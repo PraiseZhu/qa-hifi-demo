@@ -13,7 +13,8 @@
 //   index.html          demo-shell 模板 + 内联标准 qa-chrome 运行时(__qa 合约的唯一标准实现)
 //
 // 额外生成(--mode component,真组件直渲;界面不手写,esbuild 打真实产品组件):
-//   spec.json           多一个 component 段(mode/entry/sources/shims/packageRoots/themeVars/fixtures)
+//   spec.json           多一个 component 段(mode/entry/shims/packageRoots/themeVars/fixtures)
+//   component.inputs.json  由 build.mjs 生成(esbuild metafile 规范化输入清单,防伪链真相源)
 //   build.mjs           组件构建器(esbuild bundle + 图片落 assets/ + 可选 tailwind CSS)
 //   src/bootstrap.tsx   装配入口:import 真组件,Object.assign(window.__qaDemo, {states,mount,inject,onPrefs})
 //   shims/              替身层骨架(README 硬规 + _template.ts 空骨架)
@@ -125,11 +126,13 @@ if (isComponent) {
   spec.component = {
     // 组件模式标记(schema 硬校验;adapter 也校验 __qaDemo.mode)
     mode: 'component',
-    // 真组件入口(相对 repoRoot):供人核对 + 门 A 把组件源文件 hash 计入防伪链
+    // 真组件入口(相对 repoRoot):必须是 bootstrap 真正 import 渲染的那个组件——
+    // build.mjs 会用 esbuild metafile 核对,它不在 bundle 真实输入里就直接构建失败。
     entry,
-    // 代码层防伪链:要锁住的产品源文件/glob(相对 repoRoot)。默认只锁 entry,
-    // 作者应把组件树里真正参与渲染的目录加进来(如 '<组件目录>/**/*.tsx')。
-    sources: [entry],
+    // 可选的人读声明(相对 repoRoot 的路径/glob)。**代码层防伪链不看这里**:
+    // 真相源是 build.mjs 落下的 component.inputs.json(bundle 真实输入逐文件 sha256)。
+    // 写了就必须 ⊆ 真实输入,否则 report fail-closed 拒绝出块。默认留空即可。
+    sources: [],
     bootstrap: 'src/bootstrap.tsx',
     bundle: 'assets/component.bundle.js',
     assetsDir: 'assets',
@@ -230,7 +233,7 @@ console.log(JSON.stringify({
   next: isComponent
     ? [
         '0. coupling 侦察:确认组件 render 期不碰 IPC/网络/原生能力,列出必须 shim 的依赖',
-        '1. 填 spec.json component 段(sources/rendererRoot/packageRoots/shims/css),写 shims/*',
+        '1. 填 spec.json component 段(rendererRoot/packageRoots/shims/css),写 shims/*(sources 可留空)',
         '2. 写 src/bootstrap.tsx(import 真组件,Object.assign 出 states/mount/inject),node build.mjs 出 bundle',
         '3. 写 extract.mjs(含 extractThemeVars 主题桥),跑 truth.mjs --demo <dir> --embed',
         '4. spec.states[].driver 与 bootstrap 的 __qaDemo.states 键集一致,node scripts/states.mjs && verify.mjs',

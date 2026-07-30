@@ -55,7 +55,18 @@ function baseHtml(truth) {
  * 造一个「demo 位于产品仓内」的 fixture:<repo>/.git + <repo>/src/*.tsx + <repo>/qa-demo/。
  * component=false 时不写 spec.component(回归用:非组件模式旧 demo)。
  */
-function makeRepoDemo({ name = 'comp', component = true, sources = ['src/**/*.tsx'], bindings = [], noGit = false } = {}) {
+function makeRepoDemo({
+  name = 'comp',
+  component = true,
+  sources = [],
+  bindings = [],
+  noGit = false,
+  // component.inputs.json(build.mjs 从 esbuild metafile 生成的 bundle 真实输入清单)
+  // 是代码层防伪链的真相源;本 fixture 不跑真 esbuild,直接手写等价清单。
+  productInputs = ['src/Entry.tsx', 'src/components/Button.tsx'],
+  demoInputs = [],
+  manifest = true,
+} = {}) {
   const repo = mkdtempSync(join(tmpdir(), `qa-hifi-comp-${name}-`));
   if (!noGit) execFileSync('git', ['init', '-q'], { cwd: repo });
   mkdirSync(join(repo, 'src/components'), { recursive: true });
@@ -85,6 +96,15 @@ function makeRepoDemo({ name = 'comp', component = true, sources = ['src/**/*.ts
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
   writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   writeFileSync(join(dir, 'assets/component.bundle.js'), '/* bundle v1 */\n');
+  if (component && manifest) {
+    writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({
+      generator: 'qa-hifi-demo/component-build',
+      entry: 'src/Entry.tsx',
+      productInputs,
+      demoInputs,
+      skippedExternal: 0,
+    }, null, 2)}\n`);
+  }
   return { repo, dir, spec };
 }
 
@@ -100,13 +120,14 @@ function specWithComponent(patch) {
   return spec;
 }
 
-test('schema: sources 为空/缺失 → FAIL(声明了组件模式就必须锁源)', () => {
+test('schema: sources 可选(空/缺失均合法),非数组仍拒', () => {
+  // 锁源不再靠自报 sources:真相源是 build.mjs 生成的 component.inputs.json
   for (const patch of [{ sources: [] }, { sources: undefined }]) {
     const spec = specWithComponent(patch);
     if (patch.sources === undefined) delete spec.component.sources;
-    const problems = validateSpec(spec);
-    assert.ok(problems.some((p) => /component\.sources 必须是非空数组/.test(p)), `空 sources 居然放行:${JSON.stringify(problems)}`);
+    assert.deepEqual(validateSpec(spec).filter((p) => p.includes('component.sources')), []);
   }
+  assert.ok(validateSpec(specWithComponent({ sources: 'src/a.ts' })).some((p) => /component\.sources 必须是数组/.test(p)));
 });
 
 test('schema: component 合法声明通过', () => {
@@ -153,15 +174,24 @@ test('glob 展开:** 跨目录、只命中声明后缀、跳过 node_modules/.gi
   assert.deepEqual(expandRepoGlob(repo, 'src/Entry.tsx'), ['src/Entry.tsx']);
 });
 
-test('buildInputHashes: component 模式逐文件 sha256 + bundle 产物 hash 入链', () => {
+test('buildInputHashes: component 模式按 manifest 逐文件 sha256 + bundle/清单自身入链', () => {
   const { repo, dir } = makeRepoDemo({ name: 'hash' });
   const h = buildInputHashes(dir, readSpec(dir));
   assert.ok(h.componentSources, 'component 模式必须有 componentSources 段');
   assert.equal(h.componentSources.sources['src/components/Button.tsx'], hashFile(join(repo, 'src/components/Button.tsx')));
   assert.equal(h.componentSources.sources['src/Entry.tsx'], hashFile(join(repo, 'src/Entry.tsx')));
   assert.equal(h.componentSources.bundle['assets/component.bundle.js'], hashFile(join(dir, 'assets/component.bundle.js')));
-  // md 不在 glob 内,不该混进来
+  // manifest 文件自身也进链:改清单本身 = 改链范围,必须让 hash 变
+  assert.equal(h.componentSources.manifest, hashFile(join(dir, 'component.inputs.json')));
+  // 不在 manifest 里的文件不该混进来(自报 sources 不再决定范围)
   assert.equal(h.componentSources.sources['src/notes.md'], undefined);
+});
+
+test('buildInputHashes: 缺 manifest → manifest 记 NO_MANIFEST(fail-closed 新态)', () => {
+  const { dir } = makeRepoDemo({ name: 'hash-nomanifest', manifest: false });
+  const h = buildInputHashes(dir, readSpec(dir));
+  assert.equal(h.componentSources.manifest, 'NO_MANIFEST');
+  assert.deepEqual(h.componentSources.sources, {});
 });
 
 test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', () => {
@@ -175,13 +205,13 @@ test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', () => {
   assert.notEqual(JSON.stringify(buildInputHashes(dir, spec)), afterSrc, '改 bundle 产物后 hash 居然没变');
 });
 
-test('buildInputHashes: 源文件删了记 MISSING、glob 零命中记 NO_MATCH、bundle 缺失记 MISSING', () => {
-  const { dir } = makeRepoDemo({ name: 'hash-missing', sources: ['src/gone/**/*.tsx', 'src/deleted.tsx'] });
+test('buildInputHashes: manifest 里的文件不在了记 MISSING、bundle 缺失记 MISSING、越狱路径记 INVALID_PATH', () => {
+  const { dir } = makeRepoDemo({ name: 'hash-missing', productInputs: ['src/deleted.tsx', '../outside.tsx'] });
   const spec = readSpec(dir);
   spec.component.bundle = 'assets/nope.js';
   const h = buildInputHashes(dir, spec);
-  assert.equal(h.componentSources.sources['src/gone/**/*.tsx'], 'NO_MATCH');
   assert.equal(h.componentSources.sources['src/deleted.tsx'], 'MISSING');
+  assert.equal(h.componentSources.sources['../outside.tsx'], 'INVALID_PATH');
   assert.equal(h.componentSources.bundle['assets/nope.js'], 'MISSING');
 });
 
@@ -267,20 +297,29 @@ function verifyThenPrBlock(dir, env) {
   return run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
 }
 
-test('fail-closed: glob 零命中(NO_MATCH)→ pr-block 拒并提示修 sources', async (t) => {
+test('fail-closed: 自报 sources 声明零命中 → pr-block 拒并提示修 sources', async (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
   const { dir } = makeRepoDemo({ name: 'fc-nomatch', sources: ['src/**/*.nope'] });
   const pr = verifyThenPrBlock(dir, env);
-  assert.equal(pr.status, 2, `零命中 glob 居然放行:${pr.stdout}${pr.stderr}`);
-  assert.match(pr.stdout + pr.stderr, /NO_MATCH/);
-  assert.match(pr.stdout + pr.stderr, /glob 零命中/);
+  assert.equal(pr.status, 2, `零命中声明居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /零命中/);
 });
 
-test('fail-closed: 源文件缺失(MISSING)→ pr-block 拒并提示查路径', async (t) => {
+test('fail-closed: 缺 manifest(NO_MANIFEST)→ pr-block 拒并要求先跑 build.mjs', async (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
-  const { dir } = makeRepoDemo({ name: 'fc-missing', sources: ['src/components/Button.tsx', 'src/deleted.tsx'] });
+  const { dir } = makeRepoDemo({ name: 'fc-nomanifest', manifest: false });
+  const pr = verifyThenPrBlock(dir, env);
+  assert.equal(pr.status, 2, `缺清单居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /NO_MANIFEST/);
+  assert.match(pr.stdout + pr.stderr, /build\.mjs/);
+});
+
+test('fail-closed: manifest 里的源文件缺失(MISSING)→ pr-block 拒并点名文件', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { dir } = makeRepoDemo({ name: 'fc-missing', productInputs: ['src/components/Button.tsx', 'src/deleted.tsx'] });
   const pr = verifyThenPrBlock(dir, env);
   assert.equal(pr.status, 2, `缺源文件居然放行:${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout + pr.stderr, /MISSING/);
