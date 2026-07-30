@@ -274,6 +274,58 @@ test('#2c-a 阳性对照(不 skip): 干净 demo 不误杀,node_modules 内部不
   assert.deepEqual(checkDemoNoNodeModules(dir), []);
 });
 
+// ==================== 条目 4 — #1c:封印可精确仿造 ====================
+
+test('#1c 源码契约(不 skip): 封印之外必须叠加 bundle 字节全等 + pageerror + challenge 三层', () => {
+  const core = readFileSync(CORE, 'utf8');
+  const verify = readFileSync(VERIFY, 'utf8');
+  // (c) challenge:回应必须绑定 verify 传入的不可预测 nonce
+  assert.match(core, /Object\.defineProperty\(__qaSeal, "prove"/, '哨兵必须提供 challenge 回应方法');
+  assert.match(core, /nonce: String\(__n\)/, 'prove 必须回显调用方给的 nonce');
+  assert.match(verify, /randomBytes|randomUUID/, 'verify 必须生成不可预测 challenge');
+  assert.match(verify, /哨兵未按 challenge 回应/);
+  // (b) pageerror fail-closed
+  assert.match(verify, /pageerror/);
+  assert.match(verify, /bundle 初始化期页面抛错/);
+  // (a) 可信侧重算 bundle 字节
+  assert.match(verify, /recheckComponentBundle|checkComponentBundleBytes/);
+  assert.match(readFileSync(join(ROOT, 'scripts/lib/fs-utils.mjs'), 'utf8'), /--check-bundle/);
+});
+
+test('#1c bundle 字节全等(不 skip 逻辑层): 手改 bundle 一个字节 → 可信侧复算不等,门 A 红', (t) => {
+  if (!MODULE_ROOT) return t.skip('复算需要真 esbuild');
+  const { dir } = makeFixture({ name: 'bundle-bytes', boot: 'real', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const bundle = join(dir, 'assets/component.bundle.js');
+  writeFileSync(bundle, `${readFileSync(bundle, 'utf8')}\n/* tampered */\n`);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, '手改 bundle 居然还能过 verify');
+  assert.match(`${v.stdout}${v.stderr}`, /bundle 字节与可信侧复算结果不一致/);
+});
+
+test('#1c 复现样本: index.html 预占精确同形假封印(含 prove)+ 目标不调用 → verify 必红、非 proved、无「真组件直渲」', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeFixture({ name: 'preseal', boot: 'hold', repoDeps: true, preSeal: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, `预占同形封印居然通过了 verify(#1c 未修):${v.stdout}`);
+  const report = readJson(join(dir, 'report.json'));
+  assert.equal(report.gateB.pass, false);
+  assert.notEqual(report.gateB.entryRenderProof, 'proved', '伪造的封印仍被采信');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 2);
+  assert.ok(!pr.stdout.includes('真组件直渲'));
+});
+
+test('#1c 阳性对照: 真调用目标导出 → 仍 proved(封印 + challenge + 字节复算三层都不误伤)', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeFixture({ name: 'seal-ok', boot: 'real', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
+  assert.equal(readJson(join(dir, 'report.json')).gateB.entryRenderProof, 'proved');
+});
+
 // ==================== 条目 5 — #2c-b:字符类 glob ====================
 
 test('#2c-b 纯函数层(不 skip): 字符类/brace/否定/extglob 一律拒,标准 glob 放行', () => {

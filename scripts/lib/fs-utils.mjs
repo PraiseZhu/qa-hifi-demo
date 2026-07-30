@@ -309,6 +309,49 @@ export function recheckComponentInputs(demoDir) {
 }
 
 /**
+ * 可信侧复算 bundle 字节(r5 #1c 第一层):跑 **skill 仓自己那份**构建核心的
+ * `--check-bundle`(write:false,不落产物、不执行 demo 目录里的任何代码),
+ * 拿到「按当前 spec/源码应该得到的 bundle」的 sha256,与磁盘上的 bundle 全等比对。
+ *
+ * 堵两件事:
+ *   ① 手改 bundle(往产物里塞手写 UI / 删哨兵);
+ *   ② 「index.html 预占同形假封印 + 让真 bundle 的 defineProperty 抛错」这类伪造——
+ *      伪造方无法同时提供一份字节全等的**真** bundle,而真 bundle 里的哨兵是真的。
+ *
+ * 返回 { status: 'ok'|'mismatch'|'error'|'n/a', problems }。
+ */
+export function recheckComponentBundle(demoDir, component) {
+  const rel = typeof component?.bundle === 'string' && component.bundle ? component.bundle : 'assets/component.bundle.js';
+  const abs = join(demoDir, rel);
+  if (!existsSync(abs)) return { status: 'error', problems: [`component.bundle 不存在:${rel}——先跑 node build.mjs`] };
+  let fresh;
+  try {
+    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-bundle', '--demo', demoDir], {
+      cwd: demoDir,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    fresh = JSON.parse(out);
+  } catch (err) {
+    return {
+      status: 'error',
+      problems: [`可信侧复算 bundle 字节失败(skill 侧 component-build-core --check-bundle):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
+    };
+  }
+  const actual = hashFile(abs);
+  if (fresh?.sha256 === actual) return { status: 'ok', problems: [] };
+  return {
+    status: 'mismatch',
+    problems: [
+      `${rel} 的 bundle 字节与可信侧复算结果不一致——产物不是当前 spec/源码用 canonical 构建规范生成的。`
+      + `\n  磁盘 sha256:${actual}\n  可信侧复算:${fresh?.sha256 ?? '(无)'}`
+      + '\n可能原因:手改过 bundle(塞手写 UI / 摘哨兵)、改完源码没重跑 build、或用了别的构建器。'
+      + '\n修法:node build.mjs 重新产出,再重跑 verify。',
+    ],
+  };
+}
+
+/**
  * component 模式的代码层防伪链:**bundle 真实输入**逐一 sha256(真相源 = manifest)。
  *   sources     — manifest.productInputs(产品仓内相对路径)逐文件 sha256
  *   demoInputs  — manifest.demoInputs(demo 内相对路径,bootstrap/shims 等)逐文件 sha256

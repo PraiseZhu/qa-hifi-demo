@@ -14,6 +14,7 @@
 //   node component-build-core.mjs --check-inputs --demo <demoDir>
 //     → 只重算输入图,把规范化清单打到 stdout,不落任何产物。
 
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -234,6 +235,18 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     L.push('    shape: Object.freeze({ total: __qaShape.total, wrappable: __qaShape.wrappable,');
     L.push('      targetWrappable: __qaShape.targetWrappable, target: __qaShape.target, sentinel: true }) });');
     L.push('} });');
+    /* ── challenge 回应(r5 #1c 第三层) ──
+       r4 的证据是一个**静态形状**:不可写全局 + 不可配置的 get-only snapshot + 冻结对象。
+       这套协议完全公开、可被 index.html 在 bundle 加载前逐字段精确仿造(终审实证)。
+       所以再加一条只有「活的哨兵」才做得到的事:verify 每次运行生成一个不可预测的
+       nonce,调 prove(nonce),回应里必须原样带回该 nonce。静态预置的冻结 snapshot
+       无法预知 nonce;要能回应就得写一个真函数,而那时它又躲不过 (a) bundle 字节
+       全等复算与 (b) pageerror fail-closed 两层。 */
+    L.push('Object.defineProperty(__qaSeal, "prove", { enumerable: false, configurable: false, writable: false,');
+    L.push('  value: function (__n) { return Object.freeze({ nonce: String(__n),');
+    L.push('    rendered: __qaRendered, targetRendered: __qaTargetRendered,');
+    L.push('    shape: Object.freeze({ total: __qaShape.total, wrappable: __qaShape.wrappable,');
+    L.push('      targetWrappable: __qaShape.targetWrappable, target: __qaShape.target, sentinel: true }) }); } });');
     L.push('Object.freeze(__qaSeal);');
     L.push('Object.defineProperty(globalThis, "__QA_ENTRY_SENTINEL__", { value: __qaSeal, writable: false, configurable: false, enumerable: false });');
     L.push('var __qaFn = function (f, isTarget) { return new Proxy(f, {');
@@ -452,21 +465,52 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     );
   }
 
-  return { spec, comp, repoRoot, demoDir, R, D, manifest, assetsDir, bundleOut, cssOut, sentinel: manifest.entrySentinel };
+  return {
+    spec, comp, repoRoot, demoDir, R, D, manifest, assetsDir, bundleOut, cssOut,
+    sentinel: manifest.entrySentinel,
+    // checkOnly(write:false)时 esbuild 把产物留在内存里 —— 供可信侧复算 bundle 字节
+    outputFiles: buildResult.outputFiles ?? null,
+  };
 }
+
+/**
+ * 可信侧复算 bundle 字节(r5 #1c 第一层)。write:false 现算一遍,返回**期望的**
+ * bundle 内容 sha256。调用方与磁盘上的 assets/component.bundle.js 做全等比对:
+ * 手改 bundle、以及「预占同形封印 + 让真 bundle 初始化失败」这类伪造,都必须先能
+ * 提供一份字节全等的真 bundle,而那份真 bundle 的哨兵是真的。
+ */
+export async function computeExpectedBundleSha(demoDir) {
+  const { outputFiles, bundleOut, comp } = await computeComponentBuild({ demoDir, checkOnly: true });
+  const wanted = realpathish(bundleOut);
+  const hit = (outputFiles ?? []).find((f) => realpathish(f.path) === wanted)
+    ?? (outputFiles ?? []).find((f) => f.path.endsWith('.js'));
+  if (!hit) fail('可信侧复算未产出 bundle 输出文件(esbuild write:false 无 outputFiles)', 1);
+  return {
+    bundle: comp.bundle ?? 'assets/component.bundle.js',
+    sha256: createHash('sha256').update(Buffer.from(hit.contents)).digest('hex'),
+    bytes: hit.contents.length,
+  };
+}
+function realpathish(p) { try { return realpathSync(p); } catch { return resolve(p); } }
 
 /* ── CLI:--check-inputs(只复算,不落产物)。skill 侧复算与薄壳 build.mjs 共用。 ── */
 const invokedDirectly = process.argv[1] && real0(process.argv[1]) === real0(fileURLToPath(import.meta.url));
 function real0(p) { try { return realpathSync(p); } catch { return resolve(p); } }
 if (invokedDirectly) {
   const argv = process.argv.slice(2);
-  if (!argv.includes('--check-inputs')) {
-    process.stderr.write('用法: node component-build-core.mjs --check-inputs [--demo <demoDir>]\n');
+  const wantInputs = argv.includes('--check-inputs');
+  const wantBundle = argv.includes('--check-bundle');
+  if (!wantInputs && !wantBundle) {
+    process.stderr.write('用法: node component-build-core.mjs --check-inputs|--check-bundle [--demo <demoDir>]\n');
     process.exit(2);
   }
   const i = argv.indexOf('--demo');
   const demoDir = i >= 0 && argv[i + 1] ? resolve(argv[i + 1]) : process.cwd();
   try {
+    if (wantBundle) {
+      process.stdout.write(`${JSON.stringify(await computeExpectedBundleSha(demoDir), null, 2)}\n`);
+      process.exit(0);
+    }
     const { manifest } = await computeComponentBuild({ demoDir, checkOnly: true });
     process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
   } catch (err) {
