@@ -684,3 +684,30 @@ test('finding #4: --electron-app 采集 electron-win 条目在非 Windows 宿主
   assert.match(res.stdout, /electron-win|宿主|拒绝/);
   assert.ok(!existsSync(join(demo, 'baselines/electron-win/e.png')), '拒绝时不得落盘');
 });
+
+// ============ ⑤c 零分母绕过(终审第三轮缺口 #2c) ============
+
+test('finding #2c: 零分母伪 PASS(bad:50,total:0,diffRatio:0)→ 拒绝(终审人复现样本)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-zerodenom', [{ key: 'one', platform: 'ios' }]);
+  const real = realReports(dir, env);
+  // 终审人样本:total=0 跳过自洽校验、diffRatio 手写 0 ≤ threshold → 旧代码放行
+  real.results[0] = { ...real.results[0], status: 'PASS', bad: 50, total: 0, masked: 0, diffRatio: 0, engine: 'odiff' };
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2, `零分母伪 PASS 居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /total 必须是正整数|零比对/);
+});
+
+test('finding #2c: bad>total 与 diffRatio 越界([0,1] 外)均拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-badgtotal', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  real.results[0] = { ...real.results[0], status: 'PASS', bad: 200, total: 100, masked: 0, diffRatio: 2, engine: 'odiff' };
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /bad\(200\) > total\(100\)|\[0,1\]/);
+});

@@ -88,12 +88,18 @@ export function validatePixelForPr(demoDir, spec = null) {
         if (r?.status === 'PASS' || r?.status === 'WARN') {
           if (!ENGINE_LEGAL.has(r.engine))
             problems.push(`pixel results[${i}](${ck}) engine 非法:${r.engine}(只允许 odiff/pixelmatch/manual)——非本工具产出?`);
-          for (const f of ['bad', 'total', 'masked']) {
-            if (!Number.isFinite(r[f]) || r[f] < 0) problems.push(`pixel results[${i}](${ck}) ${f} 必须是非负数值`);
+          // 零分母绕过(终审 #2c):total=0 时旧代码跳过比例自洽 → 手写 bad:50,total:0,diffRatio:0
+          // 可伪 PASS。真实比对在 mask 护栏(minUnmaskedRatio)下不可能产出 PASS/WARN 且 total=0,
+          // 故 PASS/WARN 强制 total 为正整数、bad/masked 非负整数且 bad<=total,自洽校验无条件执行。
+          if (!Number.isInteger(r.total) || r.total <= 0) problems.push(`pixel results[${i}](${ck}) total 必须是正整数(当前 ${r.total})——PASS/WARN 不可能零比对`);
+          for (const f of ['bad', 'masked']) {
+            if (!Number.isInteger(r[f]) || r[f] < 0) problems.push(`pixel results[${i}](${ck}) ${f} 必须是非负整数`);
           }
-          if (!Number.isFinite(r.diffRatio)) problems.push(`pixel results[${i}](${ck}) diffRatio 必须是数值`);
+          if (Number.isInteger(r.bad) && Number.isInteger(r.total) && r.bad > r.total)
+            problems.push(`pixel results[${i}](${ck}) bad(${r.bad}) > total(${r.total})——计数伪造?`);
+          if (!Number.isFinite(r.diffRatio) || r.diffRatio < 0 || r.diffRatio > 1) problems.push(`pixel results[${i}](${ck}) diffRatio 必须是 [0,1] 数值`);
           else {
-            if (Number.isFinite(r.bad) && Number.isFinite(r.total) && r.total > 0 && Math.abs(r.diffRatio - r.bad / r.total) > 1e-9)
+            if (Number.isInteger(r.bad) && Number.isInteger(r.total) && r.total > 0 && Math.abs(r.diffRatio - r.bad / r.total) > 1e-9)
               problems.push(`pixel results[${i}](${ck}) diffRatio(${r.diffRatio}) 与 bad/total(${r.bad}/${r.total}) 不一致——计数伪造?`);
             if (r.status === 'PASS' && r.diffRatio > expectedThreshold)
               problems.push(`pixel results[${i}](${ck}) 伪 PASS:diffRatio(${r.diffRatio}) 超阈值(${expectedThreshold})——高差异伪装通过?`);
