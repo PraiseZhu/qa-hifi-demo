@@ -18,6 +18,18 @@ const VERIFY = join(ROOT, 'scripts/verify.mjs');
 const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
 
+const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
+
+/**
+ * 资产体积闸门:组件模式 demo 必有 assets/(bundle 落在那儿),pr-block 现在强制
+ * report-assets.json 存在且 hash 一致(审核 P1 #5)。集成用例在 verify 之后补跑它,
+ * 否则会被资产闸门拦下而不是被本用例想测的那条门拦下。
+ */
+function assetsGate(dir, env) {
+  const r = run(ASSETS_MANIFEST, ['--demo', dir], { env });
+  assert.equal(r.status, 0, `资产闸门应通过:${r.stdout}${r.stderr}`);
+}
+
 function run(script, args, opts = {}) {
   return spawnSync(process.execPath, [script, ...args], {
     cwd: opts.cwd ?? ROOT,
@@ -74,7 +86,9 @@ function makeRepoDemo({ name = 'comp', component = true, sources = ['src/**/*.ts
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
     states: [{ id: 'id', via: [{ expect: 'id' }] }],
     verify: {
-      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }],
+      // via 非空且只含 expect:声明「demo 初始就在该 case 的偏好上,无需导航」。
+      // 不用 via:[]——空数组与「忘填」不可分辨,schema 已拒(审核附带收紧项)。
+      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }],
       noClip: ['.box'],
     },
     bindings,
@@ -207,6 +221,7 @@ test('组件模式:改 sources 里任一源文件 → 旧 report 被 pr-block �
   const { repo, dir } = makeRepoDemo({ name: 'e2e-src' });
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `verify 必须先绿:${v.stdout}${v.stderr}`);
+  assetsGate(dir, env);
   const ok = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(ok.status, 0, `未篡改时应放行:${ok.stdout}${ok.stderr}`);
   writeFileSync(join(repo, 'src/components/Button.tsx'), 'export const Button = () => null; // tampered\n');
@@ -234,6 +249,7 @@ test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
+  assetsGate(dir, env);
   assert.equal(report.gateD.pass, true);
   assert.match(report.gateD.detail, /组件模式|产品代码路径/);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
@@ -248,6 +264,7 @@ test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) 
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
+  assetsGate(dir, env);
   assert.match(report.gateD.detail, /spec\.bindings 未配置/);
   assert.equal(report.inputHashes.componentSources, undefined);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
@@ -264,6 +281,7 @@ test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) 
 function verifyThenPrBlock(dir, env) {
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `verify 必须先绿(fail-closed 只在 pr-block 侧):${v.stdout}${v.stderr}`);
+  assetsGate(dir, env);
   return run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
 }
 

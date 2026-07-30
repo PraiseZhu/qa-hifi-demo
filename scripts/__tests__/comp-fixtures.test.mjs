@@ -1,6 +1,7 @@
 // comp-fixtures.test.mjs — 服务端驱动数据的 fixture provenance(sourceKind='fixture')。
-// 对抗口径:合法路径全过 / 缺 capturedFrom 拒 / fixture 篡改后 hash 不符拒 /
+// 对抗口径:合法路径全过 / capturedFrom 结构化校验 / fixture 篡改后 hash 不符拒 /
 // source 指向 demo 外拒 / PR 附贴块出现诚实降级声明行。fixture 自给自足,不改旧测试。
+// 注:locator 值绑定与 capturedFrom 结构化的对抗样本在 comp-fix-p1.test.mjs(审核 P1 #3)。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,14 +33,18 @@ test('makeFixtureLeaf: 合法路径产出 sourceKind=fixture + capturedFrom,校�
   const { dir, fixture } = tmpFixtureDemo('ok');
   const leaf = makeFixtureLeaf(FIXTURE_JSON.data[0].displayName, 'fixtures/providers.json', {
     locator: 'data[0].displayName',
-    capturedFrom: '2026-07-30 公司沙盒 GET /api/providers 响应',
+    capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
     demoDir: dir,
   });
   assert.equal(leaf.value, '火山方舟');
   assert.equal(leaf.provenance.sourceKind, 'fixture');
   assert.equal(leaf.provenance.source, 'fixtures/providers.json');
   assert.equal(leaf.provenance.hash, hashFile(fixture));
-  assert.match(leaf.provenance.capturedFrom, /沙盒/);
+  assert.deepEqual(leaf.provenance.capturedFrom, {
+    environment: '公司沙盒',
+    capturedAt: '2026-07-30',
+    endpoint: 'GET /api/providers',
+  });
   assert.deepEqual(validateTruth({ providers: { name: leaf } }, { demoDir: dir }), []);
 });
 
@@ -57,7 +62,7 @@ test('sourceKind 非法值被拒', () => {
   const truth = {
     a: {
       value: 1,
-      provenance: { source: 'fixtures/providers.json', sourceKind: 'server', locator: 'l', hash: hashFile(fixture) },
+      provenance: { source: 'fixtures/providers.json', sourceKind: 'server', locator: 'data.0.id', hash: hashFile(fixture) },
     },
   };
   const problems = validateTruth(truth, { demoDir: dir });
@@ -69,16 +74,21 @@ test('缺 capturedFrom:schema FAIL(工厂函数也抛)', () => {
   const truth = {
     a: {
       value: 1,
-      provenance: { source: 'fixtures/providers.json', sourceKind: 'fixture', locator: 'l', hash: hashFile(fixture) },
+      provenance: { source: 'fixtures/providers.json', sourceKind: 'fixture', locator: 'data.0.id', hash: hashFile(fixture) },
     },
   };
   const problems = validateTruth(truth, { demoDir: dir });
   assert.ok(problems.some((p) => /capturedFrom 必填/.test(p)), problems.join('\n'));
-  // 空白串同样算缺
-  truth.a.provenance.capturedFrom = '   ';
-  assert.ok(validateTruth(truth, { demoDir: dir }).some((p) => /capturedFrom 必填/.test(p)));
+  // 自由文本(含只有空白的串)一律拒:capturedFrom 现在必须是结构化对象(审核 P1 #3)
+  for (const bad of ['   ', '2026-07-30 沙盒响应']) {
+    truth.a.provenance.capturedFrom = bad;
+    assert.ok(
+      validateTruth(truth, { demoDir: dir }).some((p) => /capturedFrom 不接受自由文本/.test(p)),
+      `capturedFrom=${JSON.stringify(bad)} 应被拒`,
+    );
+  }
   assert.throws(
-    () => makeFixtureLeaf(1, 'fixtures/providers.json', { locator: 'l', demoDir: dir }),
+    () => makeFixtureLeaf('ark', 'fixtures/providers.json', { locator: 'data.0.id', demoDir: dir }),
     /capturedFrom/,
   );
 });
@@ -87,7 +97,7 @@ test('fixture 文件被篡改后 hash 不符 → 拒(fixture 不是防伪豁免)
   const { dir, fixture } = tmpFixtureDemo('tamper');
   const leaf = makeFixtureLeaf('火山方舟', 'fixtures/providers.json', {
     locator: 'data[0].displayName',
-    capturedFrom: '2026-07-30 沙盒响应',
+    capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
     demoDir: dir,
   });
   assert.deepEqual(validateTruth({ a: leaf }, { demoDir: dir }), []);
@@ -106,8 +116,8 @@ test('fixture source 指向 demo 外(../ 逃逸 / 绝对路径)→ 拒', () => {
       provenance: {
         source,
         sourceKind: 'fixture',
-        locator: 'l',
-        capturedFrom: '沙盒响应',
+        locator: 'data.0.id',
+        capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
         hash: hashFile(outside),
       },
     },
@@ -125,8 +135,8 @@ test('fixture source 指向 demo 外(../ 逃逸 / 绝对路径)→ 拒', () => {
         provenance: {
           source: 'stray.json',
           sourceKind: 'fixture',
-          locator: 'l',
-          capturedFrom: '沙盒响应',
+          locator: 'data.0.id',
+          capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
           hash: hashFile(join(dir, 'stray.json')),
         },
       },
@@ -136,19 +146,31 @@ test('fixture source 指向 demo 外(../ 逃逸 / 绝对路径)→ 拒', () => {
   assert.ok(stray.some((p) => /fixtures\/<name>\.json/.test(p)), stray.join('\n'));
   // 工厂函数同样拦
   assert.throws(
-    () => makeFixtureLeaf(1, outside, { locator: 'l', capturedFrom: '沙盒', demoDir: dir }),
+    () => makeFixtureLeaf(1, outside, { locator: 'data.0.id', capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' }, demoDir: dir }),
     /demo 目录内|fixtures\//,
   );
 });
 
 test('countFixtureLeaves: 只数 fixture 叶子,嵌套/数组都数到', () => {
   const { dir, fixture } = tmpFixtureDemo('count');
-  const fx = (v) =>
-    makeFixtureLeaf(v, 'fixtures/providers.json', { locator: 'l', capturedFrom: '沙盒响应', demoDir: dir });
+  // 值绑定生效后不能再随便塞值:每个 fixture 叶子的 value 必须真是 locator 指向的那个
+  const fx = (locator) =>
+    makeFixtureLeaf(
+      locator === 'data.0.id' ? 'ark' : '火山方舟',
+      'fixtures/providers.json',
+      {
+        locator,
+        capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
+        demoDir: dir,
+      },
+    );
   writeFileSync(join(dir, 'source.txt'), 'v1');
   const code = makeLeaf('c', 'source.txt', { locator: '常量', demoDir: dir });
   assert.equal(hashFile(fixture).length, 64);
-  assert.equal(countFixtureLeaves({ a: fx(1), b: { c: [fx(2), code] }, d: code }), 2);
+  assert.equal(
+    countFixtureLeaves({ a: fx('data.0.id'), b: { c: [fx('data.0.displayName'), code] }, d: code }),
+    2,
+  );
 });
 
 // 走真 verify.mjs 产出 report(手搓 report 会被完整性校验拒,也不算真验证过附贴块链路)。
@@ -162,7 +184,9 @@ function writeVerifiableDemo({ name, withFixture }) {
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
     states: [{ id: 'id', via: [{ expect: 'id' }] }],
     verify: {
-      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }],
+      // via 非空且只含 expect:声明「demo 初始就在该 case 的偏好上,无需导航」。
+      // 不用 via:[]——空数组与「忘填」不可分辨,schema 已拒(审核附带收紧项)。
+      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }],
       noClip: ['.box'],
     },
     bindings: [{ sel: '.box', prop: 'color', truth: 'colors.text', kind: 'color' }],
@@ -174,7 +198,7 @@ function writeVerifiableDemo({ name, withFixture }) {
           providers: {
             name: makeFixtureLeaf('火山方舟', 'fixtures/providers.json', {
               locator: 'data[0].displayName',
-              capturedFrom: '2026-07-30 公司沙盒 GET /api/providers 响应',
+              capturedFrom: { environment: '公司沙盒', capturedAt: '2026-07-30', endpoint: 'GET /api/providers' },
               demoDir: dir,
             }),
           },

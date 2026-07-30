@@ -5,11 +5,14 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
-import { failProblems } from './lib/fs-utils.mjs';
+import { buildAssetsManifest, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
 import { countFixtureLeaves, validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validateReportIntegrity } from './lib/report.mjs';
 
 const PREVIEW_HOSTS = new Set(['github.com', 'gitlab.com', 'workers.xd.team']);
+// 与 assets-manifest.mjs 保持一致(那边是可执行脚本不能被 import,一致性由测试锁住)
+const ASSETS_REPORT_NAME = 'report-assets.json';
+const DEFAULT_ASSETS_LIMIT_MB = 8;
 
 function die(msg, code = 1) {
   console.error(msg);
@@ -78,7 +81,7 @@ if (requireCommitted) {
     }
     const dirty = execFileSync('git', ['-C', demoDir, 'status', '--porcelain', '--', '.'], { encoding: 'utf8' })
       .split('\n').filter(Boolean)
-      .filter((l) => !/report(-pixel)?\.json$|pixel-artifacts\//.test(l));
+      .filter((l) => !/report(-pixel|-assets)?\.json$|pixel-artifacts\//.test(l));
     if (dirty.length)
       problems.push(`committed: demo 目录有未提交改动(${dirty.length} 项)——PR 会带旧版,先 commit:\n${dirty.slice(0, 5).join('\n')}`);
   } catch {
@@ -146,6 +149,37 @@ if (requireDeployed) {
 
 const pixel = validatePixelForPr(demoDir, spec);
 problems.push(...pixel.problems.map((p) => `pixel: ${p}`));
+
+// 资产闸门入链(审核 P1 #5):demo 一旦有 assets/,就必须能出示"闸门真跑过且当时量的
+// 就是这批字节"的凭据。缺报告 = 闸门没跑;hash 不符 = 跑完又换了图;ok:false = 超阀
+// 没抬闸。三者任一即阻断——否则 assets-manifest.mjs 是一条谁都可以整段跳过的自愿门。
+let assetsReport = null;
+if (existsSync(join(demoDir, 'assets'))) {
+  const assetsReportPath = join(demoDir, ASSETS_REPORT_NAME);
+  if (!existsSync(assetsReportPath)) {
+    problems.push(
+      `assets: demo 有 assets/ 但缺 ${ASSETS_REPORT_NAME}——资产体积闸门未跑,先跑 ` +
+        'node scripts/assets-manifest.mjs --demo <dir>',
+    );
+  } else {
+    let ar;
+    try {
+      ar = JSON.parse(readFileSync(assetsReportPath, 'utf8'));
+    } catch (err) {
+      ar = null;
+      problems.push(`assets: ${ASSETS_REPORT_NAME} 不是合法 JSON:${err.message}`);
+    }
+    if (ar) {
+      if (ar.toolVersion !== TOOL_VERSION) problems.push(`assets: ${ASSETS_REPORT_NAME} toolVersion 缺失或不匹配:${ar.toolVersion ?? '(missing)'}——重跑闸门`);
+      if (!sameInputHashes(ar.inputHashes?.assets, buildAssetsManifest(demoDir).files))
+        problems.push(`assets: ${ASSETS_REPORT_NAME} 的 assets hash 与当前 assets/ 不一致——闸门跑完又换过资产,重跑 assets-manifest.mjs`);
+      if (ar.ok !== true) problems.push(`assets: ${ASSETS_REPORT_NAME} ok 不是 true(资产超闸门未抬闸):${(ar.problems ?? []).join(';')}`);
+      if (ar.overrideReason !== null && ar.overrideReason !== undefined && (typeof ar.overrideReason !== 'string' || !ar.overrideReason.trim()))
+        problems.push(`assets: ${ASSETS_REPORT_NAME} overrideReason 非法(抬闸必须有非空理由)`);
+      assetsReport = ar;
+    }
+  }
+}
 if (problems.length) failProblems(problems);
 
 const meta = spec.meta ?? {};
@@ -203,6 +237,16 @@ const fixtureLeaves = (() => {
 })();
 if (fixtureLeaves > 0) {
   lines.push(`⚠️ ${fixtureLeaves} 个叶子来自录制 fixture（非源码溯源），来源见 truth provenance`);
+  lines.push('');
+}
+// 抬闸声明:资产超默认闸门是保真度/体积的取舍,必须让 reviewer 看见理由再决定接不接受。
+// 不抬闸时这行不出现——常贴的声明就没信息量了。
+if (assetsReport?.overrideReason) {
+  const mb = (n) => (Number(n) / 1024 / 1024).toFixed(2);
+  lines.push(
+    `⚠️ 资产 ${mb(assetsReport.totalBytes)} MB 超默认闸门 ${assetsReport.defaultLimitMb ?? DEFAULT_ASSETS_LIMIT_MB} MB` +
+      `（本次生效阀 ${assetsReport.effectiveLimitMb} MB），抬闸理由：${assetsReport.overrideReason}`,
+  );
   lines.push('');
 }
 lines.push(`<sub>由 qa-hifi-demo 生成 · 工具版本 ${report.toolVersion} · 验收时间 ${report.generatedAt}</sub>`);

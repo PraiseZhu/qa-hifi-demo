@@ -49,7 +49,9 @@ function writeDemo({ mutateSpec, mutateHtml, truthOverride, truthMutate, name = 
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
     states: [{ id: 'id', via: [{ expect: 'id' }] }],
     verify: {
-      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }],
+      // via 非空且只含 expect:声明「demo 初始就在该 case 的偏好上,无需导航」。
+      // 不用 via:[]——空数组与「忘填」不可分辨,schema 已拒(审核附带收紧项)。
+      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }],
       noClip: ['.box'],
     },
     bindings: [
@@ -369,7 +371,7 @@ test('P1(recheck) verify.cases prefs must belong to declared matrix', () => {
   const dir = writeDemo({
     name: 'case-offmatrix',
     mutateSpec: (s) => {
-      s.verify.cases = [{ id: 'bad', prefs: { plat: 'watch', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }];
+      s.verify.cases = [{ id: 'bad', prefs: { plat: 'watch', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' } }];
       return s;
     },
   });
