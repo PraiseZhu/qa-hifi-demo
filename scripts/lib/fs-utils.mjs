@@ -93,11 +93,34 @@ export function buildBaselineManifest(demoDir, spec = null) {
   return { declared, files: records };
 }
 
+// assets/ 清单(递归,路径为 demo 相对 posix 路径,按路径稳定排序)。
+// 组件模式把 hero 图/组件 bundle 落成独立文件后,这些字节同样是 demo 的一部分:
+// 既供 assets-manifest.mjs 做体积闸门,也进 inputHashes 防伪链(换图不重跑 = 旧 report 失效)。
+export function buildAssetsManifest(demoDir) {
+  const dir = join(demoDir, 'assets');
+  const files = [];
+  if (!existsSync(dir)) return { files };
+  const walk = (cur, prefix) => {
+    for (const name of readdirSync(cur).sort()) {
+      const abs = join(cur, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      const st = statSync(abs);
+      if (st.isDirectory()) walk(abs, rel);
+      else if (st.isFile()) files.push({ path: `assets/${rel}`, sha256: hashFile(abs), size: st.size });
+    }
+  };
+  walk(dir, '');
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { files };
+}
+
 export function buildInputHashes(demoDir, spec = null) {
   const files = ['spec.json', 'truth.json', 'index.html'];
   const hashes = {};
   for (const name of files) hashes[name] = hashFile(join(demoDir, name));
   hashes.baselines = buildBaselineManifest(demoDir, spec);
+  // assets/ 逐文件 sha 进防伪链;没有 assets 目录则整段省略——旧 demo 的 report 结构不变、不受影响
+  if (existsSync(join(demoDir, 'assets'))) hashes.assets = buildAssetsManifest(demoDir).files;
   // 自定义门脚本进防伪链:verify 后改脚本(或换一份宽松实现)会导致 hash 不一致,
   // pr-block 拒绝出块——体外 gate 不再游离于 report 完整性校验之外
   const customGates = Array.isArray(spec?.customGates) ? spec.customGates : [];
