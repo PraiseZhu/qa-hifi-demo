@@ -104,3 +104,9 @@ node --test scripts/__tests__/
 ## License
 
 MIT
+
+## 环境坑备忘
+
+- **typescript 必须 5.x**：keyPath 写回（writeback AST 定位）依赖 TS Compiler API；TS7 起默认包（原生版）移除了该 API，裸 `npm i typescript` 会拉到 TS7 导致 keyPath 相关测试红。安装用 `npm i --no-save typescript@^5`，或让 writeback 从产品仓 node_modules 解析（推荐，零依赖）。
+- **`node --test scripts/__tests__/`（目录形式）在 Node 24 不可用**——用 `node --test 'scripts/__tests__/*.test.mjs'` 或裸 `npm test`。
+- worktree/异地跑测试需 `QA_HIFI_MODULE_ROOT=<装了 playwright 的项目>`。
