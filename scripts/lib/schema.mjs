@@ -300,8 +300,56 @@ export function validateSpec(spec) {
       });
       // bundle 拼进 demo 目录做 hash 与页面加载:限 demo 内相对路径,禁越狱
       if (!relOk(c.bundle)) problems.push('component.bundle 必须是 demo 目录内的相对路径 string(不含 ".."/绝对路径/反斜杠)');
+      // ---- 构建段(build.mjs 消费;init.mjs 生成骨架) ----
+      if (c.bootstrap !== undefined && !relOk(c.bootstrap)) problems.push('component.bootstrap 必须是 demo 目录内的相对路径 string');
+      if (c.assetsDir !== undefined && !relOk(c.assetsDir)) problems.push('component.assetsDir 必须是 demo 目录内的相对路径 string');
+      if (c.rendererRoot !== undefined && c.rendererRoot !== null && !relOk(c.rendererRoot))
+        problems.push('component.rendererRoot 必须是相对 repoRoot 的路径 string 或 null');
+      if (c.target !== undefined && typeof c.target !== 'string') problems.push('component.target 必须是 string(esbuild target)');
+      if (c.packageRoots !== undefined) {
+        if (!isPlainObject(c.packageRoots)) problems.push('component.packageRoots 必须是 object(包名 → 相对 repoRoot 的源码目录)');
+        else for (const [pkg, root] of Object.entries(c.packageRoots)) {
+          if (!relOk(root)) problems.push(`component.packageRoots["${pkg}"] 必须是相对 repoRoot 的路径 string`);
+        }
+      }
+      if (c.shims !== undefined) {
+        if (!Array.isArray(c.shims)) problems.push('component.shims 必须是数组');
+        else c.shims.forEach((s, i) => {
+          if (!isPlainObject(s)) { problems.push(`component.shims[${i}] 必须是 object`); return; }
+          if (typeof s.spec !== 'string' || !s.spec) problems.push(`component.shims[${i}].spec 必须是非空 string(被替身的 import specifier)`);
+          if (!relOk(s.file)) problems.push(`component.shims[${i}].file 必须是 demo 目录内的相对路径 string`);
+          // why 是硬要求:写不出理由的替身就不该存在(替身是保真度让步,必须留痕)
+          if (typeof s.why !== 'string' || !s.why.trim()) problems.push(`component.shims[${i}].why 必填——说明为什么必须替身(render 期碰 IPC/网络/原生能力等)`);
+        });
+      }
+      if (c.fixtures !== undefined) {
+        if (!Array.isArray(c.fixtures)) problems.push('component.fixtures 必须是数组');
+        else c.fixtures.forEach((f, i) => {
+          if (!isPlainObject(f)) { problems.push(`component.fixtures[${i}] 必须是 object`); return; }
+          if (typeof f.id !== 'string' || !f.id) problems.push(`component.fixtures[${i}].id 必须是非空 string`);
+          if (typeof f.why !== 'string' || !f.why.trim()) problems.push(`component.fixtures[${i}].why 必填——说明该数据为什么没有源码 provenance`);
+        });
+      }
+      if (c.themeVars !== undefined && c.themeVars !== null) {
+        if (!isPlainObject(c.themeVars)) problems.push('component.themeVars 必须是 object 或 null');
+        else if (typeof c.themeVars.truthPath !== 'string' || !c.themeVars.truthPath)
+          problems.push('component.themeVars.truthPath 必须是非空 string(truth 里主题变量所在路径,adapter 目前固定读 themeVars)');
+      }
+      if (c.css !== undefined && c.css !== null) {
+        if (!isPlainObject(c.css)) problems.push('component.css 必须是 object 或 null');
+        else {
+          if (!relOk(c.css.tailwindConfig)) problems.push('component.css.tailwindConfig 必须是相对 repoRoot 的路径 string');
+          if (c.css.input !== undefined && typeof c.css.input !== 'string') problems.push('component.css.input 必须是 string(tailwind 输入 CSS 内容)');
+          if (c.css.content !== undefined && (!Array.isArray(c.css.content) || c.css.content.some((g) => typeof g !== 'string')))
+            problems.push('component.css.content 必须是 string 数组(tailwind --content glob)');
+        }
+      }
+      // driver 段已下线:状态怎么被驱动统一写 states[].driver('inject'|'via'),
+      // 单一真相源——两处声明必然漂移(2026-07-30 集成调和结论)。
+      const ALLOWED = ['mode', 'entry', 'sources', 'bundle', 'bootstrap', 'assetsDir', 'rendererRoot', 'packageRoots', 'shims', 'fixtures', 'themeVars', 'css', 'target'];
       for (const key of Object.keys(c)) {
-        if (!['mode', 'entry', 'sources', 'bundle'].includes(key)) problems.push(`component.${key} 不是支持的字段(mode/entry/sources/bundle)`);
+        if (key === 'driver') { problems.push('component.driver 已废弃——状态驱动方式写 states[].driver:"inject"|"via"(单一真相源)'); continue; }
+        if (!ALLOWED.includes(key)) problems.push(`component.${key} 不是支持的字段(${ALLOWED.join('/')})`);
       }
     }
   }

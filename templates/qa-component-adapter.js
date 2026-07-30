@@ -7,7 +7,9 @@
  * verify.mjs / replay.mjs 的 selector 不需要任何组件模式分支。
  *
  * 内联顺序(硬性,init.mjs 按此拼 index.html):
- *   ① <script id="qa-truth" type="application/json">…</script>   真值块(含 truth.themeVars)
+ *   ① <script id="qa-truth" type="application/json">…<\/script>  真值块(含 truth.themeVars)
+ *      (上面这处结束标签写成 <\/script>:本文件会被内联进 index.html 的 <script> 里,
+ *       出现裸的结束标签会被 HTML 分词器提前截断脚本——init.mjs 也做了同样的兜底转义)
  *   ② demo bundle(assets/component.bundle.js):bootstrap 里定义 window.__qaDemo(见下)
  *   ③ 本文件                                     ← 读 truth、装主题桥、包 goto、补 renderApp
  *   ④ qa-chrome.js                               ← 建 chrome DOM、建 window.__qa

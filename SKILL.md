@@ -58,22 +58,41 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | 产物 | 作用 |
 |---|---|
 | `build.mjs` | 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 图片落 `assets/` + 可选 tailwind CSS |
-| `src/bootstrap.tsx` | 装配入口：import 真组件，经 `window.__qaDemo.inject(driver)` 交给 adapter |
+| `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
 
-`spec.json` 多一个 `component` 段：`entry` / `bootstrap` / `bundle` / `assetsDir` /
-`rendererRoot` / `packageRoots` / `shims[{spec,file,why}]` / `css` / `themeVars` /
-`fixtures[]` / `driver.viaOnlyStates`。adapter 升级：
+`spec.json` 多一个 `component` 段：`mode:"component"` / `entry` / `sources[]`（代码层防伪链，
+必填非空）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
+`shims[{spec,file,why}]` / `css` / `themeVars.truthPath` / `fixtures[{id,why,shape?}]` /
+`target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
+（`"inject"` / `"via"`，单一真相源）。adapter 升级：
 `node scripts/init.mjs --dir <demo-dir> --update-adapter`（与 `--update-chrome` 同机制）。
+
+**`__qaDemo` 组件模式合约**（adapter 校验，不符当场抛错，不给静默空白页）：
+
+| 字段 | 谁提供 | 语义 |
+|---|---|---|
+| `mode: 'component'` | index.html 基础段 | 组件模式标记 |
+| `name/pr/summary/matrix/defaultPrefs/initialState/tabStates/adaptive/scale` | index.html 基础段 | 与复刻模式逐字一致 |
+| `states` | bootstrap | 键 ≡ `spec.states[].id`，每项 `{ driver: 'inject' \| 'via' }`；`via` 型不许进 `tabStates` |
+| `mount(ctx)` | bootstrap | **只调一次**，把真组件挂到 `ctx.root`（adapter 在 `.frame` 内建的 `.qa-component-root`） |
+| `inject(id)` | bootstrap | `driver:'inject'` 状态必填；幂等（挂在 `onEnter`，首帧 `initialState` 也会走一遍） |
+| `onPrefs(prefs)` | bootstrap（可选） | 非主题偏好（lang/region/os/plat）；**主题由 adapter 接管** |
+| `renderApp` | adapter 合成 | bootstrap 自带 `renderApp` = 直接抛错 |
+
+内联顺序硬性：`#qa-truth` → 基础配置段 → `assets/component.bundle.js` → adapter → qa-chrome。
+adapter 必须在 bundle **之后**（它读装配好的 `mount`/`states`）、qa-chrome **之前**
+（它要先把 `__qaDemo` 补成 chrome 能吃的形状）。
 
 **什么时候用组件模式**——只用于「干净边界的组件面」，选之前先做 **coupling 侦察**：
 
 1. 组件 render 期是否碰 IPC / 网络 / 原生能力？碰得越少越适合（登录页这类是理想对象）。
 2. 需要 shim 的依赖清单有多长？每条 shim 都要写得出 `why`；清单发散说明边界不干净，退回经典模式。
-3. 状态是否可从外部驱动？组件局部 `useState` 的子视图只能经真实交互到达——写进
-   `spec.states` 的 via 链路并列入 `driver.viaOnlyStates`，`driver.goto` 对它必须返回
-   `false`，不许假装可直达。
+3. 状态是否可从外部驱动？组件局部 `useState` 的子视图只能经真实交互到达——在
+   `spec.states[]` 里标 `driver:"via"` 并写全 via 链路（schema 硬要求），
+   `__qaDemo.states` 同键同标；adapter 对它的 `goto` 显式 throw，门 B 走 via 重放取证，
+   不许假装可直达。
 4. 界面数据是否都在源码里？只在服务端响应里存在的数据（登录方式配置、成员列表等）
    **没有源码 provenance**，写进 `component.fixtures[]` 如实声明，不许塞进 `truth.json`。
 
@@ -82,10 +101,26 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 - **移动端 / RN 组件不在范围**：需要 react-native-web，维持经典模式；`--mode component`
   生成的 matrix 因此只留 `desktop`。
 - 保真度让步要如实记进 PR：`null` / 稳态 shim 造成的缺席（如窗口按钮）需要 pixel 基准 mask。
-- 主题走**主题桥**：色值由 `extract.mjs` 提到 `truth.themeVars`（带 provenance），
-  运行时由 bootstrap 复刻产品 `applyTheme` 语义，不许在 bootstrap 里手写色值。
+- 主题走**主题桥**：色值由 `extract.mjs` 用 `extractThemeVars()` 提到 `truth.themeVars`
+  （逐 token 带 provenance），运行时由 **adapter** 复刻产品 `applyTheme` 语义
+  （重写 `style#theme-vars` + 切 `html.dark` + `colorScheme`）。bootstrap 不碰主题，
+  更不许手写色值。`themeVars` 两种合法形状：token 优先
+  `{ '<token>': { light, dark } }`（`extractThemeVars` 的输出，推荐）或 mode 优先
+  `{ light: { '<token>': v }, dark: {...} }`；缺失/空则主题桥如实关闭（不假装应用了主题）。
 - 资产不内联：图片走 file loader 落 `assets/`（全内联实测让单文件涨到 10MB 级，仓里不可接受；
-  xd-pages 本来就部署整个目录）。
+  xd-pages 本来就部署整个目录）。产品原始美术资产可能单张就几 MB（登录 hero@2x 实测 3.8MB），
+  `assets-manifest.mjs` 默认 8MB 闸门会拦——**要么压图/换 webp，要么显式
+  `--max-total <MB>` 抬闸并在 PR 里写清为什么**，不许闷着抬。
+- **「整窗级组件」的帧语义**（2026-07-30 集成实测）：组件若用 `window.innerWidth/innerHeight`
+  自量尺寸、或用 `position: fixed` 铺全屏 overlay（登录屏就是），它的几何公式以 **viewport**
+  为基准，而 chrome 工具区占了上方空间、`.frame` 比 viewport 小——两者不一致会让门 C 报
+  「溢出 viewport」。两条路都可以，但要选一条并写清：
+  ① **让组件铺满 viewport**（推荐）：不给组件根建包含块，产品公式在真实 viewport 里运行
+  （几何与真实 App 同源），demo 侧把 chrome 抬到 overlay 之上（`.qa-chrome{position:relative;
+  z-index:100000}`）；代价是 `.frame` 对这类组件只是名义边框，像素基准要按 viewport 取。
+  ② **把帧当窗口**：给组件根 `transform: translateZ(0)` 建包含块把 fixed 收进帧内；
+  但组件读 `window.innerHeight` 时仍是整窗值，须自行对齐，且门 C 的 viewport 判定会与
+  帧偏移打架——只适合不读 window 尺寸的组件。
 - 门语义变化：组件内部的门 D 绑定失去意义（值没有手写环节），门 D 收缩为只验 chrome 工具区；
   门 A 需把组件源文件 hash 计入防伪链。
 

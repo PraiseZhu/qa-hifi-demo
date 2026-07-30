@@ -62,6 +62,20 @@ for (const [spec_, file] of Object.entries(shims)) {
 const packageRoots = Object.fromEntries(Object.entries(comp.packageRoots ?? {}).map(([pkg, root]) => [pkg, R(root)]));
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\/@-]/g, '\\$&');
 
+/* workspace 包的 exports 子路径表:出口名是 kebab-case 而文件是 camelCase 时
+   (如 "./brand-identity": "./src/brandIdentity.ts")只能查 package.json 的 exports,
+   路径探测猜不出来。包根 = <packageRoots 值>/..(约定值指到包内 src)。 */
+const packageExports = {};
+for (const [pkg, root] of Object.entries(packageRoots)) {
+  const pkgJson = join(root, '..', 'package.json');
+  if (!existsSync(pkgJson)) continue;
+  const map = {};
+  for (const [sub, target] of Object.entries(JSON.parse(readFileSync(pkgJson, 'utf8')).exports ?? {})) {
+    if (typeof target === 'string') map[sub.replace(/^\.\/?/, '')] = join(root, '..', target);
+  }
+  packageExports[pkg] = map;
+}
+
 const aliasPlugin = {
   name: 'qa-component-alias',
   setup(build) {
@@ -71,7 +85,9 @@ const aliasPlugin = {
     for (const [pkg, root] of Object.entries(packageRoots)) {
       build.onResolve({ filter: new RegExp(`^${esc(pkg)}(\\/|$)`) }, (args) => {
         const sub = args.path.slice(pkg.length).replace(/^\//, '');
-        const hit = probeFile(sub ? join(root, sub) : root);
+        // exports 表优先(kebab→camel 这类映射只有它知道),再退回路径探测
+        const fromExports = packageExports[pkg]?.[sub || '.'];
+        const hit = (fromExports && existsSync(fromExports) && fromExports) || probeFile(sub ? join(root, sub) : root);
         if (hit) return { path: hit };
         return { errors: [{ text: `qa-component-alias: ${args.path} 在 ${root} 下探测不到文件` }] };
       });
