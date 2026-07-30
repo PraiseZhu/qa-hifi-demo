@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
-export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-dx-evolution';
+export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-gate-e-sync-v2';
 
 export function isPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
