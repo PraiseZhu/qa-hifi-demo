@@ -20,10 +20,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { buildInputHashes, hashFile, safeJsonForScript, stableJson, TOOL_VERSION } from '../lib/fs-utils.mjs';
 import { validatePixelForPr } from '../lib/report.mjs';
 import { loadPngApi } from '../lib/png-compare.mjs';
@@ -371,6 +372,152 @@ test('条目 2 阳性对照(实跑,不 skip): 真跑 pixel-compare 且基准与�
   assert.equal(pr.status, 0, `门 E 可信重跑误伤了正常路径:${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout, /像素基准/);
   assert.ok(!pr.stdout.includes('未运行 pixel-compare'), '门 E 真跑过,不该打「未运行」');
+});
+
+// ============ 条目 3/4/5 — content 入链集的准确性(安全性由条目 1 兜住) ============
+
+test('条目 3/4/5 源码契约(不 skip): tailwind content 展开改走 fast-glob;白名单降级为快速失败', () => {
+  const rg = readFileSync(join(ROOT, 'scripts/lib/repo-glob.mjs'), 'utf8');
+  assert.match(rg, /export function expandTailwindContent/);
+  assert.match(rg, /export function tailwindContentRelative/, '必须处理 content.relative 的基准');
+  // 与 Tailwind 对齐:展开时不带 ignore(node_modules 同样被它实扫)
+  assert.match(rg, /skipDirs: EMPTY_SKIP/, '兜底展开必须与 Tailwind 一样不跳过 node_modules');
+  const resolver = rg.slice(rg.indexOf('function resolveFastGlob'), rg.indexOf('const realish'));
+  for (const bad of ['process.cwd()', 'demoDir,', 'SELF_DIR', 'import.meta.dirname']) {
+    assert.ok(!resolver.includes(bad), `fast-glob 解析候选里出现了不可信/会漂移的根 ${bad}`);
+  }
+  assert.match(resolver, /QA_HIFI_MODULE_ROOT|trustedDirs/);
+  assert.match(rg, /落在 demo 子树 → 拒收/);
+
+  const core = readFileSync(CORE, 'utf8');
+  assert.match(core, /expandTailwindContent\(repoRoot, list/, '构建核心必须用 fast-glob 那条展开');
+  assert.ok(!/expandRepoGlob\(repoRoot, pattern\)/.test(core), '构建核心仍在用自研展开算 tailwind content');
+  assert.match(core, /降级为「快速失败 \+ 可读报错」/, '白名单的新定位要写清楚(不再是安全锚)');
+});
+
+test('条目 3 PoC: content.relative:true 时基准是 config 所在目录 —— 只入链仓根诱饵 = 哈错了一组文件', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到清单阶段');
+  /* 审核人用真 tailwindcss@3.4.19 确认:config.content.relative:true 时 glob 基准变成
+     dirname(userConfigPath),而 `--content` CLI 参数只覆盖 config.content.files、不覆盖
+     relative。于是 config 在 apps/desktop/ 时:真文件 apps/desktop/src/Foo.tsx 被实扫,
+     仓根诱饵 src/Foo.tsx 未被扫;自研展开只返回诱饵 → 「零命中即 fail」不触发
+     (matched.length===1,只是命中了错的那个)。 */
+  const { dir } = makeFixture({
+    name: 'rel-base',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'apps/desktop/tailwind.config.js', content: ['src/Foo.tsx'] },
+    extraRepoFiles: {
+      'apps/desktop/tailwind.config.js': "module.exports = { content: { relative: true, files: [] }, theme: {} };\n",
+      'apps/desktop/src/Foo.tsx': 'export const real = "bg-sky-500";\n',
+      'src/Foo.tsx': 'export const decoy = "bg-amber-500";\n',
+    },
+  });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const product = JSON.parse(r.stdout).buildInputs.product;
+  assert.ok(
+    product.includes('apps/desktop/src/Foo.tsx'),
+    `relative:true 的真实实扫文件没入链(条目 3 未修):${JSON.stringify(product)}`,
+  );
+  assert.ok(!product.includes('src/Foo.tsx'), `仓根诱饵不该入链(它根本没被 Tailwind 扫到):${JSON.stringify(product)}`);
+});
+
+test('条目 4 PoC: node_modules 下的文件 Tailwind 实扫且生效 —— 必须同样入链', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到清单阶段');
+  const { dir } = makeFixture({
+    name: 'nm-asym',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/**/*.tsx'] },
+    extraRepoFiles: {
+      'src/node_modules/vendor-widget/Widget.tsx': 'export const v = "bg-fuchsia-500";\n',
+      'src/Plain.tsx': 'export const p = "bg-teal-500";\n',
+    },
+  });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const product = JSON.parse(r.stdout).buildInputs.product;
+  assert.ok(product.includes('src/Plain.tsx'), '普通文件应入链');
+  assert.ok(
+    product.includes('src/node_modules/vendor-widget/Widget.tsx'),
+    `node_modules 下被实扫的文件没入链(条目 4 未修 —— 我们跳过它,Tailwind 不跳):${JSON.stringify(product)}`,
+  );
+});
+
+test('条目 4 交叉验证(实跑真 tailwind): node_modules 下的 class 确实进了 CSS 产物', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走完 build');
+  const { dir } = makeFixture({
+    name: 'nm-asym-css',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/**/*.tsx'] },
+    extraRepoFiles: { 'src/node_modules/vendor-widget/Widget.tsx': 'export const v = "bg-fuchsia-500";\n' },
+  });
+  const b = run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() });
+  assert.equal(b.status, 0, `${b.stdout}${b.stderr}`);
+  assert.match(
+    readFileSync(join(dir, 'assets/component.css'), 'utf8'),
+    /bg-fuchsia-500/,
+    'Tailwind 没扫 node_modules 的话这条 PoC 的前提就不成立了(实测它扫)',
+  );
+});
+
+test('条目 5 兜底(实跑真 tailwind): 改 config require 的 plugin(不在入链清单里)→ CSS 字节复算立刻不符', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走完 build');
+  /* 条目 5 的根因(审核人未做 PoC):normalizeInputs 只把 tailwindConfig 路径本身 +
+     content 命中文件 + package.json 入链,**没有**对 config 内部 require 的 presets/plugins
+     做递归哈希追踪。r6 不去补递归追踪(那是又一条追不完的语义),而是让 CSS 字节复算兜住:
+     改 plugin → 编出来的 CSS 变 → 磁盘字节与可信侧复算不等 → 门 A 红。 */
+  const { repo, dir } = makeFixture({
+    name: 'plugin-dep',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] },
+    extraRepoFiles: {
+      'tw-plugin.js': "module.exports = function ({ addUtilities }) { addUtilities({ '.qa-mark': { color: '#111111' } }); };\n",
+    },
+  });
+  writeFileSync(
+    join(repo, 'tailwind.config.js'),
+    "module.exports = { content: [], theme: {}, plugins: [require('./tw-plugin.js')], safelist: ['qa-mark'] };\n",
+  );
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const before = hashFile(join(dir, 'assets/component.css'));
+  assert.match(readFileSync(join(dir, 'assets/component.css'), 'utf8'), /#111111/, 'plugin 的产物应在 CSS 里');
+
+  // 入链清单不含 tw-plugin.js —— 这就是条目 5;改它不会让任何 hash 变
+  const inputs = readJson(join(dir, 'component.inputs.json'));
+  assert.ok(!inputs.buildInputs.product.includes('tw-plugin.js'), '前提:plugin 依赖确实不在入链清单里');
+
+  writeFileSync(
+    join(repo, 'tw-plugin.js'),
+    "module.exports = function ({ addUtilities }) { addUtilities({ '.qa-mark': { color: '#222222' } }); };\n",
+  );
+  const r = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  assert.notEqual(JSON.parse(r.stdout).sha256, before, '改了 config require 的 plugin 却算出同样的 CSS = 兜底不成立');
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, 'plugin 改了没重建,verify 必须红');
+  assert.match(`${v.stdout}${v.stderr}`, /CSS 字节与可信侧复算结果不一致/);
+});
+
+test('条目 3/4/5 引擎同源性(实跑): 我们用的 fast-glob 与 tailwind 内部那份必须来自同一份安装', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到 --check-css');
+  const { dir } = makeFixture({
+    name: 'fg-origin',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] },
+  });
+  const r = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const cg = JSON.parse(r.stdout).contentGlob;
+  assert.equal(cg.engine, 'fast-glob', '产品仓装了 tailwind 就一定装了 fast-glob,不该退回内建展开');
+  assert.match(cg.version ?? '', /^\d+\./);
+  // 同源判定:tailwindcss 自己解析出来的 fast-glob 与我们解析到的必须是同一个文件
+  const req = createRequire(join(ROOT, 'package.json'));
+  const twFg = createRequire(req.resolve('tailwindcss')).resolve('fast-glob');
+  assert.equal(
+    realpathSync(cg.from),
+    realpathSync(twFg),
+    '两份 fast-glob 不同源 → 展开语义可能有版本差异;此时入链清单的准确性只能靠 CSS 字节复算兜',
+  );
 });
 
 test('条目 1 占位模式也入锚: 未配 tailwind 时手改占位 CSS 同样被抓', (t) => {

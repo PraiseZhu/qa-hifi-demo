@@ -5,10 +5,13 @@
 // 而该核心会随模板拷进 demo 目录、不能反向 import 整个 fs-utils(会拖进 git/hash 全套)。
 // 两处共享同一份实现,避免「两套 glob 语义」漂移。
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join, relative as relativePath, resolve, sep } from 'node:path';
 
 const GLOB_SKIP_DIRS = new Set(['.git', 'node_modules']);
+/** Tailwind 的 fastGlob.sync 不带 ignore —— 与它对齐时一个目录都不跳(r6 条目 4)。 */
+const EMPTY_SKIP = new Set();
 
 /* ── demo 自带 node_modules 的探测(r6:实现从 fs-utils 移到本模块) ──
    为什么搬家:构建核心(component-build-core.mjs)在 r6 起会**执行产品仓的
@@ -101,15 +104,15 @@ function globStaticPrefix(pattern) {
   return out.join('/');
 }
 
-function walkFiles(rootAbs, relDir, out) {
+function walkFiles(rootAbs, relDir, out, { skipDirs = GLOB_SKIP_DIRS } = {}) {
   const abs = relDir ? join(rootAbs, relDir) : rootAbs;
   if (!existsSync(abs)) return out;
   if (!statSync(abs).isDirectory()) { out.push(relDir); return out; }
   for (const name of readdirSync(abs).sort()) {
-    if (GLOB_SKIP_DIRS.has(name)) continue;
+    if (skipDirs.has(name)) continue;
     const childRel = relDir ? `${relDir}/${name}` : name;
     const childAbs = join(rootAbs, childRel);
-    if (statSync(childAbs).isDirectory()) walkFiles(rootAbs, childRel, out);
+    if (statSync(childAbs).isDirectory()) walkFiles(rootAbs, childRel, out, { skipDirs });
     else out.push(childRel);
   }
   return out;
@@ -124,4 +127,123 @@ export function expandRepoGlob(repoRoot, pattern) {
   const re = globToRegExp(pattern);
   const files = walkFiles(repoRoot, globStaticPrefix(pattern), []);
   return files.filter((f) => re.test(f)).sort();
+}
+
+/* ══ Tailwind content 的展开:复用 fast-glob,不再自研语义(r6 条目 3/4/5)══
+
+   自研 glob 展开这条路已被证伪四次:
+     r4  黑名单挡 `{}()!,` 漏了字符类 `[ab]`(我们当字面量、micromatch 当字符类);
+     r6  content.relative:true 时 glob 基准变成 dirname(userConfigPath),而 `--content`
+         CLI 参数只覆盖 config.content.files、**不覆盖 relative** —— 于是 config 在
+         apps/desktop/ 时真文件 apps/desktop/src/Foo.tsx 被实扫,而我们只返回仓根诱饵
+         src/Foo.tsx;两边哈的是完全不同的一组文件,且「零命中即 fail」不触发
+         (matched.length===1,只是命中了错的);
+     r6  GLOB_SKIP_DIRS 无条件跳 node_modules/.git,而 Tailwind 的 fastGlob.sync 不带
+         ignore —— src/node_modules/vendor-widget/Widget.tsx 被实扫且生效,我们完全不返回;
+     r6  `***` / `a**` 这类写法两边语义也不同。
+   结论:放弃自研,改成复用**与 Tailwind 同一族**的 fast-glob。
+
+   安全性不靠这里:靠 component-build-core.computeExpectedCssSha 的 CSS 字节复算(条目 1)。
+   本函数只负责**准确性**(入链清单尽量等于 Tailwind 实扫集),算不准最坏是报错不精确,
+   不会放行伪造。
+
+   解析可信性(P0-2 原则):候选根只许放**不受 demo 目录内容左右**的目录 ——
+   QA_HIFI_MODULE_ROOT / PLAYWRIGHT_MODULE_ROOT(运行者显式设置)与产品 repoRoot
+   (必须是 demo 的严格祖先,由调用方保证)。**故意不放 skill 自身目录**:本模块会被
+   拷进 demo,skill-self 在 demo 侧就等于 demo 目录 —— 既不可信,还会让「demo 侧 build」
+   与「skill 侧复算」解析出不同引擎、算出不同清单(假阴性)。解析结果落在 demo 子树内
+   一律拒收。生产环境里产品仓装了 tailwind 就一定装了 fast-glob(tailwind 的依赖),
+   两侧解析到同一份,结果一致。 */
+function resolveFastGlob(trustedDirs, demoRealPath) {
+  for (const dir of trustedDirs.filter(Boolean)) {
+    let resolved;
+    try {
+      const req = createRequire(join(resolve(dir), 'package.json'));
+      resolved = req.resolve('fast-glob');
+      if (demoRealPath && isInside(demoRealPath, realish(resolved))) continue; // 落在 demo 子树 → 拒收
+      const mod = req('fast-glob');
+      const fg = typeof mod?.sync === 'function' ? mod : mod?.default;
+      if (typeof fg?.sync !== 'function') continue;
+      let version = null;
+      try { version = req('fast-glob/package.json').version ?? null; } catch {}
+      return { fg, from: resolved, version };
+    } catch {}
+  }
+  return null;
+}
+const realish = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
+const isInside = (root, abs) => abs === root || abs.startsWith(root + sep);
+
+/**
+ * Tailwind config 里 `content.relative` 的探测 —— 决定 content glob 的基准目录。
+ *
+ * 用**静态文本扫描**而不是 require() 那份 config:读它就要执行产品仓的 JS(以及它
+ * require 的 presets/plugins),而这一步在输入清单计算路径上会被 demo 侧的 build.mjs
+ * 也跑到 —— 次序护栏只在 CSS 复算那条路上成立。静态扫描零执行,基准判错最坏只是
+ * 清单不精确(安全性由 CSS 字节复算兜)。
+ * 已知局限(诚实标注):relative 由 preset 间接打开时扫不出来。
+ */
+export function tailwindContentRelative(tailwindConfigAbs) {
+  try {
+    const text = readFileSync(tailwindConfigAbs, 'utf8');
+    return /(^|[^A-Za-z0-9_$])relative\s*:\s*true/.test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 按 Tailwind 的语义展开 content glob。
+ *
+ * @returns {{files: string[], engine: 'fast-glob'|'builtin', engineFrom: string|null,
+ *            engineVersion: string|null, base: string, relative: boolean, notes: string[]}}
+ *   files 一律是**相对 repoRoot 的 posix 路径**(仓外命中会被丢弃并记 note)。
+ */
+export function expandTailwindContent(repoRoot, patterns, { tailwindConfigAbs = null, demoDir = null } = {}) {
+  const notes = [];
+  const relative_ = tailwindConfigAbs ? tailwindContentRelative(tailwindConfigAbs) : false;
+  // content.relative:true → 基准是 config 所在目录(实测 tailwindcss@3.4.19);否则仓根
+  const base = relative_ && tailwindConfigAbs ? dirname(tailwindConfigAbs) : resolve(repoRoot);
+  if (relative_) notes.push(`tailwind config 开启了 content.relative → glob 基准是 ${base}(不是仓根)`);
+
+  const demoReal = demoDir ? realish(demoDir) : null;
+  const resolved = resolveFastGlob([process.env.QA_HIFI_MODULE_ROOT, process.env.PLAYWRIGHT_MODULE_ROOT, repoRoot], demoReal);
+  const repoReal = realish(repoRoot);
+  const rel = (abs) => {
+    const r = realish(abs);
+    if (!isInside(repoReal, r)) { notes.push(`命中了产品仓外的文件,不入链:${abs}`); return null; }
+    return relativePath(repoReal, r).split(sep).join('/');
+  };
+
+  const out = new Set();
+  if (resolved) {
+    // 与 Tailwind 对齐:**不带 ignore** —— node_modules 里的文件同样被它实扫并生效
+    const hits = resolved.fg.sync(patterns, { cwd: base, onlyFiles: true, absolute: true, dot: false, followSymbolicLinks: true, suppressErrors: true });
+    for (const abs of hits) { const r = rel(abs); if (r) out.add(r); }
+    return {
+      files: [...out].sort(), engine: 'fast-glob', engineFrom: resolved.from,
+      engineVersion: resolved.version, base, relative: relative_, notes,
+    };
+  }
+
+  /* 兜底:产品仓与环境变量都解析不到 fast-glob(生产里意味着产品仓压根没装 tailwind,
+     那时 CSS 复算本身就 fail-closed 了)。仍然与 Tailwind 对齐一点:**不跳过
+     node_modules/.git** —— 跳过就是条目 4 那个非对称。 */
+  notes.push('解析不到 fast-glob(可信侧候选:QA_HIFI_MODULE_ROOT / PLAYWRIGHT_MODULE_ROOT / 产品仓根),'
+    + '退回内建展开 —— 与 Tailwind 的 micromatch 语义可能有差异,入链清单可能不精确;'
+    + '安全性仍由 CSS 字节复算兜住(条目 1)。');
+  for (const pattern of patterns) {
+    if (!/[*?]/.test(pattern)) {
+      const abs = join(base, pattern);
+      if (existsSync(abs)) { const r = rel(abs); if (r) out.add(r); }
+      continue;
+    }
+    const re = globToRegExp(pattern);
+    for (const f of walkFiles(base, globStaticPrefix(pattern), [], { skipDirs: EMPTY_SKIP })) {
+      if (!re.test(f)) continue;
+      const r = rel(join(base, f));
+      if (r) out.add(r);
+    }
+  }
+  return { files: [...out].sort(), engine: 'builtin', engineFrom: null, engineVersion: null, base, relative: relative_, notes };
 }
