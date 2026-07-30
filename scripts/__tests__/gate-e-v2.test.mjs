@@ -42,7 +42,9 @@ function writePixelDemo({ name = 'g2', baselines, baselineDpr = 2, pixelmatchThr
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
     states: [{ id: 'id', via: [{ expect: 'id' }] }],
     verify: {
-      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }],
+      // via 非空且只含 expect:声明「demo 初始就在该 case 的偏好上,无需导航」。
+      // 不用 via:[]——空数组与「忘填」不可分辨,schema 已拒(审核附带收紧项)。
+      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }],
       noClip: ['.box'],
     },
     bindings: [{ sel: '.box', prop: 'color', truth: 'colors.text', kind: 'color' }],

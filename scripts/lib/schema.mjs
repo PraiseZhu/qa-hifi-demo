@@ -1,6 +1,9 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { hashFile, isPlainObject } from './fs-utils.mjs';
+// extract-helpers 是 demo 自包含拷贝件(只依赖 node 内建),这里正向 import 复用同一份
+// fixture locator / capturedFrom 判据——工厂函数与校验器双侧同代码,天然不会漂。
+import { validateCapturedFrom, validateFixtureValueBinding } from './extract-helpers.mjs';
 
 // 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
 // 分端是「采集/存储」维度的命名空间,不是比对维度的白名单——不同 platform 的基准永不互比。
@@ -178,6 +181,11 @@ export function validateSpec(spec) {
         }
         if (c.via !== undefined) {
           if (!Array.isArray(c.via)) problems.push(`verify.cases[${i}].via 必须是 step 数组`);
+          // 空数组是语义陷阱:applyCase 见到 via 就用它取代默认偏好点击链路,via:[] 等于
+          // 「一步都不点」——非默认 case 必然 prefs mismatch,却看起来像"配置好了"。
+          // 想要默认链路就**省略** via 字段,不写空数组(审核附带收紧项)。
+          else if (c.via.length === 0)
+            problems.push(`verify.cases[${i}].via 不能是空数组——想走默认偏好点击就省略 via 字段(空数组会跳过全部点击,非默认 case 必然 prefs mismatch)`);
           else c.via.forEach((s, j) => problems.push(...validateStep(s, `verify.cases[${i}].via[${j}]`, ids)));
         }
         // per-case viewport:移动端 case 必须在移动端视口下验(否则门 C/F 结论对 mobile 不成立)
@@ -401,7 +409,7 @@ export function validateTruth(truth, { demoDir = process.cwd(), requireProvenanc
     // provenance——其完整性由门 A 的 extractor-drift 检查覆盖(跑 extract.mjs 现算 ≡ truth.json)。
     if (path === 'adaptive.samples') return;
     if (isPlainObject(value) && Object.hasOwn(value, 'value')) {
-      if (requireProvenance) validateProvenance(value.provenance, path, demoDir, problems);
+      if (requireProvenance) validateProvenance(value.provenance, path, demoDir, problems, value.value);
       return;
     }
     if (Array.isArray(value)) {
@@ -418,7 +426,7 @@ export function validateTruth(truth, { demoDir = process.cwd(), requireProvenanc
   return problems;
 }
 
-function validateProvenance(prov, path, demoDir, problems) {
+function validateProvenance(prov, path, demoDir, problems, value) {
   if (!isPlainObject(prov)) { problems.push(`${path}.provenance 缺失或不是 object`); return; }
   if (typeof prov.source !== 'string' || !prov.source) problems.push(`${path}.provenance.source 必须是文件路径`);
   if (typeof prov.locator !== 'string' || !prov.locator) problems.push(`${path}.provenance.locator 必须说明定位方式`);
@@ -459,26 +467,35 @@ function validateProvenance(prov, path, demoDir, problems) {
   if (prov.sourceKind !== undefined && sourceKind !== 'code' && sourceKind !== 'fixture') {
     problems.push(`${path}.provenance.sourceKind 只能是 'code' 或 'fixture'(省略即 code)`);
   }
+  // 源文件存在性 + hash 先校验:fixture 的值绑定要读这份文件,文件不在/被改过时
+  // 绑定结论没有意义,应先报根因再跳过绑定(免得一个错误刷出两条互相掩盖的 problem)。
+  let sourceUsable = false;
+  if (typeof prov.source === 'string' && prov.source) {
+    const sourcePath = resolve(demoDir, prov.source);
+    if (!existsSync(sourcePath)) problems.push(`${path}.provenance.source 不存在:${prov.source}`);
+    else if (prov.hash && normalizeHash(prov.hash) !== hashFile(sourcePath))
+      problems.push(`${path}.provenance.hash 与源文件不符:${prov.source}`);
+    else sourceUsable = true;
+  }
   if (sourceKind === 'fixture') {
-    if (typeof prov.capturedFrom !== 'string' || !prov.capturedFrom.trim()) {
-      problems.push(
-        `${path}.provenance.capturedFrom 必填(sourceKind=fixture):一句话声明录制来源,如「2026-07-30 公司沙盒 /api/providers 响应」`,
-      );
-    }
+    for (const p of validateCapturedFrom(prov.capturedFrom)) problems.push(`${path}.provenance.${p}`);
+    let inFixturesDir = false;
     if (typeof prov.source === 'string' && prov.source) {
       const rel = relative(demoDir, resolve(demoDir, prov.source)).split('\\').join('/');
       if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(prov.source)) {
         problems.push(`${path}.provenance.source 指向 demo 目录外:${prov.source}——fixture 必须放 demo 内 fixtures/ 下随 PR 走`);
       } else if (!rel.startsWith('fixtures/')) {
         problems.push(`${path}.provenance.source 必须是 demo 内 fixtures/<name>.json(当前 ${rel})`);
+      } else inFixturesDir = true;
+    }
+    // 值绑定(审核 P1 #3):locator 必须是可解析 JSON 路径,且指向的值 ≡ 叶子 value。
+    // 少了这一条,fixture 就是"手抄数据穿 provenance 马甲"的免检通道——整文件 hash
+    // 只能证明 fixture 没被改过,证明不了叶子里的值真出自这份 fixture。
+    if (inFixturesDir && sourceUsable) {
+      for (const p of validateFixtureValueBinding(value, resolve(demoDir, prov.source), prov.locator)) {
+        problems.push(`${path}.provenance.${p}`);
       }
     }
-  }
-  if (typeof prov.source === 'string' && prov.source) {
-    const sourcePath = resolve(demoDir, prov.source);
-    if (!existsSync(sourcePath)) problems.push(`${path}.provenance.source 不存在:${prov.source}`);
-    else if (prov.hash && normalizeHash(prov.hash) !== hashFile(sourcePath))
-      problems.push(`${path}.provenance.hash 与源文件不符:${prov.source}`);
   }
 }
 

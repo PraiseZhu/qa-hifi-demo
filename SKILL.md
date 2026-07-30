@@ -112,7 +112,8 @@ adapter 必须在 bundle **之后**（它读装配好的 `mount`/`states`）、q
 - 资产不内联：图片走 file loader 落 `assets/`（全内联实测让单文件涨到 10MB 级，仓里不可接受；
   xd-pages 本来就部署整个目录）。产品原始美术资产可能单张就几 MB（登录 hero@2x 实测 3.8MB），
   `assets-manifest.mjs` 默认 8MB 闸门会拦——**要么压图/换 webp，要么显式
-  `--max-total <MB>` 抬闸并在 PR 里写清为什么**，不许闷着抬。
+  `--max-total <MB> --override-reason "<理由>"` 抬闸**；理由是必填参数（缺了直接拒），
+  会自动印上 PR 附贴块，闷着抬这条路已经堵死。
 - **「整窗级组件」的帧语义**（2026-07-30 集成实测）：组件若用 `window.innerWidth/innerHeight`
   自量尺寸、或用 `position: fixed` 铺全屏 overlay（登录屏就是），它的几何公式以 **viewport**
   为基准，而 chrome 工具区占了上方空间、`.frame` 比 viewport 小——两者不一致会让门 C 报
@@ -148,15 +149,18 @@ adapter 必须在 bundle **之后**（它读装配好的 `mount`/`states`）、q
 
 有些值**源码里根本没有字面量**——模型供应商配置、账号 membership、后端下发的开关等，
 只存在于服务端响应里。这类值用 `makeFixtureLeaf()`：把真沙盒响应存成 demo 内
-`fixtures/<name>.json`，叶子记 `provenance.sourceKind: 'fixture'` + `capturedFrom`
-（一句话来源声明，如 `2026-07-30 公司沙盒 /api/providers 响应`）。
+`fixtures/<name>.json`，叶子记 `provenance.sourceKind: 'fixture'` + 结构化 `capturedFrom`。
 
 ```js
 import { makeFixtureLeaf } from './extract-helpers.mjs';
 const fx = readJson('fixtures/providers.json');
 providers: fx.data.map((p, i) => makeFixtureLeaf(p.displayName, 'fixtures/providers.json', {
-  locator: `data[${i}].displayName`,
-  capturedFrom: '2026-07-30 公司沙盒 GET /api/providers 响应',
+  locator: `data.${i}.displayName`,                 // 受限 JSON 路径,会被真解析
+  capturedFrom: {
+    environment: '公司沙盒',                          // 必填
+    capturedAt: '2026-07-30',                        // 必填,ISO 日期开头
+    endpoint: 'GET /api/providers',                  // 可选
+  },
 }))
 ```
 
@@ -164,9 +168,19 @@ providers: fx.data.map((p, i) => makeFixtureLeaf(p.displayName, 'fixtures/provid
 
 - fixture 文件必须落在 demo 内 `fixtures/` 下并随 PR 入库——reviewer 打不开的 fixture 等于没有溯源；
   存在性 + hash 校验与 `code` 叶子完全一致（fixture 是**声明性降级**，不是防伪豁免）。
-- `capturedFrom` 缺失 = 门 A schema FAIL。没有来源声明的 fixture 就是"手抄数据穿了 provenance 马甲"。
+- **`locator` 必须是可机械解析的 JSON 路径**，三种写法：`data.0.displayName`、
+  `data[0].displayName`、JSON Pointer `/data/0/displayName`。自由文本（`'第 0 个 provider 的名字'`）
+  一律 FAIL——不可解析的锚等于没有锚。
+- **值绑定（硬校验）**：工厂函数与门 A 都会解析 fixture 文件、按 locator 取值，与叶子 `value`
+  做 canonical 比对，不符即 FAIL。整文件 hash 只能证明"fixture 没被改过"，证明不了
+  "叶子里的值真出自这份 fixture"——少了值绑定，fixture 就是手抄数据的免检通道。
+- `capturedFrom` 必须是结构化对象 `{ environment, capturedAt[, endpoint, note] }`；
+  `capturedAt` 必须是真日期（ISO 开头）。旧的一句话自由文本已不接受——它没有任何可机械
+  检查的成分，"沙盒响应"四个字就能过，三个月后没人判断得出这份 fixture 还代表不代表真实服务端。
 - **禁止用 fixture 冒充可源码提取的值**：布局常量、i18n 文案、颜色 token 一律 `makeLeaf()` 走源码。
-  拿 fixture 绕过"值抄错了"只是把假绿藏得更深。
+  ⚠️ **这一条工具证明不了**——机械校验只能确认"值确实来自这份 fixture"，无法判断"这个值本来
+  可以从源码提取却偷懒录了 fixture"。它属**人工审查边界**：reviewer 看到 fixture 声明行时，
+  要自己核一遍这些值是不是真的只存在于服务端响应里。
 - 门 A 语义不变：fixture 文件是 extract 的输入，`extract.mjs` 现跑仍须≡`truth.json`。
 - PR 附贴块会自动加一行 `⚠️ N 个叶子来自录制 fixture（非源码溯源）`——不阻断，但对外诚实。
 
@@ -204,6 +218,14 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
 > **大矩阵必须配 `verify.cases` 收敛**:门 B/C 对每个 `case × state` 都 freshLoad(两次页面加载),
 > 全 matrix 笛卡尔积(如 3×2×2×4=48 组 × N 状态)会慢到不可用。真实 demo 用 `spec.verify.cases`
 > 声明一组有代表性组合(pairwise / 关键端×暗色×长文案),不要默认全展开。
+>
+> **`verify.cases[].via` 不许写空数组**(schema 直接拒)。三种语义各有写法,别混：
+> · 省略 `via` → applyCase 走**默认偏好点击**(按 `data-qa-pref` 之类入口逐个点到位),
+>   demo 有偏好控件时用这个；
+> · `via: [{ expect: '<初始状态 id>' }]` → 声明「demo 初始就在该 case 的偏好上,无需导航」,
+>   并顺手断言确实如此；
+> · `via: [ …真实交互步骤… ]` → 自定义到达链路。
+> 空数组同时可以解释成「不需要导航」和「忘填了」,两者不可分辨——用上面第二种写法把意图写明。
 
 - **门 A 真值一致 + extractor drift**：① index.html 内嵌 `<script id="qa-truth">` ≡ truth.json；
   ② 现跑 `extract.mjs` 的输出 ≡ truth.json（证明 value 真由源码提取，不是手抄 value+CSS 蒙混）；
@@ -349,11 +371,23 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
 2. `verify.mjs` 门 A-F 全绿 + （有基准时）`pixel-compare` 无未裁决 WARN；
 3. **产品仓自己的门禁**：受影响包 typecheck + 定向测试 + 仓库要求的全量门禁
    （cindy 仓 = 根目录 `pnpm test:unit`，见其 AGENTS.md）；
-4. **资产清单 + 体积闸门**：`node scripts/assets-manifest.mjs --demo <dir> [--max-total 8]`——
+4. **资产清单 + 体积闸门（demo 有 `assets/` 时是硬门，不是可选步骤）**：
+   `node scripts/assets-manifest.mjs --demo <dir> [--max-total <MB> --override-reason "<理由>"]`——
    图片 / 组件 bundle 一律落 demo 的 `assets/` 独立文件、HTML 用相对路径引用（不全内联：
    实测 hero 图内联能把单文件顶到 10MB 量级，首屏卡、GitHub 预览打不开、PR diff 不可读）。
-   assets/ 总体积超上限（缺省 8MB）exit 2。这些文件逐个 sha 进 `inputHashes.assets` 防伪链，
-   换了图不重跑 verify → report 失效；`pr-block --require-deployed` 也会逐个比对线上资产字节；
+   assets/ 总体积超生效阀 exit 2。这些文件逐个 sha 进 `inputHashes.assets` 防伪链，
+   换了图不重跑 verify → report 失效；`pr-block --require-deployed` 也会逐个比对线上资产字节。
+
+   闸门产物固定落盘 `report-assets.json`（`toolVersion` / `inputHashes.assets` /
+   `defaultLimitMb` / `effectiveLimitMb` / `overrideReason` / `ok`），**`pr-block` 强制**：
+   demo 有 `assets/` 就必须有这份报告、其 assets hash 与当前 `assets/` 一致、且 `ok: true`。
+   三者任一不满足即 exit 2——否则本闸门是一条谁都能整段跳过的"自愿门"（跑没跑过、抬没抬闸，
+   定稿时完全查不到）。
+
+   **抬闸必须留痕**：`--max-total` 高于默认 8MB 时必须同时给非空 `--override-reason "<为什么
+   这个 demo 必须更大>"`，否则参数直接被拒。理由进报告并原样印在 PR 附贴块上：
+   `⚠️ 资产 X MB 超默认闸门 8 MB（本次生效阀 Y MB），抬闸理由：…`。收紧到默认阀以下不需要理由
+   （收紧永远安全），因此也不接受"不抬闸却给理由"——免得"理由"变成随手贴的装饰；
 5. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
    `node scripts/pr-block.mjs --demo <dir> --require-committed --require-deployed --url <部署地址> [--preview ...]`
    产出附贴块——`--require-deployed` 会拉取部署地址逐字节比对本地 index.html（带 cache-bust），
