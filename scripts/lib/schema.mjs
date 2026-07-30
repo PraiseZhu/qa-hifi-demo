@@ -354,6 +354,17 @@ function validateProvenance(prov, path, demoDir, problems) {
       }
     }
   }
+  // locatorKeyPath 可选:写了就必须是「段.段.段」的非空路径——writeback 的 AST 定位锚,
+  // 段含空白/空段说明作者手滑,定位必然失败,这里提前拦下
+  if (prov.locatorKeyPath !== undefined) {
+    if (
+      typeof prov.locatorKeyPath !== 'string' ||
+      !prov.locatorKeyPath.trim() ||
+      prov.locatorKeyPath.split('.').some((s) => !s || /\s/.test(s))
+    ) {
+      problems.push(`${path}.provenance.locatorKeyPath 必须是「段.段.段」非空路径(段不含空白)`);
+    }
+  }
   if (typeof prov.source === 'string' && prov.source) {
     const sourcePath = resolve(demoDir, prov.source);
     if (!existsSync(sourcePath)) problems.push(`${path}.provenance.source 不存在:${prov.source}`);

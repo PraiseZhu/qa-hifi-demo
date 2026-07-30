@@ -52,6 +52,11 @@ chrome 运行时升级：`node scripts/init.mjs --dir <demo-dir> --update-chrome
    提取器是**代码**（import/JSON.parse/正则均可），不是 LLM 复述；每个值必须能溯源到产品文件路径。
    **必须用 demo 内的 `extract-helpers.mjs`**：仓库根用 `findRepoRoot()`（git 定位），叶子用
    `makeLeaf()` / `extractByPattern()` 构造，TS 布局公式用 `importTsModule()` 加载。
+   **「预期会被用户调的参数」带上写回定位锚**（P2.5 机械写回的前提）：正则抓取的值用
+   `extractByPattern()`（自动记 `locatorPattern`）；从模块 import 的常量（token/布局对象里的
+   字面量）用 `makeLeaf(value, file, { keyPath: 'tokens.hero.size' })` 记 `locatorKeyPath`——
+   keyPath 从顶层变量名（或 export default / JSON 根）起逐段写全。公式派生值（如 loginScale
+   现算的几何）在源码无字面值，**不可机械写回**，不要硬标锚。
    **禁止 `../../..` 数目录层级推仓库根**——2026-07-29 login-all-hifi 因此一天连修 3 个 bug
    （demo 从 `_tmp/` 迁 `docs/design-previews/` 后 repoRoot/provenance 前缀全断）。
 3. 跑 `node scripts/truth.mjs --demo <dir>` 生成规范化 `truth.json`。
@@ -186,14 +191,35 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
   node scripts/writeback.mjs --demo <dir> --repo <产品仓根> \
     --set colors.light.panelBg=#FAFAFA --set geometry.loginY=933 [--dry-run]
   ```
-  前提：该 truth 叶子的 `provenance.locatorPattern` 是恰含一个捕获组的正则（extract.mjs 作者
-  为「预期会被调的参数」写上它）。脚本保证：唯一命中 + 源码当前值≡truth 旧值（防盲写）→ 写回 →
-  **重跑 extract round-trip 证明写回生效** → truth.json + qa-truth 内嵌块同步更新 → 失败整体回滚。
-  写完重跑 verify，门 A-F 绿 = 双边一致有机械证明。
+  前提：该 truth 叶子的 provenance 带**定位锚**，两种通道（同时有时优先 regex）：
+  ① `locatorPattern`——恰含一个捕获组的正则（`extractByPattern()` 自动带上）；
+  ② `locatorKeyPath`——源文件中该值的完整对象路径（`makeLeaf({ keyPath })` 记上），
+  writeback 用**产品仓的 typescript** 在 AST 上定位字面量（支持 ts/tsx/js/json；
+  `as const`/`satisfies` 自动解包；多处定义、条件赋值、shorthand、spread、非字面量初始化
+  一律拒转走 agent——宁可拒转不写错位置）。脚本保证：唯一定位 + 源码当前值≡truth 旧值
+  （防盲写）→ 写回 → **重跑 extract round-trip 证明写回生效** → truth.json + qa-truth
+  内嵌块同步更新 → 失败整体回滚。写完重跑 verify，门 A-F 绿 = 双边一致有机械证明。
+- **跨端样式换算**（一次「改值」涉双端语法差异：web `padding:8px 16px` ↔ RN
+  `paddingVertical/Horizontal`；px→数字；transform 数组化；font/textShadow/border shorthand）→
+  **style-sync.mjs 白名单换算**：
+  ```bash
+  node scripts/style-sync.mjs --decl "padding: 8px 16px" [--css-file <path>]
+  ```
+  输出 `{ mechanical: {RN 属性对象}, rejected: [{prop, value, reason}] }`——属性 ∈ RN 合法
+  样式集 ∧ 值可静态保证 RN 侧生效才进 mechanical；`1rem`/`calc()`/`var()`/grid/float 等
+  passthrough 陷阱与无对应语义项**必须**进 rejected。mechanical 属性再由 writeback 逐属性
+  写回；rejected 条目连同原因交 agent 双改。换算不写产品代码，shorthand 原子（任一片段
+  不过校验整条 rejected），防「半边机械写回、半边漂移」。
 - **结构级改动**（新增元素/布局重构/新交互/新状态）→ **agent 双改**：同一轮里既改产品代码
   又改 demo（HTML 与 React/RN 无同构映射，机械直译不存在，诚实走人智），然后 `truth.mjs --embed`
   + `verify.mjs` 闭环——门 A（extractor drift）+ 门 D（渲染绑定）+ 门 F（适配采样）就是
-  「两边真的一致」的验收器。无 locatorPattern 的叶子 writeback 会明确拒绝并提示走本档。
+  「两边真的一致」的验收器。无定位锚的叶子 writeback 会明确拒绝并提示走本档。
+  **双改的结构化输入**：界面关键元素按约定带 `data-node-id`（稳定、语义化、不复用，见
+  templates/demo-shell.html 头注释）时，改动前后两份 index.html 可过
+  `node scripts/dom-ops.mjs --old <旧> --new <新>` 产出结构化操作清单
+  （added/removed/moved/attrChanged/textChanged/styleChanged，含锚点坐标与前置状态；
+  无锚点节点归入 unanchored 段如实列出、须人工核对）。清单是 agent 双改的输入，
+  **不自动应用**——它替代「两份全文自由读」，不替代「映射到产品组件树」的人智判断。
 
 ### P6 定稿 = PR ready（用户确认最终 HTML 后的收口）
 

@@ -45,6 +45,10 @@ window.__qaDemo = {
   renderApp(ctx) {
     // TODO:按 ctx.truth + ctx.prefs + ctx.state 渲染界面本体进 ctx.frame。
     // 界面数据只准取自 ctx.truth;需要门 F 探针的元素加 data-qa-probe="<id>"。
+    // 结构锚点约定:界面关键元素(卡片/按钮/输入框/列表项/状态容器)加
+    //   data-node-id="<稳定、语义化、不复用的 id>"(如 login-panel / submit-btn)——
+    //   它是 P2.5 结构级改动同步时 dom-ops.mjs 新旧对齐的锚;id 一经使用禁止改名复用
+    //   (改名 = removed+added,丢失改动追踪)。装饰性/一次性容器可不加。
     ctx.frame.innerHTML = '';
     const el = document.createElement('div');
     el.style.padding = '24px';
