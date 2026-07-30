@@ -142,8 +142,15 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     },
   };
 
-  /* ── esbuild 从**产品仓**解析(demo 自身不装依赖) ── */
-  const esbuildPath = resolveFrom('esbuild', [process.env.QA_HIFI_MODULE_ROOT, repoRoot, process.cwd()]);
+  /* ── esbuild 从**产品仓**解析(demo 自身不装依赖) ──
+     候选链只许放**不受单个 demo 目录内容左右**的目录(审核 r4 CRITICAL):
+     QA_HIFI_MODULE_ROOT 由运行者显式设置,repoRoot 由 git rev-parse --show-toplevel 得到。
+     r3 曾把 process.cwd() 兜在最后 —— 而复算路径(recheckComponentInputs)正是把子进程
+     cwd 设成 demoDir 的,于是 `<demo>/node_modules/esbuild/index.js` 成了默认入口下的
+     任意代码执行:CJS 顶层代码在 import 时同步跑,且 node_modules 既不入哈希链、
+     也不在 checkDemoBuilderIntegrity 的具名文件表里 —— 全绿地被执行。
+     结论:**解析候选里绝不允许出现 cwd / demoDir 这类不可信侧路径**。 */
+  const esbuildPath = resolveFrom('esbuild', [process.env.QA_HIFI_MODULE_ROOT, repoRoot]);
   const esbuildMod = await import(pathToFileURL(esbuildPath).href);
   const esbuild = esbuildMod.default?.build ? esbuildMod.default : esbuildMod;
 
