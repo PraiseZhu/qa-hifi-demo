@@ -249,7 +249,10 @@ test('#2c-b verify 层也拦得住(不 skip,无需浏览器): 省略 content 的
 
 test('#2c-b 薄壳模板始终显式传 --content(不 skip,源码契约)', () => {
   const tpl = readFileSync(join(ROOT, 'templates/component-build.mjs'), 'utf8');
-  assert.match(tpl, /'--content', comp\.css\.content\.join\(','\)/, '模板必须无条件显式传 --content');
+  /* r7 条目 2:content 改显式文件列表后,--content 的参数构造收敛到构建核心的 contentCliArg
+     (转绝对路径,两侧共用一份);断言随之改成那条,强度不变——仍然要求**无条件显式传**。 */
+  assert.match(tpl, /'--content', contentCliArg\(repoRoot, comp\)/, '模板必须无条件显式传 --content(参数由 contentCliArg 构造)');
+  assert.ok(!/comp\.css\.content\.join\(','\)/.test(tpl), '模板不该再直接 join 相对路径(语义解释权要收回)');
   assert.ok(
     !/if \(Array\.isArray\(comp\.css\.content\) && comp\.css\.content\.length\) args\.push\('--content'/.test(tpl),
     '仍保留「有 content 才传」的条件分支 → Tailwind 会回退到 config.content 隐式扫描(#2c-b 未修)',

@@ -61,7 +61,7 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
-| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` glob 命中的每个文件** / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓。该声明由两道机制共同兜住（r4）：复算子进程解析构建期依赖时**候选目录只有 `QA_HIFI_MODULE_ROOT` 与 repoRoot**（绝不含 cwd/demo 目录——否则 `<demo>/node_modules/esbuild` 的顶层代码会在 import 时执行）；且 demo 目录及任意子目录**只要存在 `node_modules` 就 fail-closed**「demo 目录不应自带 node_modules，检测到依赖目录，拒绝——demo 自身不装依赖」（demo 侧依赖既不入哈希链、也不在构建期文件对照表里，是绕过具名 hash 的侧路）|
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` 显式声明的每个文件**（r7：显式列表，非 glob） / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓。该声明由两道机制共同兜住（r4）：复算子进程解析构建期依赖时**候选目录只有 `QA_HIFI_MODULE_ROOT` 与 repoRoot**（绝不含 cwd/demo 目录——否则 `<demo>/node_modules/esbuild` 的顶层代码会在 import 时执行）；且 demo 目录及任意子目录**只要存在 `node_modules` 就 fail-closed**「demo 目录不应自带 node_modules，检测到依赖目录，拒绝——demo 自身不装依赖」（demo 侧依赖既不入哈希链、也不在构建期文件对照表里，是绕过具名 hash 的侧路）|
 
 **「真组件直渲」不靠声明，靠运行期哨兵 —— 而且只认你声明的那个导出。**
 只证明 `entry` 在 `metafile` 输入里是不够的：`import '<entry>'` 这种副作用导入同样让它进图、
@@ -132,14 +132,28 @@ import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bun
 `shims[{spec,file,why}]` / `css`（配了 `css` 就**必须**显式声明 `css.content` 非空数组——r4 起
 省略/空数组一律 schema + build 双重 fail-closed，因为不显式声明时 Tailwind 会按
 `tailwind.config.js` 里的 `content` **隐式扫描**，那些样式源文件不进防伪链，改了 hash 不变、
-旧 CSS + 旧 report 照过；build 现在始终用显式 `--content` 覆盖 config。每个 glob 必须是仓内
-相对的**受限 glob**——r5 起改成**白名单式字符扫描**：只允许 `A-Za-z0-9` 与 `_ - . / * ?`
-（外加非 ASCII 文件名字符），其余 ASCII 标点一律拒。r4 用黑名单 `{}()!,` 挡，漏了字符类：
-本工具把 `[ab]` 转义成**字面量**，Tailwind 的 fast-glob/micromatch 却当**字符类**——仓里放一个
-字面文件名 `src/[ab].tsx` 就能做到「我们零命中不入链、Tailwind 实扫 a/b」，改 a/b 不换 hash。
-所以字符类 `[ab]`、brace `{a,b}`、`!` 否定、extglob `+(a)`/`@(a)`/`!(a)`、括号、逗号多值、
-反斜杠、绝对路径、`..`、`require()`/对象形式一律 fail-closed 并点名触发的元字符；
-任一 glob 零命中也直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链。
+旧 CSS + 旧 report 照过；build 始终用显式 `--content` 覆盖 config。
+
+> **⚠️ 破坏性变更（r7 条目 2）：`css.content` 只接受「显式的仓内相对普通文件路径」列表，
+> 不再支持 glob 与目录。** 旧 spec（如 `["src/**/*.tsx"]`）会在 schema / build / verify 入口
+> 直接被拒并附迁移指引。迁移方式：
+> `node scripts/lib/component-build-core.mjs --suggest-content "src/**/*.tsx" --demo <dir>`
+> 把旧 glob 展成建议清单，**抄进 spec.json**（生成器只是便利工具，运行期一律不做展开）。
+> 逐项校验：非空且无首尾空白、不含 `* ? [ ] { } ! ( ) + @ , | ^ $ \\`、非绝对路径、无反斜杠、
+> 无 `..`、无空段、默认拒 `node_modules/` 与 `.git/` 下的路径；再加 fs 层的「存在 + 必须是
+> regular file + realpath 落在 repoRoot 内」（挡 symlink 越狱）。声明不存在的文件 = exit 2
+> （等价于旧「glob 零命中」：CSS 会按更小的集合编译却不被发现）。
+> **为什么收紧到这个程度**：自研 glob 展开已被证伪四次（字符类 `[ab]` → `content.relative`
+> 基准错位 → `node_modules` 非对称扫描 → `***`/`a**` 语法差异），r6 改成复用 fast-glob 后仍留
+> 三条残余；而 Tailwind v3 **没有公开稳定的 API/CLI 能导出真实 file set**
+> （`parseCandidateFiles` 是包内私有 API，不是升级稳定契约）。所以把语义解释权收回来。
+> **不变式 `S ⊆ E = L`**（实扫集 ⊆ 期望集 = 入链集）由**参数结构**保证：content 转成绝对
+> 文件路径传 `--content`，Tailwind 对绝对文件路径给出 `glob === null`，扫描集就是那些文件
+> 本身；CLI override 之后 `config.content` 与 `config.content.relative` 都不再决定集合。
+> 参数构造两侧共用构建核心的 `contentCliArg`（薄壳 build 与可信侧复算必须逐字节一致，
+> 否则 CSS 字节复算会误杀合法产物）。受限 glob 白名单仍在，但只服务 `component.sources`
+> 等其它 glob 用途，不再管 content。
+
 不需要 tailwind 就把 `component.css` 设为 `null`） / `themeVars.truthPath` /
 `fixtures[{id,why,shape?}]` / `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
 （`"inject"` / `"via"`，单一真相源）。adapter 升级：
@@ -304,17 +318,47 @@ artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自�
 （`ok`/`skipped`/`declared`/`threshold` + 每个基准的 `status`；`bad`/`total` 因重新渲染有
 像素级抖动，不做全等以免假阴性）。
 
+### 执行时序原则（r7 条目 1 CRITICAL，写死）
+
+**「可信侧重跑」成立的前提是：canonical runner 自己不能在核心观察之前执行被审方的代码。**
+r5/r6 一直漏了这一条 —— r6 的 verify 次序是「跑 demo `extract.mjs` → 三项字节复算 → 启浏览器
+跑门 B/C/D/F」，于是 demo 代码拿到了**整个观察窗口**：`extract.mjs` 同步返回**正确** truth
+（门 A extractor drift 绿），同时派一个 `detached`+`unref` 的 worker，在父 verify 存活期间把
+永久错误的 `index.html` 临时改成与 truth 一致（门 D 实测**绿**），父进程退出瞬间恢复原错误
+文件。最终磁盘字节与 `inputHashes` 完全自洽 —— verify exit 0、门 D 判过。
+
+r7 起的次序（**禁止调换，由 `comp-fix-r7` 源码契约测试锁死**）：
+
+1. 观察前算一次 `inputHashes`；
+2. 门 A 的纯静态段（内嵌 `qa-truth` ≡ `truth.json`）+ 三项可信侧字节复算
+   （`--check-inputs` / `--check-bundle` / `--check-css`；它们跑 skill canonical，不执行 demo 代码）；
+3. 浏览器门 B/C/D/F（全部核心测量）；
+4. **之后**才执行 demo 侧代码：门 A 的 extractor drift 段 + 门 X 自定义门。门 A 的结论**延后
+   合并**（`gateAHardFail` 一票否决），extractor drift 这项检查不丢不降级；
+5. 再算一次 `inputHashes` 与第 1 步比对，不等即门 A 红。
+
+**pr-block 侧同理**：门 E 的可信重跑必须排在可信 verify **之前** —— verify 末段会执行 demo
+代码，排在其后的那次真实渲染观察正好落在攻击窗口里。
+
+**第 5 步是纵深，不是主防线**：攻击可以在父进程退出后才恢复原文件，让前后两次 hash 都自洽；
+真正挡住它的是「核心观察全部早于执行 demo 代码」。
+
+**残余风险（如实标注）**：demo 侧代码在第 4 步之后仍能改磁盘（只是核心观察已完成）。**没有**把
+extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本都不合适，且 Node `vm` 不是安全
+边界，不拿它假装隔离。因此：**任何在第 4 步之后新增的观察性检查都会重新打开这个窗口**，
+新增检查必须放在分界线之前（源码契约测试会拦）。
+
 ### 门级全表（结论进 PR 附贴块 ⇒ 必须有可信侧来源）
 
 **原则（写死）：任何结论会进 PR 附贴块的门，都必须有可信侧来源。** 没有可信来源的门不许出块。
 
 | 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
 |---|---|---|---|
-| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-bundle`（bundle 字节）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对 | 复算路径上不执行 demo 目录里的任何代码 |
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-bundle`（bundle 字节）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对，**但排在所有浏览器门之后**（r7 条目 1）；执行完 demo 代码再复算一次 `inputHashes` 作纵深 | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并 |
 | B 状态覆盖 | ✅ 进（`passed/total`） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | 哨兵结论同门 |
 | C 交互鲁棒 | ✅ 进（checks 列表） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
 | D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
-| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 标注） | **pr-block 亲自 spawn canonical `pixel-compare.mjs`**（r6 条目 2；不在 verify 的门集合里） | 未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
+| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 标注） | **pr-block 亲自 spawn canonical `pixel-compare.mjs`**（r6 条目 2；不在 verify 的门集合里），**且排在可信 verify 之前**（r7 条目 1：verify 末段会执行 demo 代码） | 未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
 | F 适配还原 | ✅ 进（点数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
 | X 自定义门 | ✅ 进（gate id 列表） | pr-block 重跑 canonical `verify.mjs`；门脚本字节进 `inputHashes.customGates`，verify 后改脚本即 hash 不符 | 体外门不游离于完整性校验之外 |
 | 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 体积） | pr-block **自己**从 `assets/` 重算体积与阀值比对；`report-assets.json` 自报数字仅对账 | 见下表 |
@@ -355,19 +399,21 @@ artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自�
 | 读 `truth.json`（`countFixtureLeaves`） | fixture 叶子计数 | 只用于生成"⚠️ N 个叶子来自录制 fixture"的**诚实降级声明**；内容已被门 A 的 extractor 复算锚住 |
 | `component.inputs.json` | —— | pr-block **不直接读**；由 verify / `report.mjs` 经复算与逐文件 hash 处理 |
 
-> **Tailwind content 入链集的准确性（r6 条目 3/4/5，如实标注局限）**：`component.css.content`
-> 的展开改为复用**与 Tailwind 同族的 fast-glob**，不再自研 glob 语义（自研已被证伪四次：
-> 字符类 `[ab]` → `content.relative` 基准 → `node_modules` 非对称扫描 → `***`/`a**` 语法差异）。
-> fast-glob 只从可信侧解析（`QA_HIFI_MODULE_ROOT` / `PLAYWRIGHT_MODULE_ROOT` / 产品 repoRoot；
-> **故意不含 skill 自身**——本模块会被拷进 demo，skill-self 在 demo 侧就等于 demo 目录），
-> 解析结果落在 demo 子树内一律拒收；展开时**不跳过 `node_modules`**（与 Tailwind 对齐）。
-> 仍存在的局限：① `content.relative` 用静态文本扫描判定，由 preset 间接打开时扫不出来；
-> ② 我们解析到的 fast-glob 与 Tailwind 内部那份**未必同源**（产品仓正常安装时同源，已有实跑
-> 断言；不同源时展开语义可能有版本差异）；③ tailwind config `require` 的 presets/plugins
-> 不做递归入链追踪。**这三条都只影响入链清单的精确度，不影响安全性**——它们统一由
-> `--check-css` 的 CSS 字节复算兜住：只要有人改了 Tailwind 实扫到的任何文件而不重建，
-> 可信侧现编的字节就不等于磁盘字节，门 A 直接红。受限 glob 白名单保留，但已**降级为
-> 「快速失败 + 可读报错」，不再是安全锚**。
+> **Tailwind content 入链集（r7 条目 2：从 glob 降级为显式文件列表）**：`component.css.content`
+> 只接受**显式的仓内相对普通文件路径**，构建与可信侧复算都把它转成**绝对路径**传给
+> Tailwind `--content`。此时不变式 **`S ⊆ E = L`**（实扫集 ⊆ 期望集 = 入链集）由**参数结构**
+> 保证，不再依赖任何展开语义的猜测：绝对文件路径在 Tailwind 的 `parseCandidateFiles` 里
+> `glob === null`，扫描集就是那些文件本身；`config.content` 与 `config.content.relative` 在
+> CLI override 之后都不再决定集合。r6 遗留的三条局限**因此消失**：① `content.relative` 不必
+> 再靠静态文本扫描推断；② 不再需要与 Tailwind 内部 fast-glob 同源（我们压根不展开）；
+> ③ `node_modules` 非对称扫描没有了发生条件（显式路径默认拒依赖目录，且不递归任何目录）。
+> **仍在的一条**：tailwind config `require` 的 presets/plugins 不做递归入链追踪 —— 它由
+> `--check-css` 的 CSS 字节复算兜住（改 plugin → 重编字节不等于磁盘字节 → 门 A 红），
+> 已有实跑回归。CSS 字节复算仍是**最终锚**。
+> 版本联动：`tailwindcss` / `fast-glob` / `micromatch` 的版本钉在
+> `scripts/__tests__/fixtures/r7-content-engine-versions.json`，变了就让集成测试红，
+> 强制重跑「实扫集 === resolved list」的交叉验证（私有 API 不可加载即 fail-closed，
+> **不许 fallback 回自研 glob**）。
 
 **失败取证**：任一动态门失败自动截图到 `verify-artifacts/`，failure 条目带 `screenshot`
 字段——不用再开 `--headed` 人肉复现失败现场。`verify-artifacts/` 是生成产物，不入库。

@@ -418,7 +418,7 @@ test('#2c-b 复现样本(不 skip): 字面 [ab].tsx 入链零命中 / Tailwind �
   const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
   const out = `${r.stdout}${r.stderr}`;
   assert.equal(r.status, 2, `字符类 glob 被放行了(#2c-b 未修):${out}`);
-  assert.match(out, /不是本工具可解析的受限 glob/);
+  assert.match(out, /含 glob\/元字符|不是本工具可解析的受限 glob/);
   assert.match(out, /\[/, '报文应点出触发的元字符');
 });
 

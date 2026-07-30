@@ -23,7 +23,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ComponentBuildError, computeComponentBuild, CSS_PLACEHOLDER, DEFAULT_TAILWIND_INPUT } from './component-build-core.mjs';
+import { ComponentBuildError, computeComponentBuild, contentCliArg, CSS_PLACEHOLDER, DEFAULT_TAILWIND_INPUT } from './component-build-core.mjs';
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const CHECK_ONLY = process.argv.includes('--check-inputs');
@@ -59,12 +59,12 @@ if (comp.css?.tailwindConfig) {
   writeFileSync(inputCss, comp.css.input ?? DEFAULT_TAILWIND_INPUT);
   const bin = join(repoRoot, 'node_modules', '.bin', 'tailwindcss');
   if (!existsSync(bin)) fail(`component.css.tailwindConfig 已配置,但产品仓没有 tailwindcss CLI:${bin}`);
-  // --content 始终显式传(r4 追加 #2c-b):不传时 Tailwind 按 config.content 隐式扫描,
-  // 那些文件不入 component.inputs.json 防伪链。content 非空由构建核心 fail-closed 保证,
-  // 这里再兜一道:真为空就拒,绝不退回隐式扫描。
-  if (!Array.isArray(comp.css.content) || comp.css.content.length === 0)
-    fail('component.css.content 必须是非空数组(组件模式要求显式声明 tailwind content;不显式声明则样式源文件不入防伪链)');
-  const args = ['-c', R(comp.css.tailwindConfig), '-i', inputCss, '-o', cssOut, '--content', comp.css.content.join(',')];
+  /* --content 始终显式传(r4 追加 #2c-b):不传时 Tailwind 按 config.content 隐式扫描,
+     那些文件不入 component.inputs.json 防伪链。
+     r7 条目 2:content 是**显式文件路径列表**,参数构造统一走构建核心的 contentCliArg
+     (转成绝对路径)—— 两侧参数必须逐字节一致,否则可信侧 CSS 字节复算会误杀本地产物。
+     content 非空/格式/存在性由构建核心 fail-closed 保证,这里不再自己判。 */
+  const args = ['-c', R(comp.css.tailwindConfig), '-i', inputCss, '-o', cssOut, '--content', contentCliArg(repoRoot, comp)];
   execFileSync(bin, args, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'inherit'] });
   rmSync(inputCss, { force: true });
   cssBytes = readFileSync(cssOut).length;

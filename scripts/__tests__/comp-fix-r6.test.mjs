@@ -12,7 +12,8 @@
 //                    → 手写一份满足全部自洽约束的 report-pixel.json 即可伪造视觉回归 PASS。
 //   条目 3/4/5       自研 glob 展开与 Tailwind 的 fast-glob 语义不一致(content.relative 基准、
 //                    node_modules 非对称扫描、config 的 presets/plugins 依赖未入链)。
-//                    安全性由条目 1 的字节复算兜住,准确性改为复用 fast-glob。
+//                    安全性由条目 1 的字节复算兜住;准确性 r6 改为复用 fast-glob,
+//                    r7 条目 2 起进一步把 content 降级为显式文件列表(见本文件条目 3/4/5 段头注)。
 //
 // 分层说明(诚实标注):端到端 PoC 需要真 esbuild + playwright(项目 canonical 测试命令
 // 一直带 QA_HIFI_MODULE_ROOT,因此实跑);零依赖的源码契约/纯函数断言一律不 skip。
@@ -52,6 +53,8 @@ function run(script, args, opts = {}) {
   });
 }
 const readJson = (f) => JSON.parse(readFileSync(f, 'utf8'));
+/** 去掉注释后的可执行代码 —— 源码契约要断的是「代码里还有没有」,不是「注释提没提」。 */
+const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
 const ENTRY = [
   "import { helper } from './Helper';",
@@ -169,7 +172,12 @@ test('条目 1 源码契约(不 skip): 构建核心提供 --check-css / fs-utils
   const v = readFileSync(VERIFY, 'utf8');
   assert.match(v, /recheckComponentCss\(demoDir, spec\.component\)/, 'gate A 必须调用 CSS 复算');
   assert.match(v, /gateA\.cssRecheck = cssCheck\.status/);
-  assert.match(v, /cssCheck\.problems\.length[\s\S]{0,80}gateA\.pass = false/, 'CSS 复算不一致必须让 gate A 红');
+  /* r7 起门 A 的 pass 在「执行 demo 侧代码」之后才汇总(见 verify 文件头「执行时序原则」),
+     所以各段失败不再就地写 gateA.pass=false,而是置 gateAHardFail —— 汇总时
+     pass = !gateAHardFail && extractorDrift==='none'。断言强度不变(CSS 复算不一致 → 门 A 红),
+     只是跟着实现改成断真正的那条链路;下一行把汇总语义也一并钉住。 */
+  assert.match(v, /cssCheck\.problems\.length[\s\S]{0,80}gateAHardFail = true/, 'CSS 复算不一致必须让 gate A 红');
+  assert.match(v, /gateA\.pass = !gateAHardFail && gateA\.extractorDrift === 'none'/, '门 A 汇总必须把 hardFail 一票否决');
 
   // 薄壳模板不许再写死占位字面量(否则与可信侧常量漂移)
   const tpl = readFileSync(join(ROOT, 'templates/component-build.mjs'), 'utf8');
@@ -374,38 +382,41 @@ test('条目 2 阳性对照(实跑,不 skip): 真跑 pixel-compare 且基准与�
   assert.ok(!pr.stdout.includes('未运行 pixel-compare'), '门 E 真跑过,不该打「未运行」');
 });
 
-// ============ 条目 3/4/5 — content 入链集的准确性(安全性由条目 1 兜住) ============
 
-test('条目 3/4/5 源码契约(不 skip): tailwind content 展开改走 fast-glob;白名单降级为快速失败', () => {
+/* ============ 条目 3/4/5 — content 入链集的准确性 ============
+   r7 条目 2 起 content 从 glob 降级为**显式文件路径列表**(破坏性接口变更),
+   下面三条原本针对「自研/复用 glob 与 Tailwind 实扫集的语义差异」的 PoC 因此变形:
+   同样的 fixture、同样的攻击意图,但期望从「差异必须被 fast-glob 消除」改成
+   「这类声明在入口就被拒绝」——判定只收紧不放宽(过去是「算准它」,现在是「不许出现」)。
+   条目 5 那条兜底(改 config require 的 plugin → CSS 字节复算不符)与 content 形态无关,原样保留。
+   显式列表本身的正向/对抗覆盖见 comp-fix-r7.test.mjs。 */
+
+test('条目 3/4/5 源码契约(r7 变形,不 skip): content 不再有任何展开语义;白名单只服务其它 glob 用途', () => {
   const rg = readFileSync(join(ROOT, 'scripts/lib/repo-glob.mjs'), 'utf8');
-  assert.match(rg, /export function expandTailwindContent/);
-  assert.match(rg, /export function tailwindContentRelative/, '必须处理 content.relative 的基准');
-  // 与 Tailwind 对齐:展开时不带 ignore(node_modules 同样被它实扫)
-  assert.match(rg, /skipDirs: EMPTY_SKIP/, '兜底展开必须与 Tailwind 一样不跳过 node_modules');
-  const resolver = rg.slice(rg.indexOf('function resolveFastGlob'), rg.indexOf('const realish'));
-  for (const bad of ['process.cwd()', 'demoDir,', 'SELF_DIR', 'import.meta.dirname']) {
-    assert.ok(!resolver.includes(bad), `fast-glob 解析候选里出现了不可信/会漂移的根 ${bad}`);
-  }
-  assert.match(resolver, /QA_HIFI_MODULE_ROOT|trustedDirs/);
-  assert.match(rg, /落在 demo 子树 → 拒收/);
+  // r6 的 fast-glob 复用整段下线 —— 留着它就等于留「还能走 glob」的错觉
+  assert.ok(!/export function expandTailwindContent/.test(rg), 'content 的 fast-glob 展开应在 r7 下线');
+  assert.ok(!/export function tailwindContentRelative/.test(rg), 'content.relative 的静态推断随之下线(CLI 绝对路径 override 后它不再决定集合)');
+  assert.ok(!/function resolveFastGlob/.test(rg), 'fast-glob 解析器随之下线');
+  assert.match(rg, /export function explicitContentFileProblem/, 'content 的入口校验必须存在');
+  assert.match(rg, /export function expandRepoGlob/, 'assets/sources 等其它 glob 用途必须保留');
+  assert.match(rg, /export function restrictedGlobProblem/, '受限白名单保留(服务其它 glob 用途)');
 
   const core = readFileSync(CORE, 'utf8');
-  assert.match(core, /expandTailwindContent\(repoRoot, list/, '构建核心必须用 fast-glob 那条展开');
-  assert.ok(!/expandRepoGlob\(repoRoot, pattern\)/.test(core), '构建核心仍在用自研展开算 tailwind content');
-  assert.match(core, /降级为「快速失败 \+ 可读报错」/, '白名单的新定位要写清楚(不再是安全锚)');
+  assert.match(core, /export function resolveContentFiles/, 'content 必须只有一份显式解析实现');
+  assert.ok(!/expandTailwindContent/.test(core.replace(/\/\*[\s\S]*?\*\//g, '')), '构建核心的可执行代码里不该再有 glob 展开');
+  assert.match(core, /export function contentCliArg/, '--content 参数构造必须两侧共用一份');
 });
 
-test('条目 3 PoC: content.relative:true 时基准是 config 所在目录 —— 只入链仓根诱饵 = 哈错了一组文件', (t) => {
+test('条目 3 PoC(r7 变形): content.relative 基准错位的前提消失 —— glob 声明在入口就被拒', (t) => {
   if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到清单阶段');
-  /* 审核人用真 tailwindcss@3.4.19 确认:config.content.relative:true 时 glob 基准变成
-     dirname(userConfigPath),而 `--content` CLI 参数只覆盖 config.content.files、不覆盖
-     relative。于是 config 在 apps/desktop/ 时:真文件 apps/desktop/src/Foo.tsx 被实扫,
-     仓根诱饵 src/Foo.tsx 未被扫;自研展开只返回诱饵 → 「零命中即 fail」不触发
-     (matched.length===1,只是命中了错的那个)。 */
+  /* r6 的病灶:config.content.relative:true 时 glob 基准变成 dirname(userConfigPath),
+     而 --content 只覆盖 files 不覆盖 relative → 我们入链仓根诱饵、Tailwind 实扫 config 目录下的真文件。
+     r7:content 只接受显式文件、传绝对路径,relative 不再决定集合;而这条 PoC 的 glob 形态
+     (以及任何 glob)在入口即拒。 */
   const { dir } = makeFixture({
     name: 'rel-base',
     repoDeps: 'skill',
-    css: { tailwindConfig: 'apps/desktop/tailwind.config.js', content: ['src/Foo.tsx'] },
+    css: { tailwindConfig: 'apps/desktop/tailwind.config.js', content: ['src/*.tsx'] },
     extraRepoFiles: {
       'apps/desktop/tailwind.config.js': "module.exports = { content: { relative: true, files: [] }, theme: {} };\n",
       'apps/desktop/src/Foo.tsx': 'export const real = "bg-sky-500";\n',
@@ -413,17 +424,27 @@ test('条目 3 PoC: content.relative:true 时基准是 config 所在目录 —�
     },
   });
   const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
-  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-  const product = JSON.parse(r.stdout).buildInputs.product;
-  assert.ok(
-    product.includes('apps/desktop/src/Foo.tsx'),
-    `relative:true 的真实实扫文件没入链(条目 3 未修):${JSON.stringify(product)}`,
-  );
-  assert.ok(!product.includes('src/Foo.tsx'), `仓根诱饵不该入链(它根本没被 Tailwind 扫到):${JSON.stringify(product)}`);
+  assert.notEqual(r.status, 0, 'glob 形态的 content 必须在入口被拒(r7 破坏性变更)');
+  assert.match(r.stdout, /component\.css\.content/);
+  assert.match(r.stdout, /显式/);
+
+  // 阳性:改成显式声明 config 目录下的**真**文件 → 入链的就是它,且不含仓根诱饵
+  const specPath = join(dir, 'spec.json');
+  const spec2 = JSON.parse(readFileSync(specPath, 'utf8'));
+  spec2.component.css.content = ['apps/desktop/src/Foo.tsx'];
+  writeFileSync(specPath, JSON.stringify(spec2, null, 2));
+  const r2 = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r2.status, 0, `${r2.stdout}${r2.stderr}`);
+  const product = JSON.parse(r2.stdout).buildInputs.product;
+  assert.ok(product.includes('apps/desktop/src/Foo.tsx'), `显式声明的真文件必须入链:${JSON.stringify(product)}`);
+  assert.ok(!product.includes('src/Foo.tsx'), `仓根诱饵不该入链:${JSON.stringify(product)}`);
 });
 
-test('条目 4 PoC: node_modules 下的文件 Tailwind 实扫且生效 —— 必须同样入链', (t) => {
+test('条目 4 PoC(r7 变形): node_modules 非对称扫描的前提消失 —— 目录 glob 与 node_modules 路径都被拒', (t) => {
   if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到清单阶段');
+  /* r6 的病灶:我们的展开跳过 node_modules,Tailwind 的 fastGlob.sync 不跳 →
+     src/node_modules/vendor-widget/Widget.tsx 被实扫且生效却不入链。
+     r7:① 'src/**' 这类 glob 在入口即拒;② 就算有人显式写 node_modules 下的路径,也被默认拒。 */
   const { dir } = makeFixture({
     name: 'nm-asym',
     repoDeps: 'skill',
@@ -434,30 +455,44 @@ test('条目 4 PoC: node_modules 下的文件 Tailwind 实扫且生效 —— �
     },
   });
   const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
-  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-  const product = JSON.parse(r.stdout).buildInputs.product;
-  assert.ok(product.includes('src/Plain.tsx'), '普通文件应入链');
-  assert.ok(
-    product.includes('src/node_modules/vendor-widget/Widget.tsx'),
-    `node_modules 下被实扫的文件没入链(条目 4 未修 —— 我们跳过它,Tailwind 不跳):${JSON.stringify(product)}`,
-  );
+  assert.notEqual(r.status, 0, 'glob 形态必须被拒');
+  assert.match(r.stdout, /显式/);
+
+  const specPath = join(dir, 'spec.json');
+  const spec2 = JSON.parse(readFileSync(specPath, 'utf8'));
+  spec2.component.css.content = ['src/Plain.tsx', 'src/node_modules/vendor-widget/Widget.tsx'];
+  writeFileSync(specPath, JSON.stringify(spec2, null, 2));
+  const r2 = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.notEqual(r2.status, 0, 'node_modules 下的显式路径必须被默认拒绝');
+  assert.match(r2.stdout, /node_modules/);
+
+  spec2.component.css.content = ['src/Plain.tsx'];
+  writeFileSync(specPath, JSON.stringify(spec2, null, 2));
+  const r3 = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r3.status, 0, `${r3.stdout}${r3.stderr}`);
+  const product = JSON.parse(r3.stdout).buildInputs.product;
+  assert.deepEqual(product.filter((p) => p.endsWith('.tsx')), ['src/Plain.tsx']);
 });
 
-test('条目 4 交叉验证(实跑真 tailwind): node_modules 下的 class 确实进了 CSS 产物', (t) => {
+test('条目 4 交叉验证(r7 变形,实跑真 tailwind): 未声明的 node_modules 文件不再进 CSS 产物', (t) => {
   if (!MODULE_ROOT) return t.skip('需要真 esbuild 走完 build');
+  /* r6 实测过「Tailwind 会扫 node_modules」——那正是非对称的成因。
+     r7 只把显式文件的绝对路径传给 --content,于是它压根没有机会去扫那个目录:
+     声明的 class 进 CSS,node_modules 里的不进(E = L)。 */
   const { dir } = makeFixture({
     name: 'nm-asym-css',
     repoDeps: 'skill',
-    css: { tailwindConfig: 'tailwind.config.js', content: ['src/**/*.tsx'] },
-    extraRepoFiles: { 'src/node_modules/vendor-widget/Widget.tsx': 'export const v = "bg-fuchsia-500";\n' },
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/Plain.tsx'] },
+    extraRepoFiles: {
+      'src/node_modules/vendor-widget/Widget.tsx': 'export const v = "bg-fuchsia-500";\n',
+      'src/Plain.tsx': 'export const p = "bg-teal-500";\n',
+    },
   });
   const b = run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() });
   assert.equal(b.status, 0, `${b.stdout}${b.stderr}`);
-  assert.match(
-    readFileSync(join(dir, 'assets/component.css'), 'utf8'),
-    /bg-fuchsia-500/,
-    'Tailwind 没扫 node_modules 的话这条 PoC 的前提就不成立了(实测它扫)',
-  );
+  const css = readFileSync(join(dir, 'assets/component.css'), 'utf8');
+  assert.match(css, /bg-teal-500/, '显式声明的 class 必须进 CSS');
+  assert.ok(!css.includes('bg-fuchsia-500'), 'node_modules 下未声明的 class 进了 CSS = E = L 不成立');
 });
 
 test('条目 5 兜底(实跑真 tailwind): 改 config require 的 plugin(不在入链清单里)→ CSS 字节复算立刻不符', (t) => {
@@ -498,26 +533,18 @@ test('条目 5 兜底(实跑真 tailwind): 改 config require 的 plugin(不在�
   assert.match(`${v.stdout}${v.stderr}`, /CSS 字节与可信侧复算结果不一致/);
 });
 
-test('条目 3/4/5 引擎同源性(实跑): 我们用的 fast-glob 与 tailwind 内部那份必须来自同一份安装', (t) => {
-  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到 --check-css');
-  const { dir } = makeFixture({
-    name: 'fg-origin',
-    repoDeps: 'skill',
-    css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] },
-  });
-  const r = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
-  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-  const cg = JSON.parse(r.stdout).contentGlob;
-  assert.equal(cg.engine, 'fast-glob', '产品仓装了 tailwind 就一定装了 fast-glob,不该退回内建展开');
-  assert.match(cg.version ?? '', /^\d+\./);
-  // 同源判定:tailwindcss 自己解析出来的 fast-glob 与我们解析到的必须是同一个文件
-  const req = createRequire(join(ROOT, 'package.json'));
-  const twFg = createRequire(req.resolve('tailwindcss')).resolve('fast-glob');
-  assert.equal(
-    realpathSync(cg.from),
-    realpathSync(twFg),
-    '两份 fast-glob 不同源 → 展开语义可能有版本差异;此时入链清单的准确性只能靠 CSS 字节复算兜',
-  );
+
+test('条目 3/4/5 引擎同源性(r7 变形,不 skip): content 路径已无第三方展开引擎可言', () => {
+  /* r6 需要断言「我们解析到的 fast-glob 与 tailwind 内部那份同源」,因为展开语义决定入链集。
+     r7 起 content 不做任何展开 —— 同源性这个风险项本身被消掉了,改为断言它确实不存在:
+     构建核心不再解析/依赖 fast-glob,--check-css 的输出也不再报 contentGlob 引擎实况。 */
+  // 只看可执行代码:注释里回顾历史(r6 曾复用 fast-glob)是必要的,不算残留依赖
+  const core = stripComments(readFileSync(CORE, 'utf8'));
+  assert.ok(!/fast-glob/.test(core), '构建核心的可执行代码不该再依赖 fast-glob(content 无展开引擎)');
+  assert.match(core, /content: \{ mode: 'explicit-files'/, '--check-css 应报显式文件实况而不是展开引擎');
+  // 报错文案里提到 fast-glob/micromatch 是对读者解释语义差异,不是依赖;断的是「有没有真去解析它」
+  const rg = stripComments(readFileSync(join(ROOT, 'scripts/lib/repo-glob.mjs'), 'utf8'));
+  assert.ok(!/require\(.fast-glob.\)|resolve\(.fast-glob.\)|from '.*fast-glob/.test(rg), 'repo-glob 不该再解析 fast-glob');
 });
 
 test('条目 1 占位模式也入锚: 未配 tailwind 时手改占位 CSS 同样被抓', (t) => {

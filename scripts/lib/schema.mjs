@@ -4,7 +4,7 @@ import { hashFile, isPlainObject } from './fs-utils.mjs';
 // extract-helpers 是 demo 自包含拷贝件(只依赖 node 内建),这里正向 import 复用同一份
 // fixture locator / capturedFrom 判据——工厂函数与校验器双侧同代码,天然不会漂。
 import { validateCapturedFrom, validateFixtureValueBinding } from './extract-helpers.mjs';
-import { restrictedGlobProblem } from './repo-glob.mjs';
+import { explicitContentFileProblem } from './repo-glob.mjs';
 
 // 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
 // 分端是「采集/存储」维度的命名空间,不是比对维度的白名单——不同 platform 的基准永不互比。
@@ -363,15 +363,17 @@ export function validateSpec(spec) {
           // 被扫到的样式源文件不入 component.inputs.json 防伪链 → 改样式不换 hash,旧 CSS 照过。
           if (!Array.isArray(c.css.content) || c.css.content.length === 0 || c.css.content.some((g) => typeof g !== 'string'))
             problems.push(
-              'component.css.content 必须是非空 string 数组(tailwind --content glob)——'
+              'component.css.content 必须是非空 string 数组(**显式的仓内相对文件路径**,r7 起不再支持 glob)——'
               + '配了 component.css 就必须显式声明 content;省略会让 Tailwind 按 tailwind.config.js 的 content 隐式扫描,'
               + '那些样式源文件不进防伪链。不需要 tailwind 请把 component.css 设为 null',
             );
-          // 受限 glob 白名单(r5 #2c-b):字符类/brace/extglob 等元字符本工具不实现、
-          // Tailwind 的 micromatch 却会解释 —— 两边语义不一致 = 声明了却没入链。
+          /* r7 条目 2(破坏性变更):content 只接受显式文件路径,glob/目录一律拒。
+             理由与迁移方式见 repo-glob.explicitContentFileProblem 的报文 ——
+             自研/复用 glob 与 Tailwind 实扫集的语义差异已被证伪四次,而 v3 没有公开稳定
+             API 能导出真实 file set;只有显式列表能让 S ⊆ E = L 由参数结构保证。 */
           else
             for (const [i, g] of c.css.content.entries()) {
-              const gp = restrictedGlobProblem(g);
+              const gp = explicitContentFileProblem(g);
               if (gp) problems.push(`component.css.content[${i}] ${gp}`);
             }
         }

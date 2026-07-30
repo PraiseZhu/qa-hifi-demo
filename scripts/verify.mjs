@@ -14,6 +14,26 @@
 // 增量是修复循环里的调试工具,定稿必须全量重跑(防「只验过改的那部分」冒充全绿)。
 //
 // 失败取证:任一动态门失败时自动截图到 verify-artifacts/,failure 条目带 screenshot 字段。
+//
+// ══ 执行时序原则(r7 条目 1 CRITICAL,勿调换;由 comp-fix-r7 源码契约测试锁死)══
+// r5/r6 立的「可信侧重跑」原则有一个前提没被满足过:**spawn canonical verify ≠ 可信**,
+// 只要 canonical runner 在核心观察之前就执行了被审方的任意 Node 代码。
+// r6 之前的次序是:执行 demo/extract.mjs(门 A extractor drift)→ 三项字节复算 → 启浏览器
+// 跑门 B/C/D/F。于是 demo 代码拿到了**整个观察窗口**:extract.mjs 同步返回正确 truth
+// (门 A 绿),同时派一个 detached+unref 的 worker,在父 verify 存活期间把永久错误的
+// index.html CSS 临时改成与 truth 一致(门 D 实测绿),父进程退出瞬间恢复原错误文件。
+// 最终磁盘字节与 inputHashes 完全自洽 —— pr-block exit 0 并贴「渲染绑定 ✅」。
+//
+// r7 起的次序:
+//   ① 观察前算一次 inputHashes;
+//   ② 门 A 的纯静态段(内嵌真值 ≡ truth.json)+ 三项可信侧字节复算(inputs/bundle/CSS);
+//   ③ 浏览器门 B/C/D/F(全部核心测量);
+//   ④ **之后**才执行 demo 侧代码:门 A 的 extractor drift 段 + 门 X 自定义门;
+//   ⑤ 再算一次 inputHashes,与 ① 比对,不等即门 A 红(纵深防御,不是主防线 ——
+//      攻击可以恢复原文件让前后 hash 都自洽,主防线是 ③ 早于 ④)。
+// 门 E(像素)的可信重跑在 pr-block 里,必须排在可信 verify **之前**(同一理由)。
+// 残余风险(诚实标注):demo 代码在 ④ 之后仍能改磁盘,只是核心观察已完成;没有把
+// extractor/custom gate 放进 OS 级 sandbox(Node vm 不是安全边界,不拿它假装隔离)。
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -28,6 +48,7 @@ import {
   recheckComponentBundle,
   recheckComponentCss,
   recheckComponentInputs,
+  sameInputHashes,
   sha256Buffer,
   stableJson,
   TOOL_VERSION,
@@ -114,44 +135,30 @@ function skippedGate(name) {
   return { name, pass: false, skipped: true, detail: '本次为增量运行(--gate 过滤),该门未执行' };
 }
 
-// ---------- 门 A:真值一致 + provenance + extractor drift ----------
-// 三段:① 内嵌 qa-truth ≡ truth.json;② truth 由 extract.mjs 现跑重算 ≡ truth.json(证明 value
-// 真由源码提取,不是手抄 value+CSS+内嵌块蒙混,codex 复审 P0-1);③ provenance 由 validateTruth 保证。
+// ---------- 门 A 第一段(纯静态 + 可信侧字节复算,不执行 demo 侧代码) ----------
+// 门 A 一共四段:① 内嵌 qa-truth ≡ truth.json;② 三项可信侧字节复算(组件模式);
+// ③ truth 由 extract.mjs 现跑重算 ≡ truth.json(证明 value 真由源码提取,不是手抄
+// value+CSS+内嵌块蒙混,codex 复审 P0-1);④ provenance 由 validateTruth 保证。
+// r7 起 ③ 因为要**执行 demo 侧代码**,被推到所有浏览器门之后(见文件头「执行时序原则」)。
 let gateA;
+/** 门 A 里除 extractor drift 之外的任一段已判失败 —— 延后汇总时不许被 extractor 绿覆盖。 */
+let gateAHardFail = false;
 if (!runGate('A')) gateA = skippedGate('真值一致');
 else {
-  gateA = { name: '真值一致', pass: false, detail: '', provenance: 'required', extractorDrift: 'unknown' };
+  gateA = { name: '真值一致', pass: false, detail: '', provenance: 'required', extractorDrift: 'pending' };
   const m = html.match(/<script[^>]*id=["']qa-truth["'][^>]*>([\s\S]*?)<\/script>/);
-  if (!m) gateA.detail = 'index.html 缺 <script id="qa-truth" type="application/json"> 内嵌真值块';
-  else {
+  if (!m) {
+    gateAHardFail = true;
+    gateA.detail = 'index.html 缺 <script id="qa-truth" type="application/json"> 内嵌真值块';
+  } else {
     try {
       const embedded = JSON.parse(m[1]);
       if (stableJson(embedded) !== stableJson(truthObj)) {
+        gateAHardFail = true;
         gateA.detail = '内嵌真值与 truth.json 不一致(规范化比对失败)';
-      } else {
-        // extractor drift:跑 demo/extract.mjs,现算结果必须 ≡ truth.json
-        const extractor = join(demoDir, 'extract.mjs');
-        if (!existsSync(extractor)) {
-          gateA.pass = false;
-          gateA.extractorDrift = 'no-extractor';
-          gateA.detail = '缺 extract.mjs——无法证明 truth 由源码提取(只有 provenance hash 声明,不构成机械证明);请补 extractor';
-        } else {
-          try {
-            const fresh = execFileSync(process.execPath, [extractor], { cwd: demoDir, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-            if (stableJson(JSON.parse(fresh)) === stableJson(truthObj)) {
-              gateA.pass = true;
-              gateA.extractorDrift = 'none';
-            } else {
-              gateA.extractorDrift = 'drift';
-              gateA.detail = 'extract.mjs 现算结果与 truth.json 漂移——truth 被手改或源码已变,重跑 truth.mjs 生成';
-            }
-          } catch (err) {
-            gateA.extractorDrift = 'error';
-            gateA.detail = `extract.mjs 执行失败:${String(err.stderr || err.message).slice(0, 200)}`;
-          }
-        }
       }
     } catch (err) {
+      gateAHardFail = true;
       gateA.detail = `真值块解析失败:${err.message}`;
     }
   }
@@ -161,7 +168,7 @@ else {
     const recheck = recheckComponentInputs(demoDir);
     gateA.inputsRecheck = recheck.status;
     if (recheck.problems.length) {
-      gateA.pass = false;
+      gateAHardFail = true;
       gateA.detail = [gateA.detail, ...recheck.problems].filter(Boolean).join('\n');
     }
     // r5 #1c 第一层:bundle 字节必须等于可信侧 write:false 复算结果
@@ -170,7 +177,7 @@ else {
     const bundleCheck = recheckComponentBundle(demoDir, spec.component);
     gateA.bundleRecheck = bundleCheck.status;
     if (bundleCheck.problems.length) {
-      gateA.pass = false;
+      gateAHardFail = true;
       gateA.detail = [gateA.detail, ...bundleCheck.problems].filter(Boolean).join('\n');
     }
     /* r6 条目 1:CSS 字节必须等于可信侧重编结果(与 bundle 同型)。
@@ -180,7 +187,7 @@ else {
     const cssCheck = recheckComponentCss(demoDir, spec.component);
     gateA.cssRecheck = cssCheck.status;
     if (cssCheck.problems.length) {
-      gateA.pass = false;
+      gateAHardFail = true;
       gateA.detail = [gateA.detail, ...cssCheck.problems].filter(Boolean).join('\n');
     }
   }
@@ -673,6 +680,35 @@ try {
     }
   }
 
+  /* ══════════ 分界线:以下开始执行 demo 侧代码(r7 条目 1) ══════════
+     以上所有**核心观察**已完成:门 A 的静态段与三项可信侧字节复算、门 B/C/D/F 的全部
+     浏览器实测。以下两段(门 A 的 extractor drift、门 X 的自定义门)都要跑 demo 目录里的
+     Node 脚本,一旦执行,被审方就能派 detached 子进程改磁盘 —— 所以它们必须在这里,
+     而不是像 r6 那样排在最前面。禁止把任何观察性检查移到本分界线之下。 */
+
+  // ---------- 门 A 第三段:extractor drift(执行 demo/extract.mjs) ----------
+  // 现算结果必须 ≡ truth.json;证明 truth 真由源码提取,不是手抄 value + 内嵌块蒙混。
+  if (!gateA.skipped) {
+    const extractor = join(demoDir, 'extract.mjs');
+    if (!existsSync(extractor)) {
+      gateA.extractorDrift = 'no-extractor';
+      gateA.detail = [gateA.detail, '缺 extract.mjs——无法证明 truth 由源码提取(只有 provenance hash 声明,不构成机械证明);请补 extractor'].filter(Boolean).join('\n');
+    } else {
+      try {
+        const fresh = execFileSync(process.execPath, [extractor], { cwd: demoDir, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+        if (stableJson(JSON.parse(fresh)) === stableJson(truthObj)) gateA.extractorDrift = 'none';
+        else {
+          gateA.extractorDrift = 'drift';
+          gateA.detail = [gateA.detail, 'extract.mjs 现算结果与 truth.json 漂移——truth 被手改或源码已变,重跑 truth.mjs 生成'].filter(Boolean).join('\n');
+        }
+      } catch (err) {
+        gateA.extractorDrift = 'error';
+        gateA.detail = [gateA.detail, `extract.mjs 执行失败:${String(err.stderr || err.message).slice(0, 200)}`].filter(Boolean).join('\n');
+      }
+    }
+    gateA.pass = !gateAHardFail && gateA.extractorDrift === 'none';
+  }
+
   // ---------- 门 X:自定义门(demo 专属体外脚本,注册进防伪链) ----------
   // 背景:多个真实 demo 自建了 overlap-gate.mjs / interaction-gate.mjs 等体外脚本,
   // 不进 report/hash 链——pr-block 不知道它们跑没跑。注册进 spec.customGates 后:
@@ -705,6 +741,26 @@ try {
         gateX.gates.push(entry);
       }
       gateX.pass = gateX.failures.length === 0;
+    }
+  }
+
+  /* ── 事后输入 hash 复算(r7 条目 1,纵深防御而非主防线) ──
+     demo 侧代码(extract.mjs / 自定义门)执行完之后,把 inputHashes 再算一次,与观察前那份
+     比对。它抓的是「跑完 demo 代码后磁盘已经不是我们观察的那份」这种情形。
+     诚实标注:攻击可以在父进程退出后才恢复原文件,从而让前后两次 hash 都自洽 ——
+     所以这一条**不是**主防线,主防线是「核心观察全部排在执行 demo 代码之前」。 */
+  const inputHashesPost = buildInputHashes(demoDir, spec);
+  if (!gateA.skipped) {
+    const same = sameInputHashes(inputHashes, inputHashesPost);
+    gateA.postRunHashRecheck = same ? 'ok' : 'mismatch';
+    if (!same) {
+      gateA.pass = false;
+      gateA.detail = [
+        gateA.detail,
+        '执行 demo 侧代码(extract.mjs / 自定义门)之后,输入 hash 与观察前不一致——'
+        + 'demo 代码在本次验收过程中改写了自己的输入文件(index.html / assets / truth 等),'
+        + '本次所有测量结果都不可信。\n修法:extract.mjs 与自定义门必须是只读的,不得改写 demo 输入。',
+      ].filter(Boolean).join('\n');
     }
   }
 

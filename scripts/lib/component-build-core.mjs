@@ -18,15 +18,19 @@
 //   node component-build-core.mjs --check-css --demo <demoDir>
 //     → 用产品 tailwind config 重编一遍 CSS 到临时目录,给出「应该得到的
 //       assets/component.css」sha256(r6 条目 1;未配 tailwind 时给占位字节的期望值)。
+//   node component-build-core.mjs --suggest-content "<旧 glob>" [...] --demo <demoDir>
+//     → **生成器**(r7 条目 2):把旧式 glob 在产品仓内展开成建议的显式文件清单打到 stdout,
+//       供作者抄进 spec.json 的 component.css.content。它只是便利工具:运行期一律不做展开,
+//       定稿输入必须是显式列表(不变式 S ⊆ E = L 由参数结构保证,不能依赖展开语义)。
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { findRepoRoot, resolveFrom } from './extract-helpers.mjs';
-import { expandTailwindContent, findDemoNodeModules, restrictedGlobProblem } from './repo-glob.mjs';
+import { explicitContentFileProblem, findDemoNodeModules } from './repo-glob.mjs';
 
 export const CORE_FILE_NAME = 'component-build-core.mjs';
 export const BUILDER_FILE_NAME = 'build.mjs';
@@ -66,64 +70,79 @@ export const CSS_PLACEHOLDER =
   '/* 组件模式:spec.component.css 未配置,无编译产物(占位,保证 index.html <link> 不 404) */\n';
 export const DEFAULT_TAILWIND_INPUT = '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n';
 
+/* ══ tailwind content = **显式文件路径列表**(r7 条目 2,破坏性接口变更)══
+
+   不变式 **S ⊆ E = L**:
+     L(入链集)  = component.css.content 解析出的那批文件,逐一进 buildInputs.product;
+     E(期望集)  = 传给 Tailwind `--content` 的绝对路径列表,与 L 逐项同源;
+     S(实扫集)  ⊆ E —— 因为每一项都是**绝对普通文件路径**,Tailwind 的 parseCandidateFiles
+                  对它给出 glob === null,扫描集就是这些文件本身,没有任何展开语义空间。
+   这条不变式由**参数结构**保证,不靠事后比对/猜测。CLI 上的 `--content` override 之后,
+   config.content 与 config.content.relative 都不再决定集合(r6 条目 3 那条基准错位因此消失)。
+
+   为什么不再自研/复用 glob:语义差异已被证伪四次,而 Tailwind v3 没有公开稳定 API 能导出
+   真实 file set(parseCandidateFiles 是包内私有 API)。旧 glob 的迁移见
+   repo-glob.explicitContentFileProblem 的报文,以及本文件 CLI 的 `--suggest-content` 生成器。 */
+
 /**
- * tailwind content 的展开(声明了就必须能展开成实际文件并逐一入链,审核 #2c-b)。
- * 提到模块级:构建核心的输入清单与「可信侧 CSS 字节复算」都要用同一份展开语义。
+ * 把 component.css.content 解析成绝对路径列表(唯一实现;构建、可信侧复算、薄壳 build 共用)。
+ * 逐项校验:格式(explicitContentFileProblem)+ 存在 + regular file + realpath 落在 repoRoot 内。
+ * @returns {{absolute: string[], relative: string[]}} 两者一一对应且已排序去重。
  */
-export function tailwindContentSet(repoRoot, comp, { demoDir = null } = {}) {
-  const list = Array.isArray(comp.css?.content) ? comp.css.content : [];
+export function resolveContentFiles(repoRoot, list) {
+  const repoReal = realpathish(repoRoot);
+  const problems = [];
+  const pairs = new Map(); // rel(posix,相对 repoReal) → abs(realpath)
+  for (const [i, entry] of (Array.isArray(list) ? list : []).entries()) {
+    const formatProblem = explicitContentFileProblem(entry);
+    if (formatProblem) { problems.push(`component.css.content[${i}] ${formatProblem}`); continue; }
+    const abs = join(repoRoot, entry);
+    if (!existsSync(abs)) { problems.push(`component.css.content[${i}] 文件不存在:${entry}(显式列表不许声明不存在的文件——它会让 CSS 按更小的集合编译却不被发现)`); continue; }
+    let st;
+    try { st = statSync(abs); } catch (err) { problems.push(`component.css.content[${i}] 无法 stat:${entry}(${err.message})`); continue; }
+    if (!st.isFile()) { problems.push(`component.css.content[${i}] 不是普通文件(目录/设备/socket 一律拒):${entry}`); continue; }
+    const real = realpathish(abs);
+    // symlink 越狱:声明项本身在仓内,realpath 可能指到仓外 —— 那份文件不入链却会被实扫
+    if (real !== repoReal && !real.startsWith(repoReal + sep)) {
+      problems.push(`component.css.content[${i}] realpath 落在产品仓外(symlink 越狱?):${entry} → ${real}`);
+      continue;
+    }
+    pairs.set(toPosix(relative(repoReal, real)), real);
+  }
+  if (problems.length) fail(problems.join('\n'), 2);
+  const rels = [...pairs.keys()].sort();
+  return { relative: rels, absolute: rels.map((r) => pairs.get(r)) };
+}
+
+/**
+ * `--content` 的**唯一**参数构造:可信侧复算(compileTailwindOnce)与 demo 侧薄壳 build.mjs
+ * 都必须调它。两侧参数只要有一点不同,CSS 字节复算就会误杀合法 demo。
+ */
+export function contentCliArg(repoRoot, comp) {
+  return contentSetup(repoRoot, comp).absolute.join(',');
+}
+
+/** content 必填校验 + 解析,构建清单与 CSS 复算共用一条路径。 */
+function contentSetup(repoRoot, comp) {
   /* ── css 非 null 时 content 必填(审核 r4 追加 #2c-b,方案 A) ──
-     r3 允许 `css: { tailwindConfig }` 不带 content:那时 build 不传 --content,
-     Tailwind 按 **config.content** 隐式扫描,而清单只记 tailwind.config.js 本身,
-     config.content 命中的样式源文件全不入链 —— 改它们 hash 不变、旧 CSS 照过门。
-     现在:配了 css 就必须显式声明 content(非空),build 也始终用 --content 覆盖 config,
-     隐式扫描这条路彻底关掉。 */
+     不显式声明时 Tailwind 会按 config.content 隐式扫描,而清单只记 tailwind.config.js 本身,
+     被扫到的样式源文件全不入链 —— 改它们 hash 不变、旧 CSS 照过门。 */
   if (comp.css && (!Array.isArray(comp.css.content) || comp.css.content.length === 0))
     fail(
       'component.css 已配置但 component.css.content 缺失/为空——组件模式要求**显式**声明 tailwind content。'
       + '\n原因:不显式声明时 Tailwind 会按 tailwind.config.js 里的 content 隐式扫描,而那些被扫到的'
       + '样式源文件不会进 component.inputs.json 防伪链;改样式源文件 hash 不变,旧 CSS + 旧 report 照过验收。'
-      + '\n修法:把 config 里 content 的等价 glob 抄进 component.css.content(仓内相对,只支持 * / ** / ?);'
+      + '\n修法(r7 起):把样式源文件**逐个显式列出**(仓内相对普通文件路径,不支持 glob/目录),'
+      + '可用 `node component-build-core.mjs --suggest-content "<旧 glob>" --demo <dir>` 生成建议清单;'
       + '真不需要 tailwind 就把 component.css 设为 null。',
       2,
     );
-  /* 受限白名单(r5 #2c-b)保留,但 r6 起**降级为「快速失败 + 可读报错」**,不再是安全锚:
-     安全性由 computeExpectedCssSha 的 CSS 字节复算兜(条目 1)。也不再为语法差异打补丁 ——
-     差异由下面复用 fast-glob 消除。它现在的作用是把 `{a,b}` / `[ab]` / `!x` 这类**本工具
-     没在清单侧验证过**的写法挡在门外并给出明确修法,比让它们悄悄进来更好读。 */
-  for (const pattern of list) {
-    const globProblem = restrictedGlobProblem(pattern);
-    if (globProblem) fail(`component.css.content ${globProblem}`, 2);
-  }
-  /* 展开交给 **与 Tailwind 同一族的 fast-glob**(r6 条目 3/4/5):
-     处理 content.relative 的基准、不跳过 node_modules、`***`/`a**` 等语义差异。
-     解析不到 fast-glob 时退回内建展开(同样不跳 node_modules),并在 notes 里说清风险。 */
-  const tailwindConfigAbs = comp.css?.tailwindConfig
-    ? (isAbsolute(comp.css.tailwindConfig) ? comp.css.tailwindConfig : join(repoRoot, comp.css.tailwindConfig))
-    : null;
-  const expanded = expandTailwindContent(repoRoot, list, { tailwindConfigAbs, demoDir });
-  const out = new Set(expanded.files.filter((rel) => existsSync(join(repoRoot, rel))));
-  // 「零命中即配置错误」这条不变:声明了 content 却一个文件都匹配不到 = CSS 会按空 content 编译
-  if (list.length > 0 && out.size === 0)
-    fail(
-      `component.css.content 在产品仓内零命中(glob 基准 ${expanded.base}${expanded.relative ? ',由 config 的 content.relative 决定' : ''};`
-      + `展开引擎 ${expanded.engine})——声明了 content 却匹配不到任何文件 = 配置错误`
-      + '(CSS 会按空 content 编译,改样式源文件也不会让 hash 变)。'
-      + `\n声明:${list.join(', ')}`
-      + (expanded.notes.length ? `\n${expanded.notes.join('\n')}` : '')
-      + '\n修法:修正这些 glob,或从 component.css.content 里删掉它们。',
-      2,
-    );
-  return out;
+  return resolveContentFiles(repoRoot, comp.css?.content ?? []);
 }
 
-/** 与 tailwindContentSet 同一次展开,但把引擎/基准/notes 也带出来(供 --check-css 输出与排查)。 */
-export function tailwindContentDetail(repoRoot, comp, { demoDir = null } = {}) {
-  const list = Array.isArray(comp.css?.content) ? comp.css.content : [];
-  const tailwindConfigAbs = comp.css?.tailwindConfig
-    ? (isAbsolute(comp.css.tailwindConfig) ? comp.css.tailwindConfig : join(repoRoot, comp.css.tailwindConfig))
-    : null;
-  return expandTailwindContent(repoRoot, list, { tailwindConfigAbs, demoDir });
+/** 入链集 L:content 解析出的仓内相对路径(与传给 Tailwind 的绝对路径一一对应)。 */
+export function tailwindContentSet(repoRoot, comp) {
+  return new Set(contentSetup(repoRoot, comp).relative);
 }
 
 /**
@@ -184,9 +203,8 @@ export async function computeExpectedCssSha(demoDir) {
 
   const configAbs = isAbsolute(comp.css.tailwindConfig) ? comp.css.tailwindConfig : join(repoRoot, comp.css.tailwindConfig);
   if (!existsSync(configAbs)) fail(`component.css.tailwindConfig 不存在:${configAbs}`, 2);
-  // content 的合法性/非空/零命中一律先判(与输入清单同一份实现,报文一致)
-  tailwindContentSet(repoRoot, comp, { demoDir });
-  const contentDetail = tailwindContentDetail(repoRoot, comp, { demoDir });
+  // content 的格式/存在性/仓内归属一律先判(与输入清单同一份实现,报文一致)
+  const contentFiles = resolveContentFiles(repoRoot, comp.css.content);
 
   const bin = join(repoRoot, 'node_modules', '.bin', 'tailwindcss');
   if (!existsSync(bin))
@@ -212,15 +230,9 @@ export async function computeExpectedCssSha(demoDir) {
   return {
     css: cssRel, mode: 'tailwind', sha256: runs[0].sha256, bytes: runs[0].bytes, deterministic: true,
     // 展开引擎实况:同源性风险(我们用的 fast-glob 与 tailwind 内部那份是否同一份)靠它可查
-    contentGlob: {
-      engine: contentDetail.engine,
-      from: contentDetail.engineFrom,
-      version: contentDetail.engineVersion,
-      base: contentDetail.base,
-      relative: contentDetail.relative,
-      files: contentDetail.files.length,
-      notes: contentDetail.notes,
-    },
+    /* 不变式 S ⊆ E = L 的实况:contentFiles 就是传给 Tailwind --content 的绝对路径列表,
+       也是进 buildInputs.product 的那一批(相对路径形态)。没有展开引擎、没有基准歧义。 */
+    content: { mode: 'explicit-files', count: contentFiles.relative.length, files: contentFiles.relative },
   };
 }
 
@@ -233,7 +245,9 @@ function compileTailwindOnce({ repoRoot, bin, configAbs, comp, tag }) {
   try {
     // 参数与薄壳 build.mjs 逐项对齐(cwd=repoRoot、-c/-i/-o/--content 同序),
     // 否则复算字节与作者产出字节会因参数差异而不等 —— 那是误杀不是检出。
-    execFileSync(bin, ['-c', configAbs, '-i', inputCss, '-o', outCss, '--content', comp.css.content.join(',')], {
+    // --content 传**绝对文件路径**(contentCliArg 是两侧唯一实现):CLI override 之后
+    // config.content 与 config.content.relative 都不再决定集合(不变式 E = L)。
+    execFileSync(bin, ['-c', configAbs, '-i', inputCss, '-o', outCss, '--content', contentCliArg(repoRoot, comp)], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024,
@@ -547,9 +561,9 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
   // qa-entry-orig 下,这里剥掉前缀,让它照常按真实文件路径归位。
   const stripNs = (key) => (key.startsWith(`${ENTRY_ORIG_NS}:`) ? key.slice(ENTRY_ORIG_NS.length + 1) : key);
 
-  /** tailwind content:声明了就必须能展开成实际文件并逐一入链(审核 #2c-b)。 */
+  /** tailwind content 的入链集 L(r7:显式文件列表,与传给 --content 的绝对路径一一对应)。 */
   function tailwindContentFiles() {
-    return tailwindContentSet(repoRoot, comp, { demoDir });
+    return tailwindContentSet(repoRoot, comp);
   }
 
   function normalizeInputs(metafile) {
@@ -660,13 +674,41 @@ if (invokedDirectly) {
   const wantInputs = argv.includes('--check-inputs');
   const wantBundle = argv.includes('--check-bundle');
   const wantCss = argv.includes('--check-css');
-  if (!wantInputs && !wantBundle && !wantCss) {
-    process.stderr.write('用法: node component-build-core.mjs --check-inputs|--check-bundle|--check-css [--demo <demoDir>]\n');
+  const suggestIdx = argv.indexOf('--suggest-content');
+  if (!wantInputs && !wantBundle && !wantCss && suggestIdx === -1) {
+    process.stderr.write('用法: node component-build-core.mjs --check-inputs|--check-bundle|--check-css|--suggest-content <glob...> [--demo <demoDir>]\n');
     process.exit(2);
   }
   const i = argv.indexOf('--demo');
   const demoDir = i >= 0 && argv[i + 1] ? resolve(argv[i + 1]) : process.cwd();
   try {
+    /* ── 生成器:旧 glob → 建议的显式清单(r7 条目 2 的迁移便利,不参与验收) ──
+       用 expandRepoGlob(仓内自研展开)只是为了「列个候选给人看」,不承担任何安全职责:
+       它的输出必须由作者过目并抄进 spec.json,运行期读到的永远是那份显式列表。 */
+    if (suggestIdx !== -1) {
+      const globs = argv.slice(suggestIdx + 1).filter((a) => !a.startsWith('--'));
+      if (!globs.length) { process.stderr.write('--suggest-content 需要至少一个 glob\n'); process.exit(2); }
+      const repoRoot = findRepoRoot(demoDir);
+      const { expandRepoGlob } = await import('./repo-glob.mjs');
+      const out = new Set();
+      const skipped = [];
+      for (const g of globs) {
+        for (const rel of expandRepoGlob(repoRoot, g)) {
+          if (!existsSync(join(repoRoot, rel))) continue;
+          // 生成器不许产出定稿会被拒的条目 —— 否则作者抄进去还要再返工一轮
+          if (explicitContentFileProblem(rel)) { skipped.push(rel); continue; }
+          out.add(rel);
+        }
+      }
+      process.stdout.write(`${JSON.stringify({
+        note: '把 content 抄进 spec.json 的 component.css.content;运行期不做展开,定稿必须是显式列表',
+        repoRoot,
+        content: [...out].sort(),
+        skipped: skipped.sort(),
+        skippedNote: skipped.length ? '这些命中项不能作为显式 content(含元字符/在 node_modules 或 .git 下),需人工处理' : null,
+      }, null, 2)}\n`);
+      process.exit(0);
+    }
     if (wantCss) {
       process.stdout.write(`${JSON.stringify(await computeExpectedCssSha(demoDir), null, 2)}\n`);
       process.exit(0);
