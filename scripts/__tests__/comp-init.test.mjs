@@ -301,7 +301,9 @@ function makeFixtureRepo() {
 /** 把 demo 装成 fixture 可构建的形态(react-free bootstrap:本测试验构建管线,不验 React 装配)。 */
 function prepareFixtureDemo(repo) {
   const demoDir = join(repo, '_tmp/demo');
-  const res = run(INIT, ['--dir', demoDir, '--name', 'fixture-demo', '--mode', 'component', '--entry', 'src/renderer/components/Widget.tsx']);
+  const res = run(INIT, ['--dir', demoDir, '--name', 'fixture-demo', '--mode', 'component', '--entry', 'src/renderer/components/Widget.tsx',
+    // r3:目标组件导出名(拿到「真组件直渲」结论的唯一途径;init 只在给了该 flag 时才写进 spec)
+    '--entry-export', 'renderWidget']);
   assert.equal(res.status, 0, res.stdout + res.stderr);
 
   const specPath = join(demoDir, 'spec.json');

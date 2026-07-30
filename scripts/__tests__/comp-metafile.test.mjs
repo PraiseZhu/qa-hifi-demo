@@ -86,6 +86,8 @@ function makeFixture({ name, bootstrap = 'real', sources = [] } = {}) {
   mkdirSync(join(dir, 'assets'), { recursive: true });
   copyFileSync(BUILD_TEMPLATE, join(dir, 'build.mjs'));
   copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
+  copyFileSync(join(ROOT, "scripts/lib/component-build-core.mjs"), join(dir, "component-build-core.mjs"));
+  copyFileSync(join(ROOT, "scripts/lib/repo-glob.mjs"), join(dir, "repo-glob.mjs"));
   writeFileSync(
     join(dir, 'src/bootstrap.ts'),
     bootstrap === 'real'
@@ -106,6 +108,8 @@ function makeFixture({ name, bootstrap = 'real', sources = [] } = {}) {
     component: {
       mode: 'component',
       entry: 'src/components/Claimed.ts',
+      // 目标组件导出名:r3 起「真组件直渲」结论只认这个导出被调用(见 pr-block/verify 哨兵)
+      export: 'claimed',
       sources,
       bundle: 'assets/component.bundle.js',
       bootstrap: 'src/bootstrap.ts',
@@ -173,7 +177,7 @@ test('pr-block: 改未声明但真被 bundle 读到的源文件 → 旧 report �
   const ok = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(ok.status, 0, `未篡改时应放行:${ok.stdout}${ok.stderr}`);
   // 附贴块的 N 来自 manifest 真实输入(3 个),不是自报的 1 个
-  assert.match(ok.stdout, /真组件直渲（3 个源文件 hash 入链，运行期哨兵实测入口组件被渲染）/);
+  assert.match(ok.stdout, /真组件直渲（3 个源文件 hash 入链，运行期哨兵实测声明的目标组件导出被渲染）/);
   writeFileSync(join(repo, 'src/components/Helper.ts'), "import { DEEP } from './Deep';\nexport const helper = () => `tampered-${DEEP}`;\n");
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 2, `改未声明的真实输入居然放行:${pr.stdout}${pr.stderr}`);

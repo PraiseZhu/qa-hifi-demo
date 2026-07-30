@@ -2,6 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DEMO_BUILD_FILES } from './component-build-core.mjs';
+import { expandRepoGlob } from './repo-glob.mjs';
 
 export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r3';
 
@@ -116,60 +119,9 @@ export function findGitRepoRoot(startDir) {
   }
 }
 
-const GLOB_SKIP_DIRS = new Set(['.git', 'node_modules']);
-
-/** glob 段 → 正则源码。`**` 跨目录、`*` 段内、`?` 单字符,其余字符字面量转义。 */
-function globToRegExp(pattern) {
-  let src = '';
-  for (let i = 0; i < pattern.length; i += 1) {
-    const c = pattern[i];
-    if (c === '*') {
-      if (pattern[i + 1] === '*') {
-        // `**/` 允许匹配零层目录;裸 `**` 匹配任意后缀
-        if (pattern[i + 2] === '/') { src += '(?:.*/)?'; i += 2; } else { src += '.*'; i += 1; }
-      } else src += '[^/]*';
-    } else if (c === '?') src += '[^/]';
-    else src += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${src}$`);
-}
-
-/** glob 前的静态目录前缀:只遍历这一段,避免在大仓里全量 walk。 */
-function globStaticPrefix(pattern) {
-  const segs = pattern.split('/');
-  const out = [];
-  for (const seg of segs) {
-    if (/[*?]/.test(seg)) break;
-    out.push(seg);
-  }
-  // 最后一段若是完整文件名(无通配)也会被收进来,walkFiles 对文件路径同样安全
-  return out.join('/');
-}
-
-function walkFiles(rootAbs, relDir, out) {
-  const abs = relDir ? join(rootAbs, relDir) : rootAbs;
-  if (!existsSync(abs)) return out;
-  if (!statSync(abs).isDirectory()) { out.push(relDir); return out; }
-  for (const name of readdirSync(abs).sort()) {
-    if (GLOB_SKIP_DIRS.has(name)) continue;
-    const childRel = relDir ? `${relDir}/${name}` : name;
-    const childAbs = join(rootAbs, childRel);
-    if (statSync(childAbs).isDirectory()) walkFiles(rootAbs, childRel, out);
-    else out.push(childRel);
-  }
-  return out;
-}
-
-/**
- * 按 glob 展开 repoRoot 下的文件(相对路径,已排序去重)。
- * 无通配符的模式不 walk,直接当字面路径返回(缺失与否交给调用方记 MISSING)。
- */
-export function expandRepoGlob(repoRoot, pattern) {
-  if (!/[*?]/.test(pattern)) return [pattern];
-  const re = globToRegExp(pattern);
-  const files = walkFiles(repoRoot, globStaticPrefix(pattern), []);
-  return files.filter((f) => re.test(f)).sort();
-}
+// glob 展开实现搬到 lib/repo-glob.mjs(component 构建核心也要用同一份语义,见该文件头注)。
+// 这里保留同名再导出,历史 import 点不受影响。
+export { expandRepoGlob };
 
 // 组件模式 bundle 输入清单(由 build.mjs 从 esbuild metafile 生成)。
 // 「声明源」(spec.component.entry/sources)与「bundle 真实输入」必须机械绑定:
@@ -197,33 +149,72 @@ export function readComponentInputsManifest(demoDir) {
   return parsed;
 }
 
+/* ── demo 侧构建期文件 ⟷ skill canonical 的对照表(审核 #2c-a) ──
+   demo 目录里的 build.mjs / component-build-core.mjs / extract-helpers.mjs / repo-glob.mjs
+   都是 init.mjs 从 skill 仓逐字节拷过去的。它们的 sha256 必须与 canonical 全等:
+   「换一份更宽松的构建器」在 r3 起不只是让 hash 变(那只拦旧 report),而是直接被门 A
+   fail-closed 拒收。canonical 路径从本文件位置推,skill 装在哪都不受影响。 */
+const LIB_DIR = dirname(fileURLToPath(import.meta.url));
+const CANONICAL_BUILD_FILES = {
+  'build.mjs': join(LIB_DIR, '../../templates/component-build.mjs'),
+  'component-build-core.mjs': join(LIB_DIR, 'component-build-core.mjs'),
+  'extract-helpers.mjs': join(LIB_DIR, 'extract-helpers.mjs'),
+  'repo-glob.mjs': join(LIB_DIR, 'repo-glob.mjs'),
+};
+
 /**
- * 独立复算 bundle 输入图(审核 #2c):跑 `node build.mjs --check-inputs`,拿 esbuild
- * 现算的规范化清单与 demo 内 component.inputs.json 做全等比对。
+ * demo 里的构建期文件必须逐字节等于 skill canonical——不等就是自定义构建器。
+ * 返回 problems(空 = 全等)。
+ */
+export function checkDemoBuilderIntegrity(demoDir) {
+  const problems = [];
+  for (const name of DEMO_BUILD_FILES) {
+    const demoFile = join(demoDir, name);
+    const canonical = CANONICAL_BUILD_FILES[name];
+    if (!canonical || !existsSync(canonical)) continue; // skill 自身残缺:别把锅算到 demo 头上
+    if (!existsSync(demoFile)) {
+      problems.push(`缺 ${name}——组件模式 demo 必须带 skill 下发的原版构建期文件才能独立复算 ${COMPONENT_INPUTS_FILE}(重跑 init.mjs --mode component)`);
+      continue;
+    }
+    if (hashFile(demoFile) !== hashFile(canonical))
+      problems.push(
+        `检测到自定义构建器,需人工审查:${name} 与本工具 canonical 版本不一致(sha256 不等)。`
+        + '\n组件模式的构建规范不许 demo 侧改写——改了就无法判断清单/产物是按什么规则生成的。'
+        + `\n修法:用 skill 原版覆盖(重跑 init.mjs --mode component),真需要改构建规范请改 skill 仓 ${name === 'build.mjs' ? 'templates/component-build.mjs' : `scripts/lib/${name}`} 并走 review。`,
+      );
+  }
+  return problems;
+}
+
+/**
+ * 独立复算 bundle 输入图(审核 #2c):用 **skill 仓自己那份构建核心**
+ * (`scripts/lib/component-build-core.mjs --check-inputs`)现算一遍 esbuild 输入图,
+ * 与 demo 内 component.inputs.json 做全等比对。
  *
- * 为什么必须复算:manifest 是一份可手改的 JSON。「先把 productInputs 缩到只剩 entry,
- * 再重跑 build」会被覆盖,但「先缩 manifest,再只重跑 verify」——verify 原来直接把
- * manifest 当真相源,缩完的窄链照样算出一致 hash,链就白锁了。复算把真相源换回 esbuild。
+ * 为什么必须复算:manifest 是一份可手改的 JSON。「先缩 manifest,再只重跑 verify」——
+ * verify 若直接把 manifest 当真相源,缩完的窄链照样算出一致 hash,链就白锁了。
+ *
+ * 为什么 oracle 必须是 skill 侧的(r3,审核 #2c-a):r2 复算跑的是
+ * `node <demo>/build.mjs --check-inputs` —— oracle 自己就在被审对象里。终审实证把
+ * demo/build.mjs 换成「--check-inputs 时原样打印现有 component.inputs.json」的脚本,
+ * 缩链后 verify/pr-block 全绿。r3 起复算路径上**不执行 demo 目录里的任何代码**,
+ * 另外用 checkDemoBuilderIntegrity 把 demo 侧拷贝钉死在 canonical 上。
  *
  * 返回 { status, problems }:
- *   'ok'         — 复算结果与 manifest 全等;
- *   'mismatch'   — 不等(problems 含 diff 摘要);
- *   'no-builder' — demo 里没有 build.mjs(不是本工具生成的组件 demo,交给别的门管);
- *   'error'      — 复算本身跑不起来(缺 esbuild / 构建报错),fail-closed 记 problem。
+ *   'ok'          — 复算结果与 manifest 全等;
+ *   'mismatch'    — 不等(problems 含 diff 摘要);
+ *   'bad-builder' — demo 侧构建器缺失或被改写(fail-closed,不做复算比对);
+ *   'error'       — 复算本身跑不起来(缺 esbuild / 构建报错),fail-closed 记 problem。
  */
 export function recheckComponentInputs(demoDir) {
   const declared = readComponentInputsManifest(demoDir);
   if (!declared) return { status: 'no-manifest', problems: [] }; // 由 NO_MANIFEST 那条单独阻断
-  const builder = join(demoDir, 'build.mjs');
-  if (!existsSync(builder)) {
-    return {
-      status: 'no-builder',
-      problems: [`缺 build.mjs——组件模式 demo 必须带构建器才能独立复算 ${COMPONENT_INPUTS_FILE}(重跑 init.mjs --mode component)`],
-    };
-  }
+  const builderProblems = checkDemoBuilderIntegrity(demoDir);
+  if (builderProblems.length) return { status: 'bad-builder', problems: builderProblems };
   let fresh;
   try {
-    const out = execFileSync(process.execPath, [builder, '--check-inputs'], {
+    // cwd 必须是 demoDir:esbuild metafile 的 key 相对 cwd,换 cwd 会改整份清单的规范化结果
+    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-inputs', '--demo', demoDir], {
       cwd: demoDir,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
@@ -232,7 +223,7 @@ export function recheckComponentInputs(demoDir) {
   } catch (err) {
     return {
       status: 'error',
-      problems: [`独立复算 bundle 输入图失败(node build.mjs --check-inputs):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
+      problems: [`独立复算 bundle 输入图失败(skill 侧 component-build-core --check-inputs):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
     };
   }
   if (sameInputHashes(fresh, declared)) return { status: 'ok', problems: [] };
@@ -250,7 +241,7 @@ export function recheckComponentInputs(demoDir) {
   listDiff('demoInputs', fresh.demoInputs, declared.demoInputs);
   listDiff('buildInputs.demo', fresh.buildInputs?.demo, declared.buildInputs?.demo);
   listDiff('buildInputs.product', fresh.buildInputs?.product, declared.buildInputs?.product);
-  for (const key of ['generator', 'entry', 'entrySentinel', 'skippedExternal']) {
+  for (const key of ['generator', 'entry', 'entryExport', 'entrySentinel', 'skippedExternal']) {
     if (JSON.stringify(fresh[key]) !== JSON.stringify(declared[key]))
       diff.push(`${key} 不一致:现算 ${JSON.stringify(fresh[key])} vs 清单 ${JSON.stringify(declared[key])}`);
   }
