@@ -36,6 +36,12 @@ const demoIdx = args.indexOf('--demo');
 if (demoIdx === -1 || !args[demoIdx + 1]) failJson('缺 --demo <dir>');
 const demoDir = resolve(args[demoIdx + 1]);
 const headed = args.includes('--headed');
+// --report-out <file>:把 report 写到指定路径而不是 <demo>/report.json。
+// 供 pr-block 在**可信侧重跑全门**时使用(r5 架构主线 P0-1):重跑结果落在 demo 之外,
+// 既不覆盖作者的 report.json,也不让被审对象碰到我们自己的裁决依据。
+const reportOutIdx = args.indexOf('--report-out');
+if (reportOutIdx !== -1 && !args[reportOutIdx + 1]) failJson('--report-out 需要一个文件路径');
+const reportOut = reportOutIdx !== -1 ? resolve(args[reportOutIdx + 1]) : join(demoDir, 'report.json');
 
 function listArg(flag) {
   const i = args.indexOf(flag);
@@ -710,7 +716,7 @@ try {
     gateX,
     generatedAt: new Date().toISOString(),
   };
-  writeFileSync(join(demoDir, 'report.json'), JSON.stringify(report, null, 2) + '\n');
+  writeFileSync(reportOut, JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report, null, 2));
   process.exitCode = allPass ? 0 : 2;
 } catch (err) {

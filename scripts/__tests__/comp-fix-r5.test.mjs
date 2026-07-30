@@ -184,6 +184,70 @@ function writeForgedReport(demoDir, spec) {
   return report;
 }
 
+// ==================== 条目 1 — P0-1:report.json 整份可手写 ====================
+
+test('P0-1 源码契约(不 skip): pr-block 必须自己重跑 canonical verify,并且不再拿 demo 自报当放行依据', () => {
+  const src = readFileSync(join(ROOT, 'scripts/pr-block.mjs'), 'utf8');
+  assert.match(src, /CANONICAL_VERIFY\s*=\s*join\(SCRIPT_DIR, 'verify\.mjs'\)/, 'pr-block 必须指向 skill 仓自己的 verify.mjs');
+  assert.match(src, /spawnSync\(process\.execPath, \[CANONICAL_VERIFY, '--demo', demoDir, '--report-out'/, 'pr-block 必须真的重跑全门');
+  assert.match(src, /trusted-verify:/, '重跑未通过必须落成 problem');
+  assert.match(src, /report = trusted;/, '出块数据必须换成可信侧重跑结果');
+  // verify 必须支持把报告写到 demo 之外(否则重跑会覆盖被审方的自报材料,对账就没了)
+  assert.match(readFileSync(VERIFY, 'utf8'), /--report-out/);
+});
+
+test('P0-1 根因固定(不 skip): 手写的全绿 report 能通过全部静态完整性校验——所以静态层本身不构成证明', (t) => {
+  if (!MODULE_ROOT) return t.skip('component 防伪链复算需要真 esbuild');
+  const { dir, spec } = makeFixture({ name: 'forged-static', boot: 'hold', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  writeForgedReport(dir, spec);
+  const problems = validateReportIntegrity(dir, spec, readJson(join(dir, 'report.json')));
+  assert.deepEqual(problems, [], `静态层如果能拦住手写 report,这条 P0 就不成立了;实际:${JSON.stringify(problems)}`);
+});
+
+test('P0-1 复现样本: 真 build + 只持引用不调用 + 手搓 UI + 完全不跑 verify + 手写全绿 report → pr-block 必须拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir, spec } = makeFixture({ name: 'forged-report', boot: 'hold', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  // bundle 是真的(entry 真进图),UI 是手搓的
+  assert.ok(readFileSync(join(dir, 'assets/component.bundle.js'), 'utf8').includes('HAND_WRITTEN_ONLY'));
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0, '资产闸门是真跑的');
+  writeForgedReport(dir, spec);
+
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 2, `手写全绿 report 居然出了块(P0-1 未修):${pr.stdout}${pr.stderr}`);
+  assert.ok(!pr.stdout.includes('真组件直渲'), '绝不能打出「真组件直渲」');
+  assert.match(pr.stdout, /trusted-verify/, '必须点名是可信侧重跑没过,而不是别的偶然原因');
+  assert.match(pr.stdout, /声明的目标导出从未被渲染|门/, '可信侧重跑的失败详情要带出来');
+});
+
+test('P0-1 对账: report 自报与可信侧重跑结论不一致(自报 proved,实际 nontarget)→ 阻断', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir, spec } = makeFixture({ name: 'reconcile', boot: 'real', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
+  // 真报告已存在且为 proved;把它改成 nontarget(自报与实际不一致的最小扰动,hash 不变)
+  const real = readJson(join(dir, 'report.json'));
+  real.gateB.entryRenderProof = 'nontarget';
+  writeFileSync(join(dir, 'report.json'), `${JSON.stringify(real, null, 2)}\n`);
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 2, `自报与可信侧不一致必须阻断:${pr.stdout}`);
+  assert.match(pr.stdout, /trusted-report: demo 的 report\.json 与可信侧重跑结论不一致/);
+});
+
+test('P0-1 阳性对照: 真跑 verify + 真调用目标导出 → pr-block 仍 exit 0 且写「真组件直渲」', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeFixture({ name: 'p01-ok', boot: 'real', repoDeps: true });
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0);
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 0, `可信侧重跑误伤了正常路径:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /真组件直渲/);
+});
+
 // ==================== 条目 2 — P0-2:playwright 解析链 RCE + fail-fast ====================
 
 test('P0-2 源码契约(不 skip): playwright 解析候选不含 startDir/cwd 等 demo 派生路径', () => {

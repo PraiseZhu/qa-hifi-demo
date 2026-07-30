@@ -1,13 +1,31 @@
 #!/usr/bin/env node
 // pr-block.mjs — 基于当前输入 hash + report 门统计生成 PR 验收附贴块。
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { join, relative, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildAssetsManifest, checkDemoNoNodeModules, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
 import { countFixtureLeaves, validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validateReportIntegrity } from './lib/report.mjs';
+
+/* ══ r5 架构主线(P0-1 CRITICAL):放行依据必须由可信侧亲自算出来 ══
+   总原则:**验证方绝不把 demo 目录产出的文件当作「某事已发生」的证明。**
+   report.json 整份都住在 demo 目录里,是被审方可写的。r4 之前 pr-block 只校验它
+   「自洽」:toolVersion 对、各 gate.pass=true、inputHashes 等于现算值——而 inputHashes
+   是攻击者用可导出的 buildInputHashes() 对自己控制的文件现算的,天然自洽。于是:
+   正常 build(真 esbuild、entry 真进图) + bootstrap 只 `void Button` 从不调用 + mount 里
+   innerHTML 手搓 UI + **完全不跑 verify**、手写一份全 pass 的 report.json(gateB
+   .entryRenderProof="proved"),pr-block 就 exit 0 并打出「真组件直渲」✅ ——
+   那台机器上连 Playwright 都没装。
+   r5 起(方案 A):定稿出块前 pr-block 用 **skill 仓自己那份 verify.mjs** 在可信侧
+   把 A-F/X 全门重跑一遍,以自己重跑的结果为唯一放行依据;demo 的 report.json 降级为
+   仅供对账的自报材料(不一致要报),绝不再充当「verify 跑过且通过」的证明。 */
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const CANONICAL_VERIFY = join(SCRIPT_DIR, 'verify.mjs');
+const TRUSTED_VERIFY_TIMEOUT_MS = 900000;
 
 const PREVIEW_HOSTS = new Set(['github.com', 'gitlab.com', 'workers.xd.team']);
 // 与 assets-manifest.mjs 保持一致(那边是可执行脚本不能被 import,一致性由测试锁住)
@@ -217,6 +235,54 @@ if (existsSync(join(demoDir, 'assets'))) {
         problems.push(`assets: ${ASSETS_REPORT_NAME} 未抬闸(生效阀 ${effectiveMb}MB ≤ 默认 ${defaultMb}MB)却带了 overrideReason——报告被手改过,重跑闸门`);
       assetsReport = ar;
     }
+  }
+}
+/* ── 可信侧重跑全门(P0-1 的落地;见文件头「架构主线」) ──
+   已有 problems 时不必再花一次浏览器代价:反正一定 exit 2。全绿候选才重跑。
+   重跑用 skill 仓自己的 verify.mjs,报告落到 demo 之外的临时目录(--report-out),
+   demo 侧 report.json 不被覆盖——作者的自报材料要留着对账。 */
+if (problems.length === 0) {
+  const outFile = join(mkdtempSync(join(tmpdir(), 'qa-hifi-trusted-')), 'report.json');
+  const run = spawnSync(process.execPath, [CANONICAL_VERIFY, '--demo', demoDir, '--report-out', outFile], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: TRUSTED_VERIFY_TIMEOUT_MS,
+  });
+  let trusted = null;
+  if (existsSync(outFile)) { try { trusted = JSON.parse(readFileSync(outFile, 'utf8')); } catch {} }
+  if (!trusted) { try { trusted = JSON.parse(run.stdout); } catch {} }
+  const tail = (s) => String(s ?? '').trim().split('\n').slice(-12).join('\n').slice(-1500);
+  if (run.status !== 0 || !trusted || trusted.ok !== true) {
+    problems.push(
+      'trusted-verify: pr-block 在可信侧重跑全门(A/B/C/D/F/X)未通过——'
+      + `不接受 demo 目录里的 report.json 作为「verify 跑过且通过」的证明(exit=${run.status})。`
+      + `\n可信侧重跑输出(尾部):\n${tail(run.stdout) || tail(run.stderr) || '(空)'}`,
+    );
+  } else {
+    // 可信侧产物同样要过一遍完整性校验(它是我们自己跑出来的,这里主要兜 component 防伪链)
+    problems.push(...validateReportIntegrity(demoDir, spec, trusted).map((p) => `trusted-report: ${p}`));
+    /* 对账:demo 自报的 report 与可信侧重跑结论必须一致。不一致意味着那份 report 不是
+       这套输入真跑出来的(手写/旧版/改过) —— 即使可信侧本身是绿的,也要报出来,
+       否则「PR 上贴的结论」与「仓库里存的证据」两张皮。 */
+    const projection = (r) => ({
+      ok: r.ok === true,
+      partial: r.partial === true,
+      entryRenderProof: r.gateB?.entryRenderProof ?? null,
+      gates: Object.fromEntries(['gateA', 'gateB', 'gateC', 'gateD', 'gateF', 'gateX'].map((k) => [k, r[k]?.pass === true])),
+      gateB: `${r.gateB?.passed}/${r.gateB?.total}`,
+      gateD: `${r.gateD?.passed}/${r.gateD?.total}`,
+      cases: (r.coverage?.cases ?? []).map((c) => c?.id).sort(),
+    });
+    const claimed = JSON.stringify(projection(report));
+    const actual = JSON.stringify(projection(trusted));
+    if (claimed !== actual)
+      problems.push(
+        'trusted-report: demo 的 report.json 与可信侧重跑结论不一致——那份报告不是当前输入真跑出来的'
+        + `\n  demo 自报:${claimed}\n  可信重跑:${actual}`
+        + '\n修法:重跑 node scripts/verify.mjs --demo <dir> 生成真实 report.json。',
+      );
+    // 出块用的一切数字/结论都取可信侧重跑结果,不再取 demo 自报
+    report = trusted;
   }
 }
 if (problems.length) failProblems(problems);
