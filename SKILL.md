@@ -62,6 +62,32 @@ chrome 运行时升级：`node scripts/init.mjs --dir <demo-dir> --update-chrome
 3. 跑 `node scripts/truth.mjs --demo <dir>` 生成规范化 `truth.json`。
    **禁止**：demo 里出现任何不在 truth.json 里的界面文案/几何/颜色值。
 
+#### 服务端驱动数据（fixture 叶子）
+
+有些值**源码里根本没有字面量**——模型供应商配置、账号 membership、后端下发的开关等，
+只存在于服务端响应里。这类值用 `makeFixtureLeaf()`：把真沙盒响应存成 demo 内
+`fixtures/<name>.json`，叶子记 `provenance.sourceKind: 'fixture'` + `capturedFrom`
+（一句话来源声明，如 `2026-07-30 公司沙盒 /api/providers 响应`）。
+
+```js
+import { makeFixtureLeaf } from './extract-helpers.mjs';
+const fx = readJson('fixtures/providers.json');
+providers: fx.data.map((p, i) => makeFixtureLeaf(p.displayName, 'fixtures/providers.json', {
+  locator: `data[${i}].displayName`,
+  capturedFrom: '2026-07-30 公司沙盒 GET /api/providers 响应',
+}))
+```
+
+规则：
+
+- fixture 文件必须落在 demo 内 `fixtures/` 下并随 PR 入库——reviewer 打不开的 fixture 等于没有溯源；
+  存在性 + hash 校验与 `code` 叶子完全一致（fixture 是**声明性降级**，不是防伪豁免）。
+- `capturedFrom` 缺失 = 门 A schema FAIL。没有来源声明的 fixture 就是"手抄数据穿了 provenance 马甲"。
+- **禁止用 fixture 冒充可源码提取的值**：布局常量、i18n 文案、颜色 token 一律 `makeLeaf()` 走源码。
+  拿 fixture 绕过"值抄错了"只是把假绿藏得更深。
+- 门 A 语义不变：fixture 文件是 extract 的输入，`extract.mjs` 现跑仍须≡`truth.json`。
+- PR 附贴块会自动加一行 `⚠️ N 个叶子来自录制 fixture（非源码溯源）`——不阻断，但对外诚实。
+
 ### P2 生成 demo（LLM 自由区，但守合约）
 
 按「demo 合约」（见下节）编写/更新 `index.html`。界面渲染数据**只准**取自内嵌 truth；

@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
 import { failProblems } from './lib/fs-utils.mjs';
-import { validateSpec } from './lib/schema.mjs';
+import { countFixtureLeaves, validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validateReportIntegrity } from './lib/report.mjs';
 
 const PREVIEW_HOSTS = new Set(['github.com', 'gitlab.com', 'workers.xd.team']);
@@ -189,6 +189,17 @@ if (pixel.present) {
   lines.push('| 像素基准（vs 真沙盒截图） | ⚠️ 未运行 pixel-compare |');
 }
 lines.push('');
+// 诚实降级声明:服务端驱动的值(providers 配置等)源码里没有字面量,只能录 fixture。
+// 不阻断——但必须在 PR 上写明"这些叶子不是源码溯源",否则 reviewer 会误以为全部可回查源码。
+const fixtureLeaves = (() => {
+  const truthPath = join(demoDir, 'truth.json');
+  if (!existsSync(truthPath)) return 0;
+  try { return countFixtureLeaves(JSON.parse(readFileSync(truthPath, 'utf8'))); } catch { return 0; }
+})();
+if (fixtureLeaves > 0) {
+  lines.push(`⚠️ ${fixtureLeaves} 个叶子来自录制 fixture（非源码溯源），来源见 truth provenance`);
+  lines.push('');
+}
 lines.push(`<sub>由 qa-hifi-demo 生成 · 工具版本 ${report.toolVersion} · 验收时间 ${report.generatedAt}</sub>`);
 
 console.log(lines.join('\n'));

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { hashFile, isPlainObject } from './fs-utils.mjs';
 
 // 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
@@ -365,12 +365,56 @@ function validateProvenance(prov, path, demoDir, problems) {
       problems.push(`${path}.provenance.locatorKeyPath 必须是「段.段.段」非空路径(段不含空白)`);
     }
   }
+  // sourceKind 可选:省略 = 'code'(源码溯源,默认)。'fixture' = 该值来自录制的服务端响应,
+  // 源码里没有这个字面量(providers 配置 / account memberships 等服务端驱动数据)。
+  // fixture 是**声明性降级**不是防伪豁免:文件存在性 + hash 照旧校验,另外强制两条——
+  //   ① capturedFrom:一句话人读来源声明(什么时候从哪个环境的哪个接口录的),缺了直接 FAIL
+  //      ——没有它,fixture 就是"来源不明的手抄数据穿了 provenance 的马甲";
+  //   ② source 必须落在 demo 内 fixtures/ 下:fixture 得随 PR 走、可被 reviewer 打开,
+  //      指向仓外/demo 外的路径谁都验不了,等于没有溯源。
+  const sourceKind = prov.sourceKind === undefined ? 'code' : prov.sourceKind;
+  if (prov.sourceKind !== undefined && sourceKind !== 'code' && sourceKind !== 'fixture') {
+    problems.push(`${path}.provenance.sourceKind 只能是 'code' 或 'fixture'(省略即 code)`);
+  }
+  if (sourceKind === 'fixture') {
+    if (typeof prov.capturedFrom !== 'string' || !prov.capturedFrom.trim()) {
+      problems.push(
+        `${path}.provenance.capturedFrom 必填(sourceKind=fixture):一句话声明录制来源,如「2026-07-30 公司沙盒 /api/providers 响应」`,
+      );
+    }
+    if (typeof prov.source === 'string' && prov.source) {
+      const rel = relative(demoDir, resolve(demoDir, prov.source)).split('\\').join('/');
+      if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(prov.source)) {
+        problems.push(`${path}.provenance.source 指向 demo 目录外:${prov.source}——fixture 必须放 demo 内 fixtures/ 下随 PR 走`);
+      } else if (!rel.startsWith('fixtures/')) {
+        problems.push(`${path}.provenance.source 必须是 demo 内 fixtures/<name>.json(当前 ${rel})`);
+      }
+    }
+  }
   if (typeof prov.source === 'string' && prov.source) {
     const sourcePath = resolve(demoDir, prov.source);
     if (!existsSync(sourcePath)) problems.push(`${path}.provenance.source 不存在:${prov.source}`);
     else if (prov.hash && normalizeHash(prov.hash) !== hashFile(sourcePath))
       problems.push(`${path}.provenance.hash 与源文件不符:${prov.source}`);
   }
+}
+
+/**
+ * 统计 truth 里 sourceKind='fixture' 的叶子数(PR 附贴块的诚实降级声明用)。
+ * 与校验解耦:只数,不判合法性——非法的在 validateTruth 阶段已被拦下。
+ */
+export function countFixtureLeaves(truth) {
+  let n = 0;
+  const visit = (value) => {
+    if (isPlainObject(value) && Object.hasOwn(value, 'value') && Object.hasOwn(value, 'provenance')) {
+      if (isPlainObject(value.provenance) && value.provenance.sourceKind === 'fixture') n += 1;
+      return;
+    }
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    if (isPlainObject(value)) { Object.values(value).forEach(visit); }
+  };
+  visit(truth);
+  return n;
 }
 
 export function unwrapTruth(value) {
