@@ -104,6 +104,19 @@
       "occurrences": 1,
       "firstSeen": "2026-07-30T06:33:29.107Z",
       "lastSeen": "2026-07-30T06:33:29.107Z"
+    },
+    {
+      "fingerprint": "html-to-native-no-mechanical-path",
+      "tier": "by-design",
+      "title": "结构级 HTML→四端机械转换原理性不存在,agent 双改即业界最优",
+      "detail": "2026-07-30 GitHub 全量调研确认:Mitosis 只有 JSX 子集正向编译器且无 HTML parser(RN sanitizer 策略=丢弃+警告);html-to-react-native 生态位仅 0-6 star 玩具;跨框架 patch 生成无任何开源项目。CSS/RN 样式语义鸿沟(级联/继承/grid vs flex-only)与结构语义鸿沟(div→View/Pressable 是意图判断)决定无损映射不可能",
+      "proposal": null,
+      "status": "tracked",
+      "commit": null,
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T07:00:26.037Z",
+      "lastSeen": "2026-07-30T07:00:26.037Z"
     }
   ]
 }

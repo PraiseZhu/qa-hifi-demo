@@ -27,3 +27,8 @@
 - `repo-root-depth-assumption` **extract.mjs 用目录深度推 repoRoot,demo 搬家即断** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: landed,commit `b173ced`
   - 现象:2026-07-29 login-all-hifi:demo 从 _tmp/ 迁 docs/design-previews/ 后 repoRoot/provenance 前缀全断,一天连修 3 个 bug
   - 提案:extract-helpers.findRepoRoot() 走 git rev-parse;init 把 helpers 拷进 demo 自包含
+
+## 无法自动化(by-design,只计数观察)
+
+- `html-to-native-no-mechanical-path` **结构级 HTML→四端机械转换原理性不存在,agent 双改即业界最优** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: tracked
+  - 现象:2026-07-30 GitHub 全量调研确认:Mitosis 只有 JSX 子集正向编译器且无 HTML parser(RN sanitizer 策略=丢弃+警告);html-to-react-native 生态位仅 0-6 star 玩具;跨框架 patch 生成无任何开源项目。CSS/RN 样式语义鸿沟(级联/继承/grid vs flex-only)与结构语义鸿沟(div→View/Pressable 是意图判断)决定无损映射不可能
