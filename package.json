@@ -6,6 +6,7 @@
   },
   "dependencies": {
     "pixelmatch": "^7.1.0",
-    "pngjs": "^7.0.0"
+    "pngjs": "^7.0.0",
+    "odiff-bin": "^4.5.0"
   }
 }
