@@ -31,7 +31,12 @@ import { validatePixelForPr, validatePixelReport, validateReportIntegrity } from
    用可导出的 buildInputHashes 现算、计数一致、diffRatio<=threshold、engine 合法、WARN 补
    adjudication + 存在的 artifact 文件),不跑 pixel-compare 就能让门 E 判通过 —— 视觉回归
    可伪造成 PASS。现在:声明了 baseline 时 pr-block **亲自 spawn skill 自己那份
-   pixel-compare**(--report-out 落到 demo 之外),以可信结果为放行依据;demo 自报降级为对账。 */
+   pixel-compare**(--report-out 落到 demo 之外),以可信结果为放行依据;demo 自报降级为对账。
+
+   r7 条目 1(CRITICAL)再补一层**次序**约束:可信 verify 的末段会执行 demo 侧 Node 代码
+   (extract.mjs / 自定义门),之后被审方就有一个 detached 子进程能改磁盘的窗口。因此门 E 的
+   可信重跑必须排在可信 verify **之前** —— 否则那次真实渲染观察正好落在攻击窗口里。
+   本文件里两次 spawn 的先后(CANONICAL_PIXEL 早于 CANONICAL_VERIFY)由源码契约测试锁死。 */
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const CANONICAL_VERIFY = join(SCRIPT_DIR, 'verify.mjs');
 const CANONICAL_PIXEL = join(SCRIPT_DIR, 'pixel-compare.mjs');
@@ -255,6 +260,59 @@ if (existsSync(join(demoDir, 'assets'))) {
    重跑用 skill 仓自己的 verify.mjs,报告落到 demo 之外的临时目录(--report-out),
    demo 侧 report.json 不被覆盖——作者的自报材料要留着对账。 */
 if (problems.length === 0) {
+  /* ── 门 E 的可信侧重跑(r6 条目 2),**必须排在可信 verify 之前**(r7 条目 1) ──
+     次序理由:可信 verify 的末段会执行 demo 侧 Node 代码(extract.mjs / 自定义门),
+     那之后被审方就有一个 detached 子进程能改磁盘的窗口。像素比对是一次真实渲染观察,
+     排在 verify 之后就落在那个窗口里 —— 临时把错误样式改对、pixel 判 PASS、退出时恢复。
+     所以:先做像素观察,再去碰 demo 代码。禁止把这两段调换回去(源码契约测试锁住)。
+     artifact 三图会被重跑覆盖成**可信侧生成的**那份,WARN 的人工裁决从此绑在可信产物上
+     (裁决文件本身仍是作者署名的 —— 人工裁决的性质决定的,但它判的图是我们的)。 */
+  const declaredBaselines = Array.isArray(spec.baselines) ? spec.baselines.length : 0;
+  if (declaredBaselines > 0) {
+    const pxOut = join(mkdtempSync(join(tmpdir(), 'qa-hifi-trusted-px-')), 'report-pixel.json');
+    const pxRun = spawnSync(process.execPath, [CANONICAL_PIXEL, '--demo', demoDir, '--report-out', pxOut], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: TRUSTED_VERIFY_TIMEOUT_MS,
+    });
+    const pxTail = (s) => String(s ?? '').trim().split('\n').slice(-12).join('\n').slice(-1500);
+    let trustedPx = null;
+    if (existsSync(pxOut)) { try { trustedPx = JSON.parse(readFileSync(pxOut, 'utf8')); } catch {} }
+    if (pxRun.status !== 0 || !trustedPx || trustedPx.ok !== true) {
+      problems.push(
+        `trusted-pixel: pr-block 在可信侧重跑门 E(pixel-compare)未通过——不接受 demo 目录里的 report-pixel.json 作为「门 E 跑过且通过」的证明(exit=${pxRun.status})。`
+        + `\n可信侧重跑输出(尾部):\n${pxTail(pxRun.stdout) || pxTail(pxRun.stderr) || '(空)'}`,
+      );
+    } else {
+      // 可信产物同样过一遍完整校验(阈值/计数/engine/WARN 裁决与 artifact 均绑在这份上)
+      const tv = validatePixelReport(demoDir, spec, trustedPx);
+      problems.push(...tv.problems.map((p) => `trusted-pixel: ${p}`));
+      /* 对账:自报与可信结论必须一致。只比「PR 上会宣称的结论」——ok/skipped/declared/
+         阈值 + 每个基准的 status;bad/total 是重新渲染后现算的像素计数,天然会有微小抖动,
+         拿它做全等比对只会制造假阴性。 */
+      const pxProjection = (r) => ({
+        ok: r?.ok === true,
+        skipped: r?.skipped === true,
+        declared: r?.declared ?? null,
+        threshold: r?.threshold ?? null,
+        statuses: (Array.isArray(r?.results) ? r.results : [])
+          .map((x) => `${x?.platform ? `${x.platform}/` : ''}${x?.key}=${x?.status}`)
+          .sort(),
+      });
+      const pxClaimed = JSON.stringify(pxProjection(pixel.report));
+      const pxActual = JSON.stringify(pxProjection(trustedPx));
+      if (pxClaimed !== pxActual)
+        problems.push(
+          'trusted-pixel: demo 的 report-pixel.json 与可信侧重跑结论不一致——那份门 E 报告不是当前输入真跑出来的'
+          + `\n  demo 自报:${pxClaimed}\n  可信重跑:${pxActual}`
+          + '\n修法:重跑 node scripts/pixel-compare.mjs --demo <dir> 生成真实 report-pixel.json。',
+        );
+      // 出块的像素结论同样取可信侧结果
+      pixel = { present: true, problems: [], report: trustedPx };
+    }
+  }
+}
+if (problems.length === 0) {
   const outFile = join(mkdtempSync(join(tmpdir(), 'qa-hifi-trusted-')), 'report.json');
   const run = spawnSync(process.execPath, [CANONICAL_VERIFY, '--demo', demoDir, '--report-out', outFile], {
     encoding: 'utf8',
@@ -296,54 +354,6 @@ if (problems.length === 0) {
       );
     // 出块用的一切数字/结论都取可信侧重跑结果,不再取 demo 自报
     report = trusted;
-
-    /* ── 门 E 的可信侧重跑(r6 条目 2) ──
-       声明了 baseline 就必须由我们自己跑一遍真比对。artifact 三图会被重跑覆盖成
-       **可信侧生成的**那份,WARN 的人工裁决从此绑在可信产物上(裁决文件本身仍是
-       作者署名的 —— 人工裁决的性质决定的,但它判的图是我们的)。 */
-    const declaredBaselines = Array.isArray(spec.baselines) ? spec.baselines.length : 0;
-    if (problems.length === 0 && declaredBaselines > 0) {
-      const pxOut = join(mkdtempSync(join(tmpdir(), 'qa-hifi-trusted-px-')), 'report-pixel.json');
-      const pxRun = spawnSync(process.execPath, [CANONICAL_PIXEL, '--demo', demoDir, '--report-out', pxOut], {
-        encoding: 'utf8',
-        maxBuffer: 64 * 1024 * 1024,
-        timeout: TRUSTED_VERIFY_TIMEOUT_MS,
-      });
-      let trustedPx = null;
-      if (existsSync(pxOut)) { try { trustedPx = JSON.parse(readFileSync(pxOut, 'utf8')); } catch {} }
-      if (pxRun.status !== 0 || !trustedPx || trustedPx.ok !== true) {
-        problems.push(
-          `trusted-pixel: pr-block 在可信侧重跑门 E(pixel-compare)未通过——不接受 demo 目录里的 report-pixel.json 作为「门 E 跑过且通过」的证明(exit=${pxRun.status})。`
-          + `\n可信侧重跑输出(尾部):\n${tail(pxRun.stdout) || tail(pxRun.stderr) || '(空)'}`,
-        );
-      } else {
-        // 可信产物同样过一遍完整校验(阈值/计数/engine/WARN 裁决与 artifact 均绑在这份上)
-        const tv = validatePixelReport(demoDir, spec, trustedPx);
-        problems.push(...tv.problems.map((p) => `trusted-pixel: ${p}`));
-        /* 对账:自报与可信结论必须一致。只比「PR 上会宣称的结论」——ok/skipped/declared/
-           阈值 + 每个基准的 status;bad/total 是重新渲染后现算的像素计数,天然会有微小抖动,
-           拿它做全等比对只会制造假阴性。 */
-        const pxProjection = (r) => ({
-          ok: r?.ok === true,
-          skipped: r?.skipped === true,
-          declared: r?.declared ?? null,
-          threshold: r?.threshold ?? null,
-          statuses: (Array.isArray(r?.results) ? r.results : [])
-            .map((x) => `${x?.platform ? `${x.platform}/` : ''}${x?.key}=${x?.status}`)
-            .sort(),
-        });
-        const pxClaimed = JSON.stringify(pxProjection(pixel.report));
-        const pxActual = JSON.stringify(pxProjection(trustedPx));
-        if (pxClaimed !== pxActual)
-          problems.push(
-            'trusted-pixel: demo 的 report-pixel.json 与可信侧重跑结论不一致——那份门 E 报告不是当前输入真跑出来的'
-            + `\n  demo 自报:${pxClaimed}\n  可信重跑:${pxActual}`
-            + '\n修法:重跑 node scripts/pixel-compare.mjs --demo <dir> 生成真实 report-pixel.json。',
-          );
-        // 出块的像素结论同样取可信侧结果
-        pixel = { present: true, problems: [], report: trustedPx };
-      }
-    }
   }
 }
 if (problems.length) failProblems(problems);

@@ -169,7 +169,12 @@ test('条目 1 源码契约(不 skip): 构建核心提供 --check-css / fs-utils
   const v = readFileSync(VERIFY, 'utf8');
   assert.match(v, /recheckComponentCss\(demoDir, spec\.component\)/, 'gate A 必须调用 CSS 复算');
   assert.match(v, /gateA\.cssRecheck = cssCheck\.status/);
-  assert.match(v, /cssCheck\.problems\.length[\s\S]{0,80}gateA\.pass = false/, 'CSS 复算不一致必须让 gate A 红');
+  /* r7 起门 A 的 pass 在「执行 demo 侧代码」之后才汇总(见 verify 文件头「执行时序原则」),
+     所以各段失败不再就地写 gateA.pass=false,而是置 gateAHardFail —— 汇总时
+     pass = !gateAHardFail && extractorDrift==='none'。断言强度不变(CSS 复算不一致 → 门 A 红),
+     只是跟着实现改成断真正的那条链路;下一行把汇总语义也一并钉住。 */
+  assert.match(v, /cssCheck\.problems\.length[\s\S]{0,80}gateAHardFail = true/, 'CSS 复算不一致必须让 gate A 红');
+  assert.match(v, /gateA\.pass = !gateAHardFail && gateA\.extractorDrift === 'none'/, '门 A 汇总必须把 hardFail 一票否决');
 
   // 薄壳模板不许再写死占位字面量(否则与可信侧常量漂移)
   const tpl = readFileSync(join(ROOT, 'templates/component-build.mjs'), 'utf8');
