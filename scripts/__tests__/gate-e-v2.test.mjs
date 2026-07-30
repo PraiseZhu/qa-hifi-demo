@@ -10,6 +10,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compareImages, loadPngApi, readPng } from '../lib/png-compare.mjs';
 import { buildBaselineManifest, hashFile, safeJsonForScript } from '../lib/fs-utils.mjs';
+import { validatePixelReport } from '../lib/report.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const PIXEL = join(ROOT, 'scripts/pixel-compare.mjs');
@@ -712,4 +713,163 @@ test('finding #2c: bad>total 与 diffRatio 越界([0,1] 外)均拒绝', async (t
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
   assert.equal(pr.status, 2);
   assert.match(pr.stdout + pr.stderr, /bad\(200\) > total\(100\)|\[0,1\]/);
+});
+
+// ============ ⑤ r8:WARN 人工裁决必须绑定 key/diffRatio/threshold/三图 sha256 ============
+//
+// r7 只绑三图字节 —— 挡得住「换图」,挡不住「换差异」:同一 key 上一次小幅 WARN 的裁决,在差异
+// 变大、三图跟着重跑更新之后,旧裁决的语义(判的是 0.1% 还是 8%)此前无人核对,于是「小幅差异
+// 的人工放行」可以被复用到后续任意大幅 WARN 上。r8 起裁决必须同时声明并全等四项;key 用含
+// platform 的复合形式(`<platform>/<key>`,与 report.mjs 校验用的 ck 同构),因为基准分端存放、
+// 永不互比,mac 端的裁决不得给 windows 端的 WARN 用。
+
+/** 造一个必然 WARN 的 demo:#frame 是纯红,基准图把 `bad` 个像素涂蓝 → diffRatio = bad/1024。 */
+async function writeWarnDemo(name, { bad, platform = 'web' } = {}) {
+  const { PNG } = await pngApi();
+  const dir = writePixelDemo({ name, baselines: [{ key: 'one', platform, frameSel: '#frame' }] });
+  writeWarnBaseline(dir, PNG, { bad, platform });
+  return dir;
+}
+
+function writeWarnBaseline(dir, PNG, { bad, platform = 'web' } = {}) {
+  const png = paintPng(PNG, 32, 32, (x, y) => (y * 32 + x < bad ? [0, 0, 255] : [255, 0, 0]));
+  const sub = join(dir, 'baselines', platform);
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(join(sub, 'one.png'), PNG.sync.write(png));
+}
+
+const ADJ_REL = 'adjudications/web.one.json';
+function writeAdj(dir, fields) {
+  mkdirSync(join(dir, 'adjudications'), { recursive: true });
+  writeFileSync(join(dir, ADJ_REL), `${JSON.stringify({ ok: true, reviewer: '张三', reason: '底色改版预期差异', ...fields }, null, 2)}\n`);
+}
+const pixelReport = (dir) => JSON.parse(readFileSync(join(dir, 'report-pixel.json'), 'utf8'));
+const specOf = (dir) => JSON.parse(readFileSync(join(dir, 'spec.json'), 'utf8'));
+/** 只跑 report.mjs 侧的校验(pr-block 对 demo 自报 report 走的就是这条),回传 problems。 */
+const validatePixelReportR8 = (dir, rep) => validatePixelReport(dir, specOf(dir), rep).problems;
+/** 跑一次门 E,回传 {status, out, item} —— item 是唯一那条比对结果。 */
+function runPixel(dir, env) {
+  const p = run(PIXEL, ['--demo', dir], { env, timeout: 150000 });
+  const rep = pixelReport(dir);
+  return { status: p.status, out: p.stdout + p.stderr, item: rep.results[0], rep };
+}
+/** 四项全部取自本次现算的合法裁决字段。 */
+const boundFields = (item) => ({
+  key: `${item.platform}/${item.key}`,
+  diffRatio: item.diffRatio,
+  threshold: 0.005,
+  artifactHashes: item.artifactHashes,
+});
+
+test('r8: 裁决只绑三图 sha256(缺 key/diffRatio/threshold)→ 拒并点名缺失字段', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeWarnDemo('r8-missing', { bad: 8 });
+  const first = runPixel(dir, env);
+  assert.equal(first.item.status, 'WARN', `前提:必须是 WARN(diffRatio=${first.item.diffRatio})`);
+  // r7 式裁决:hash 绑对,但没声明这次判的是哪个 key、多大差异、什么阈值
+  writeAdj(dir, { artifactHashes: first.item.artifactHashes });
+  const second = runPixel(dir, env);
+  assert.notEqual(second.status, 0, 'r7 式裁决(只绑三图)仍被采纳 —— r8 语义绑定未生效');
+  assert.equal(second.item.adjudication, undefined, '缺语义字段的裁决不该被采纳');
+  const reason = second.item.adjudicationRejected?.reason ?? '';
+  assert.match(reason, /缺字段/);
+  for (const f of ['key', 'diffRatio', 'threshold']) assert.match(reason, new RegExp(f), `拒收原因必须点名缺 ${f}`);
+  // report.mjs 侧同样要拦(demo 自报 report 里塞一份缺字段的裁决)
+  const rep = pixelReport(dir);
+  rep.results[0].adjudication = { ok: true, reviewer: '张三', reason: 'r', artifactHashes: rep.results[0].artifactHashes };
+  const v = validatePixelReportR8(dir, rep);
+  assert.ok(v.some((p) => /缺 diffRatio/.test(p)), `report.mjs 未拦缺字段裁决:${JSON.stringify(v)}`);
+});
+
+test('r8: 裁决声明的 diffRatio/threshold 与本次现算不符 → 拒并打印两个值的对照', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeWarnDemo('r8-wrongvalue', { bad: 80 });
+  const first = runPixel(dir, env);
+  assert.equal(first.item.status, 'WARN');
+  assert.ok(first.item.diffRatio > 0.05, `前提:本次差异要明显(实际 ${first.item.diffRatio})`);
+  writeAdj(dir, { ...boundFields(first.item), diffRatio: 0.001, threshold: 0.01 });
+  const second = runPixel(dir, env);
+  assert.notEqual(second.status, 0, '错值裁决被采纳了');
+  const reason = second.item.adjudicationRejected?.reason ?? '';
+  assert.match(reason, /diffRatio/);
+  assert.match(reason, /0\.001/, '报文必须含裁决声明值');
+  assert.match(reason, new RegExp(String(second.item.diffRatio).replace('.', '\\.')), '报文必须含本次现算值');
+  // report.mjs 侧:同一份错值裁决塞进 report 也要被拦,且同样打印两个值
+  const rep = pixelReport(dir);
+  rep.results[0].adjudication = { ok: true, reviewer: '张三', reason: 'r', ...boundFields(rep.results[0]), diffRatio: 0.001 };
+  const v = validatePixelReportR8(dir, rep);
+  assert.ok(
+    v.some((p) => /diffRatio 与本次现算不符/.test(p) && p.includes('0.001') && p.includes(String(rep.results[0].diffRatio))),
+    `report.mjs 未打印裁决声明值 vs 本次现算值:${JSON.stringify(v)}`,
+  );
+});
+
+test('r8 核心: 小幅 WARN 的旧裁决,在差异变大后(三图 hash 已更新)不得复用 → 拒', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { PNG } = await pngApi();
+  const dir = await writeWarnDemo('r8-stale', { bad: 8 });
+  // ① 小幅 WARN + 一份当时合法的裁决 → 放行(阳性对照)
+  const small = runPixel(dir, env);
+  assert.equal(small.item.status, 'WARN');
+  const staleFields = boundFields(small.item);
+  writeAdj(dir, staleFields);
+  const ok1 = runPixel(dir, env);
+  assert.equal(ok1.status, 0, `前提:四项一致的裁决必须放行:${ok1.out}`);
+  assert.equal(ok1.item.adjudication?.reviewer, '张三');
+  assert.equal(run(VERIFY, ['--demo', dir], { env, timeout: 150000 }).status, 0);
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env, timeout: 150000 });
+  assert.equal(pr.status, 0, `四项一致却不放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /张三/, 'PR 里必须能看到裁决人');
+  assert.match(pr.stdout, /底色改版预期差异/, 'PR 里必须能看到裁决理由');
+
+  // ② 差异变大(基准换成 200px 蓝),重跑 → 三图字节随之更新
+  writeWarnBaseline(dir, PNG, { bad: 200 });
+  const big = runPixel(dir, env);
+  assert.equal(big.item.status, 'WARN');
+  assert.ok(big.item.diffRatio > small.item.diffRatio * 5, `前提:差异必须明显变大(${small.item.diffRatio} → ${big.item.diffRatio})`);
+
+  // ③ 只把旧裁决的 diffRatio/threshold 留成旧值,三图 hash 补成新的
+  //    → 这正是「三图 hash 对得上但语义字段过期」,r7 会放行,r8 必须拒
+  writeAdj(dir, {
+    key: staleFields.key,
+    diffRatio: staleFields.diffRatio,
+    threshold: staleFields.threshold,
+    artifactHashes: big.item.artifactHashes,
+  });
+  const reused = runPixel(dir, env);
+  const KINDS = ['baseline', 'demo', 'diff'];
+  assert.ok(
+    KINDS.every((k) => reused.item.artifactHashes[k] === big.item.artifactHashes[k]),
+    '前提:这一跑的三图 hash 必须与裁决声明的一致(否则测的还是三图绑定那条)',
+  );
+  assert.notEqual(reused.status, 0, '旧裁决在差异变大后仍被复用 —— r8 核心场景未修');
+  assert.equal(reused.item.adjudication, undefined);
+  const reason = reused.item.adjudicationRejected?.reason ?? '';
+  assert.match(reason, /diffRatio/, `拒收原因必须指向 diffRatio 过期,而不是三图 hash:${reason}`);
+  assert.doesNotMatch(reason, /sha256 与本次可信侧产出不符/, '不该被误判成换图');
+  assert.ok(reason.includes(String(staleFields.diffRatio)) && reason.includes(String(reused.item.diffRatio)));
+  // report.mjs 侧同样拦
+  const v = validatePixelReportR8(dir, { ...reused.rep, results: [{ ...reused.item, adjudication: JSON.parse(readFileSync(join(dir, ADJ_REL), 'utf8')) }] });
+  assert.ok(v.some((p) => /diffRatio 与本次现算不符/.test(p)), `report.mjs 未拦旧裁决复用:${JSON.stringify(v)}`);
+});
+
+test('r8: 裁决 key 必须含 platform —— 裸 key 或另一端的 key 都拒(基准分端永不互比)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeWarnDemo('r8-key', { bad: 8, platform: 'web' });
+  const first = runPixel(dir, env);
+  assert.equal(first.item.status, 'WARN');
+  for (const wrong of ['one', 'ios/one']) {
+    writeAdj(dir, { ...boundFields(first.item), key: wrong });
+    const r = runPixel(dir, env);
+    assert.notEqual(r.status, 0, `key=${wrong} 的裁决被采纳了`);
+    assert.match(r.item.adjudicationRejected?.reason ?? '', /key 不符/);
+    assert.match(r.item.adjudicationRejected?.reason ?? '', /web\/one/, '报文必须给出本次期望的复合 key');
+  }
+  // 阳性对照:复合 key 正确 → 放行
+  writeAdj(dir, boundFields(first.item));
+  assert.equal(runPixel(dir, env).status, 0);
 });

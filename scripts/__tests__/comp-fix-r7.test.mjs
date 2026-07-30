@@ -990,8 +990,7 @@ test('条目 7d 对抗(实跑): 三份自报各自手写全绿且不跑对应执
     const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
     assert.equal(pr.status, 2, `手写全 PASS 的 report-pixel.json 居然出了块:${pr.stdout}${pr.stderr}`);
     assert.match(`${pr.stdout}${pr.stderr}`, /trusted-pixel/, '必须由门 E 的可信重跑挡住');
-    void spec;
-  }
+    }
 
   // ③ report-assets.json:手写 totalBytes:0 + ok:true,资产其实很大
   {
@@ -1036,7 +1035,8 @@ async function makeWarnFixture(name) {
 test('条目 8 源码契约(不 skip): 三图 sha256 入 report，裁决必须绑定它且 reviewer/理由必填', () => {
   const px = stripComments(readFileSync(PIXEL, 'utf8'));
   assert.match(px, /item\.artifactHashes = \{/, 'pixel-compare 必须把三图 sha256 记进 report');
-  assert.match(px, /adj\?\.artifactHashes/, '裁决必须声明 artifactHashes 才可能被采纳');
+  assert.match(px, /adjudicationMismatch\(adj, \{/, '裁决必须逐项绑定本次比对才可能被采纳');
+  assert.match(px, /'key', 'diffRatio', 'threshold', 'artifactHashes'/, 'r8:裁决必须同时绑定四项');
   assert.match(px, /adjudicationRejected/, '裁决绑不上时必须留下可读原因');
   const rp = stripComments(readFileSync(join(ROOT, 'scripts/lib/report.mjs'), 'utf8'));
   assert.match(rp, /hashFile\(join\(demoDir, p\)\) !== recorded/, '磁盘三图字节必须与 report 记录比对');
@@ -1063,21 +1063,27 @@ test('条目 8 PoC(实跑): 裁决只声明 ok/reviewer/reason(不绑 hash)→ �
   const r1 = readJson(join(dir, 'report-pixel.json'));
   assert.equal(r1.results[0].status, 'WARN');
   assert.equal(r1.results[0].adjudication, undefined, '裁决不该被采纳');
-  assert.match(r1.results[0].adjudicationRejected?.reason ?? '', /缺 artifactHashes/);
+  assert.match(r1.results[0].adjudicationRejected?.reason ?? '', /缺字段.*artifactHashes/);
   // 三图 sha256 必须已进 report(裁决要绑的就是它)
   for (const k of ['baseline', 'demo', 'diff']) assert.match(r1.results[0].artifactHashes[k], /^[0-9a-f]{64}$/);
 
   // ② 绑错 hash(改一位)→ 同样不被采纳
-  const good = r1.results[0].artifactHashes;
-  writeAdj({ artifactHashes: { ...good, diff: good.diff.replace(/^./, (c) => (c === 'a' ? 'b' : 'a')) } });
+  const g2 = r1.results[0];
+  const good = g2.artifactHashes;
+  // 其余三项(key/diffRatio/threshold)按本次现算填对,单独把 diff 图的 hash 改一位
+  // —— 否则先撞上 r8 的「缺字段」拒收,测不到「绑错 hash」这条路径。
+  writeAdj({
+    key: g2.key, diffRatio: g2.diffRatio, threshold: spec.baselineThreshold ?? 0.005,
+    artifactHashes: { ...good, diff: good.diff.replace(/^./, (c) => (c === 'a' ? 'b' : 'a')) },
+  });
   const p2 = run(PIXEL, ['--demo', dir], { env: env() });
   assert.notEqual(p2.status, 0, '绑错 hash 的裁决被采纳了');
-  assert.match(readJson(join(dir, 'report-pixel.json')).results[0].adjudicationRejected?.reason ?? '', /不符/);
+  assert.match(readJson(join(dir, 'report-pixel.json')).results[0].adjudicationRejected?.reason ?? '', /sha256 与本次可信侧产出不符/);
 
   // ③ 绑对 hash → 被采纳,门 E 过,且 PR 里能看到裁决人与理由
   //    注意:hash 要取"最后一次真跑"的三图(每次重跑都会重写它们)
-  const cur = readJson(join(dir, 'report-pixel.json')).results[0].artifactHashes;
-  writeAdj({ artifactHashes: cur });
+  const c3 = readJson(join(dir, 'report-pixel.json')).results[0];
+  writeAdj({ key: c3.key, diffRatio: c3.diffRatio, threshold: spec.baselineThreshold ?? 0.005, artifactHashes: c3.artifactHashes });
   const p3 = run(PIXEL, ['--demo', dir], { env: env() });
   assert.equal(p3.status, 0, `绑对 hash 的裁决没被采纳:${p3.stdout}${p3.stderr}`);
   const r3 = readJson(join(dir, 'report-pixel.json'));
@@ -1097,8 +1103,8 @@ test('条目 8 PoC(实跑): 裁决绑定后又把 diff 图换掉 → 拒(裁决�
   const { dir } = await makeWarnFixture('warn-swap');
   mkdirSync(join(dir, 'adjudications'), { recursive: true });
   run(PIXEL, ['--demo', dir], { env: env() });
-  const cur = readJson(join(dir, 'report-pixel.json')).results[0].artifactHashes;
-  writeFileSync(join(dir, 'adjudications/one.json'), `${JSON.stringify({ ok: true, reviewer: '李四', reason: 'ok', artifactHashes: cur }, null, 2)}\n`);
+  const c0 = readJson(join(dir, 'report-pixel.json')).results[0];
+  writeFileSync(join(dir, 'adjudications/one.json'), `${JSON.stringify({ ok: true, reviewer: '李四', reason: 'ok', key: c0.key, diffRatio: c0.diffRatio, threshold: 0.005, artifactHashes: c0.artifactHashes }, null, 2)}\n`);
   assert.equal(run(PIXEL, ['--demo', dir], { env: env() }).status, 0, '前提:绑对后应放行');
   // 攻击:比对完成后把 diff 图换成别的字节(report 里的 hash 不动)
   const rep = readJson(join(dir, 'report-pixel.json'));
