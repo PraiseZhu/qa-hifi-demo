@@ -389,7 +389,7 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 | B 状态覆盖 | ✅ 进（`passed/total`） | canonical 浏览器重跑，**在任何 demo Node 脚本之前**、从同一 immutable snapshot 加载 | 哨兵结论同门 |
 | C 交互鲁棒 | ✅ 进（checks 列表） | 同 B（canonical 浏览器 + snapshot + 先于 demo 脚本） | |
 | D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | 同 B | |
-| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 的裁决人与理由） | **pr-block 亲自 spawn canonical `pixel-compare --report-out <demo 外>`**，真实解码/截图/odiff；trusted report 出块、自报只对账；artifact 三图被 trusted 运行覆盖，WARN 裁决必须绑定这三图的 sha256（r7 条目 8） | 排在可信 verify **之前**（verify 末段会执行 demo 代码）；未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
+| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 的裁决人与理由） | **pr-block 亲自 spawn canonical `pixel-compare --report-out <demo 外>`**，真实解码/截图/odiff；trusted report 出块、自报只对账；artifact 三图被 trusted 运行覆盖，WARN 裁决必须绑定这三图的 sha256 + 本次现算的 `key`/`diffRatio`/`threshold`（r8） | 排在可信 verify **之前**（verify 末段会执行 demo 代码）；未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
 | F 适配还原 | ✅ 进（点数；未配置则降级声明） | 同 B | |
 | X 自定义门 | ✅ 进（gate id 列表，**降准表述**） | canonical verify 亲自执行注册脚本、记真实 exit code；执行前就地算脚本 sha256 并与观察前入链的那份比对 | **只能声称「精确 hash 的注册脚本被可信 runner 执行且 exit 0」这个执行事件** —— 脚本本身是 demo 代码，不证明它实现了正确的业务 oracle（r7 条目 10）。排在 A-D/F/E 核心观察之后；执行完整组回收子进程；隔离程度见下方残余风险 |
 | 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 可信侧现算体积） | pr-block **自己**枚举 `assets/` 现算体积并与阀值比对；`report-assets.json` 自报数字仅对账 | 抬闸阀与理由是**作者的政策输入**、不是测量证据（见「资产抬闸的定性」） |
@@ -415,7 +415,7 @@ verify 的门过滤、pr-block 的投影门集合、PR 门表渲染都只遍历�
 | `report-assets.json` | 测量数字**不能**作依据；抬闸理由可作**作者声明** | 体积/阀值由 pr-block 自己现算；`overrideReason` 原样印进 PR 供 reviewer 判断 |
 | `component.inputs.json` | **不能单独信** | 必须 `--check-inputs` 与 esbuild 现算结果全等 + 清单内每项逐文件 hash + 产物字节复算（I-ESBUILD / I-CSS） |
 | `truth.json` | **待证明的声明** | 每个叶子带 provenance + canonical verify 现跑 `extract.mjs` 比对（extractor drift） |
-| `adjudications/*.json`（WARN 人工裁决） | **人工裁决声明，不是机械测量** | 必须绑定 trusted E 产出的 baseline/demo/diff 三图 sha256；裁决人与理由印进 PR（r7 条目 8） |
+| `adjudications/*.json`（WARN 人工裁决） | **人工裁决声明，不是机械测量** | 必须同时声明并全等四项：`key`（含 platform 的复合 key `<platform>/<key>`）/ `diffRatio` / `threshold` / 三图 sha256（r8）；裁决人与理由印进 PR |
 | `index.html` | **init 生成后可编辑的运行输入**，不是可信产物 | 不声称 adapter/chrome 段是 canonical（没有逐段字节全等校验）：只保证「相对上次 build 未被改动」（进 `inputHashes`）+ 内嵌 `qa-truth` ≡ `truth.json` + **渲染结论由 canonical 浏览器从 immutable snapshot 实测**（门 B/C/D）（r7 条目 12） |
 
 ### 资产抬闸的定性（r7 条目 11，别把它写成机械保证）
@@ -456,7 +456,7 @@ pr-block 会自己现算体积并把抬闸阀与理由原样印进 PR 附贴块�
 | `build.mjs` / `component-build-core.mjs` / `extract-helpers.mjs` / `repo-glob.mjs`（demo 侧拷贝） | init 拷贝 | **需可信侧复算**（更强：钉死） | `checkDemoBuilderIntegrity` 要求与 skill canonical 逐字节全等；且复算一律跑 skill 那份，不执行 demo 拷贝 |
 | `baselines/**.png`（像素基准图） | `capture-baseline.mjs` / 人工采集 | **hash 输入已足够 + 门 E 可信重跑** | 基准图进 `inputHashes.baselines`（换图 → report 失效）；比对本身由 pr-block 重跑 pixel-compare 亲自做。**基准图的"来源真实性"（是否真是产品沙盒截图）工具无法机械证明——这一条如实降级为需人工审查** |
 | `pixel-artifacts/*.png`（baseline/demo/diff 三图） | pixel-compare | **需可信侧复算** ✅ r6 起 | 被可信重跑覆盖成我们生成的那份，WARN 人工裁决判的是这份 |
-| `adjudications/*.json`（WARN 人工裁决） | 人工 | **人工裁决声明，不是机械测量** | r7 条目 8 起必须**绑定 trusted E 产出的三图 sha256**（不再是「路径存在」就算数:路径可以指向后来被换掉的图）。三层都要对上——report 记了三图 hash、磁盘现算等于它、裁决声明的 hash 等于它;`reviewer` / `reason` 必填并印进 PR。工具只保证「它判的是可信侧生成的那三张图」，保证不了「判断本身对」 |
+| `adjudications/*.json`（WARN 人工裁决） | 人工 | **人工裁决声明，不是机械测量** | 必须同时声明并**全等**四项 `{ key, diffRatio, threshold, artifactHashes }`，缺一项即拒并点名缺哪个，任一项不等即拒并打印「裁决声明值 vs 本次现算值」。① `artifactHashes`：trusted E 产出的 baseline/demo/diff 三图 sha256（r7 条目 8 起就不再是「路径存在」算数:路径可以指向后来被换掉的图）——三层都要对上:report 记了三图 hash、磁盘现算等于它、裁决声明等于它。② `diffRatio` / `threshold`：必须等于**本次 trusted pixel 现算**的值(r8)。只绑三图挡得住「换图」，挡不住「换差异」——同一 key 上一次小幅 WARN 的裁决，在差异变大、三图跟着重跑更新之后就会被复用;**人工裁决的是当时那个具体差异，差异变大就必须重新裁决**。③ `key`：含 platform 的复合形式 `<platform>/<key>`（无 platform 的旧式条目用裸 key）——基准按 `baselines/<platform>/` 分端存放、永不互比，mac 端的裁决不得被 windows 端的 WARN 复用。校验点在 trusted `pixel-compare` 采纳处与 `report.mjs` 的 `validatePixelReport` **两侧都有**。`reviewer` / `reason` 必填并印进 PR。工具只保证「它判的是可信侧生成的那三张图、那个具体差异」，保证不了「判断本身对」 |
 | `report.json` | verify | **不作为放行依据** | pr-block 重跑 canonical verify，自报仅对账（r5） |
 | `report-pixel.json` | pixel-compare | **不作为放行依据** | pr-block 重跑 canonical pixel-compare，自报仅对账（r6） |
 | `report-assets.json` | assets-manifest | **不作为放行依据** | 体积/阀值由 pr-block 自己重算，自报仅对账（r5 #5c） |
@@ -537,7 +537,7 @@ pr-block 会自己现算体积并把抬闸阀与理由原样印进 PR 附贴块�
   但报告降级声明「还原承诺仅到数据层」；配了就必须全过。
 - **门 E 像素基准**（`scripts/pixel-compare.mjs`）：`baselines/<key>.png` = 真沙盒截图
   （桌面 dev 实例 / 手机模拟器采集），在 Node 可信侧解 PNG、比较 RGBA 并输出 baseline/demo/diff 三图。
-  mask 只可跳过小面积动态区，超面积、缺图、尺寸错、ERROR/MISSING 都阻断；WARN 必须有人工裁决 artifact 才允许 PR 附贴。
+  mask 只可跳过小面积动态区，超面积、缺图、尺寸错、ERROR/MISSING 都阻断；WARN 必须有人工裁决 artifact 才允许 PR 附贴，且该裁决必须绑定本次的 `key`/`diffRatio`/`threshold`/三图 sha256（旧裁决不得复用到变大的差异上）。
   无基准时如实标注「像素级未比对」。
   **比对内核（gate-e-v2）**：优先 **odiff**（`odiff-bin`，`antialiasing:true` 忽略抗锯齿像素、
   mask 映射 `ignoreRegions`），odiff 不可用时回退 pixelmatch（行为不变并记录 `engineNote`）；
@@ -556,7 +556,7 @@ pr-block 会自己现算体积并把抬闸阀与理由原样印进 PR 附贴块�
   **分端基准（gate-e-v2）**：`baselines[].platform` 声明 `web|electron-mac|electron-win|ios|android` 后，
   基准落 `baselines/<platform>/<key>.png`（未声明保持旧平铺）；**不同 platform 的基准永不互比**，
   各自只与 demo 渲染帧比——跨渲染引擎像素直比不可行（字体/取整/阴影算法差异），跨端一致性走
-  门 D 绑定与真值断言，不走像素。分端条目的 artifact/裁决文件按 `<platform>.<key>` 命名。
+  门 D 绑定与真值断言，不走像素。分端条目的 artifact/裁决**文件名**按 `<platform>.<key>` 命名（如 `adjudications/web.one.json`），而裁决文件**内部** `key` 字段写复合 key `<platform>/<key>`（如 `web/one`，与 report 校验用的复合 key 同构）——文件名不能带 `/`，但字段必须能唯一定位「哪个 platform 的哪个 baseline」。
   **采集用 `scripts/capture-baseline.mjs`**：`--url <dev实例>` 直接截真沙盒帧元素（DPR 与
   pixel-compare 同口径），`--electron-app <main入口或app目录>` 起真实 Electron 壳截首窗口
   （桌面端真渲染，mac/win 各存各的基准），或 `--from-png <截图>` 导入真机截图（先渲染 demo 量帧尺寸，

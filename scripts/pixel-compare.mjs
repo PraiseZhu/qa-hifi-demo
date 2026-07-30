@@ -160,19 +160,25 @@ try {
         };
         const adj = readAdjudication(demoDir, artKey);
         if (item.status === 'WARN') {
-          /* 裁决要能影响放行,前提是它**绑定这一次(可信侧)产出的三图 sha256**。
-             裁决文件本身是**人工裁决声明、不是机械测量** —— 工具只能保证「它判的图是我们
-             生成的那三张」,保证不了「判断本身对」。绑不上就不认这份裁决(WARN 无有效裁决 → ok=false)。 */
-          const bound = adj?.artifactHashes;
-          const same = bound && ['baseline', 'demo', 'diff'].every((k) => bound[k] === item.artifactHashes[k]);
-          if (adj?.ok === true && same) item.adjudication = adj;
+          /* 裁决要能影响放行,前提是它**同时绑定这次比对的四项**(r8):
+               key(含 platform 的复合 key) / diffRatio / threshold / 三图 sha256。
+             r7 只绑三图字节 —— 挡得住「换图」,挡不住「换差异」:同一 key 上一次小幅 WARN 的
+             裁决,在差异变大后只要三图跟着重跑更新,旧裁决的语义(判的是 0.1% 还是 8%)无人核对。
+             人工裁决的是**当时那个具体差异**,差异变了就必须重新裁决;key 带 platform 则防止
+             mac 端的裁决被 windows 端的 WARN 复用(基准本就分端存放、永不互比)。
+             裁决文件本身仍是**人工裁决声明、不是机械测量** —— 工具只能保证「它判的是我们这次
+             生成的那三张图、那个具体差异」,保证不了「判断本身对」。绑不上就不认(→ ok=false)。 */
+          const reason = adjudicationMismatch(adj, {
+            key: item.platform ? `${item.platform}/${entry.key}` : entry.key,
+            diffRatio: item.diffRatio,
+            threshold,
+            artifactHashes: item.artifactHashes,
+          });
+          if (adj?.ok === true && !reason) item.adjudication = adj;
           else if (adj?.ok !== true) item.detail += '; 缺人工裁决 artifact';
           else {
-            item.detail += '; 人工裁决未绑定本次可信侧产出的三图 sha256(裁决无凭据)';
-            item.adjudicationRejected = {
-              file: adj.file,
-              reason: bound ? '裁决声明的 artifactHashes 与本次产出不符(图被换过 / 裁决是旧版)' : '裁决缺 artifactHashes 字段',
-            };
+            item.detail += `; ${reason}`;
+            item.adjudicationRejected = { file: adj.file, reason };
           }
         }
       }
@@ -189,6 +195,30 @@ try {
   try { if (page) await page.close(); } catch {}
   try { if (browser) await browser.close(); } catch {}
   try { if (safeServer) await safeServer.close(); } catch {}
+}
+
+/* 返回 null = 裁决绑定成立;返回字符串 = 拒收原因(会同时进 detail 与 adjudicationRejected)。
+   四项字段全部要求**全等**:缺任一项点名缺哪个;不等则同时打印「裁决声明值 vs 本次现算值」,
+   让人一眼看出这是旧裁决被复用,而不是「哪里格式不对」。 */
+function adjudicationMismatch(adj, expected) {
+  if (!adj) return '缺人工裁决 artifact';
+  const REQUIRED = ['key', 'diffRatio', 'threshold', 'artifactHashes'];
+  const missing = REQUIRED.filter((f) => adj[f] === undefined || adj[f] === null);
+  if (missing.length)
+    return `人工裁决缺字段 ${missing.join(' / ')}——WARN 裁决必须同时声明 ${REQUIRED.join(' / ')}(否则旧裁决可被复用到新的差异上)`;
+  const KINDS = ['baseline', 'demo', 'diff'];
+  const noHash = KINDS.filter((k) => typeof adj.artifactHashes[k] !== 'string');
+  if (noHash.length) return `人工裁决 artifactHashes 缺 ${noHash.join(' / ')} 的 sha256(裁决无凭据)`;
+  const badHash = KINDS.filter((k) => adj.artifactHashes[k] !== expected.artifactHashes[k]);
+  if (badHash.length)
+    return `人工裁决声明的 ${badHash.join(' / ')} sha256 与本次可信侧产出不符(图被换过 / 裁决是旧版)`;
+  if (adj.key !== expected.key)
+    return `人工裁决 key 不符:裁决声明 ${adj.key} vs 本次现算 ${expected.key}——裁决属于另一个 platform/baseline,不得跨端复用`;
+  if (adj.diffRatio !== expected.diffRatio)
+    return `人工裁决 diffRatio 与本次现算不符:裁决声明 ${adj.diffRatio} vs 本次现算 ${expected.diffRatio}——旧裁决被复用到新的差异上,必须针对当前差异重新裁决`;
+  if (adj.threshold !== expected.threshold)
+    return `人工裁决 threshold 与本次不符:裁决声明 ${adj.threshold} vs 本次现算 ${expected.threshold}——裁决判的不是当前阈值口径`;
+  return null;
 }
 
 function readAdjudication(root, key) {
