@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{NAME}} · qa-hifi demo</title>
+<style>
+/* ===== 界面本体样式 =====
+   规则:任何文案/几何/颜色值只准来自内嵌 truth(门 A/D 会抓手写漂移)。
+   chrome 工具区样式由 qa-chrome 注入,不要在这里覆盖 qa-* 类。 */
+</style>
+</head>
+<body>
+<!-- 真值块:由 `node <skill>/scripts/truth.mjs --demo <dir> --embed` 写入,禁止手抄 -->
+<script id="qa-truth" type="application/json"></script>
+<script>
+// ===== demo 配置(作者唯一要写的部分;字段说明见 qa-chrome 头注释) =====
+window.__qaDemo = {
+  name: '{{NAME}}',
+  pr: {{PR}},
+  summary: {
+    what: 'TODO:做了什么(≤2 行)',
+    how: 'TODO:怎么做的(≤2 行)',
+    accept: 'TODO:怎么验收(≤2 行)',
+  },
+  matrix: {
+    plat:   { label: '端',   options: [{ v: 'desktop', label: '桌面' }, { v: 'mobile', label: '移动' }] },
+    region: { label: '区域', options: [{ v: 'cn', label: '中国大陆' }, { v: 'global', label: 'Global' }] },
+    os:     { label: '系统', options: [{ v: 'mac', label: 'macOS' }, { v: 'win', label: 'Windows' }] },
+    mode:   { label: '主题', options: [{ v: 'light', label: 'Light' }, { v: 'dark', label: 'Dark' }] },
+    lang:   { label: '语言', options: [{ v: 'zh-CN', label: '简中' }, { v: 'en', label: 'EN' }] },
+  },
+  defaultPrefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' },
+  initialState: 'entry',
+  states: {
+    entry: {},
+    // TODO:补齐 spec.states 声明的所有状态(两边必须一致,门 B 会验)
+  },
+  tabStates: [
+    // { id: 'error-expired', label: '过期态', note: '链路难触达:需要服务端返回过期错误' },
+  ],
+  adaptive: null,
+  // adaptive: { min: { w: 960, h: 640 }, initial: { w: 1200, h: 800 }, bandLabel: (w, h) => (w < 1100 ? '压缩档' : '标准档') },
+  scale: () => 1,
+  renderApp(ctx) {
+    // TODO:按 ctx.truth + ctx.prefs + ctx.state 渲染界面本体进 ctx.frame。
+    // 界面数据只准取自 ctx.truth;需要门 F 探针的元素加 data-qa-probe="<id>"。
+    ctx.frame.innerHTML = '';
+    const el = document.createElement('div');
+    el.style.padding = '24px';
+    el.textContent = `state=${ctx.state} · ${JSON.stringify(ctx.prefs)}`;
+    ctx.frame.appendChild(el);
+  },
+};
+</script>
+<script>
+/* QA_CHROME_BEGIN — 标准 chrome 运行时,由 init.mjs 内联;勿手改。
+   升级:node <skill>/scripts/init.mjs --dir <demo-dir> --update-chrome */
+{{QA_CHROME}}
+/* QA_CHROME_END */
+</script>
+</body>
+</html>
