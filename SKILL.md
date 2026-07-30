@@ -398,6 +398,12 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
    三者任一不满足即 exit 2——否则本闸门是一条谁都能整段跳过的"自愿门"（跑没跑过、抬没抬闸，
    定稿时完全查不到）。
 
+   **`pr-block` 不信报告自报的数字**：`hash + ok:true` 都写在同一份可手写的 JSON 里，
+   一份 `{ ok:true, totalBytes:0, inputHashes:<真 hash> }` 就能把 9MB 资产送过闸。所以
+   `pr-block` 自己从 `assets/` 重算总体积，再逐条校验：`defaultLimitMb` ≡ 本工具写死的 8、
+   `effectiveLimitMb` 是有限正数、自报 `totalBytes` ≡ 现算值、现算值 ≤ 生效阀、
+   「生效阀 > 默认阀」⟺「`overrideReason` 非空」（双向）。任一不成立即 exit 2。
+
    **抬闸必须留痕**：`--max-total` 高于默认 8MB 时必须同时给非空 `--override-reason "<为什么
    这个 demo 必须更大>"`，否则参数直接被拒。理由进报告并原样印在 PR 附贴块上：
    `⚠️ 资产 X MB 超默认闸门 8 MB（本次生效阀 Y MB），抬闸理由：…`。收紧到默认阀以下不需要理由

@@ -301,3 +301,84 @@ test('#2c 组件 demo 缺 build.mjs → fail-closed(清单无法独立复算)', 
   const problems = validateReportIntegrity(dir, readSpec(dir), readJson(join(dir, 'report.json')));
   assert.ok(problems.some((p) => /缺 build\.mjs/.test(p)), `缺构建器未 fail-closed:${JSON.stringify(problems)}`);
 });
+
+// ==================== #5c 资产闸门独立重算 ====================
+
+/** 拿一份真实通过的资产报告当基底,再按对抗场景改字段。 */
+function assetsReportOf(dir) {
+  return readJson(join(dir, 'report-assets.json'));
+}
+function writeAssetsReport(dir, patch) {
+  writeFileSync(join(dir, 'report-assets.json'), stableJson({ ...assetsReportOf(dir), ...patch }));
+}
+
+test('#5c 复现样本: 9MB 资产 + 手写 ok:true/totalBytes:0 的报告 → pr-block 拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'fake-ok', extraAssetBytes: 9 * 1024 * 1024 });
+  assert.equal(buildDemo(dir).status, 0);
+  assert.equal(verifyDemo(dir).status, 0);
+  // 真闸门会拒(超 8MB 未抬闸),但它照样落盘 ok:false —— 攻击者把它改成 ok:true
+  assert.notEqual(assetsGate(dir).status, 0, '9MB 资产应被真闸门拒');
+  const real = assetsReportOf(dir);
+  assert.equal(real.ok, false);
+  writeAssetsReport(dir, { ok: true, totalBytes: 0, problems: undefined });
+  const pr = prBlock(dir);
+  assert.notEqual(pr.status, 0, '手写 ok:true 居然出块了(#5c 未修)');
+  const out = pr.stdout + pr.stderr;
+  assert.match(out, /自报 totalBytes=0 与现算/);
+  assert.match(out, /超过生效阀/);
+});
+
+test('#5c 伪造 effectiveLimit 999 且无抬闸理由 → pr-block 拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'fake-limit', extraAssetBytes: 9 * 1024 * 1024 });
+  assert.equal(buildDemo(dir).status, 0);
+  assert.equal(verifyDemo(dir).status, 0);
+  assetsGate(dir);
+  const cur = assetsReportOf(dir);
+  writeAssetsReport(dir, {
+    ok: true,
+    problems: undefined,
+    effectiveLimitMb: 999,
+    effectiveLimitBytes: 999 * 1024 * 1024,
+    maxTotalMb: 999,
+    totalBytes: cur.totalBytes, // 体积自报如实,只把阀值吹上去
+    overrideReason: null,
+  });
+  const pr = prBlock(dir);
+  assert.notEqual(pr.status, 0, '无理由抬闸居然出块了');
+  assert.match(pr.stdout + pr.stderr, /抬到 999MB 却没有非空 overrideReason/);
+});
+
+test('#5c 真实抬闸(带理由)→ 过闸且附贴块印出理由', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'real-raise', extraAssetBytes: 9 * 1024 * 1024 });
+  assert.equal(buildDemo(dir).status, 0);
+  assert.equal(verifyDemo(dir).status, 0);
+  assert.notEqual(assetsGate(dir).status, 0, '默认阀下 9MB 应先被拒');
+  const g = assetsGate(dir, ['--max-total', '12', '--override-reason', '登录页品牌视频首帧必须原分辨率']);
+  assert.equal(g.status, 0, `真实抬闸应通过:${g.stdout}${g.stderr}`);
+  const pr = prBlock(dir);
+  assert.equal(pr.status, 0, `带理由的抬闸被误伤:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /抬闸理由：登录页品牌视频首帧必须原分辨率/);
+});
+
+test('#5c 默认阀常量被改 / 未抬闸却挂理由 → pr-block 拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'const-drift' });
+  greenDemo(dir);
+  assert.equal(prBlock(dir).status, 0, '基线应放行');
+  writeAssetsReport(dir, { defaultLimitMb: 64 });
+  assert.match(prBlock(dir).stdout + prBlock(dir).stderr, /defaultLimitMb=64 与本工具默认闸门 8MB 不一致/);
+  writeAssetsReport(dir, { overrideReason: '看起来像有理由' });
+  assert.match(prBlock(dir).stdout + prBlock(dir).stderr, /未抬闸.*却带了 overrideReason/s);
+});
+
+test('#5c 阳性对照: 小体积资产 + 真跑闸门 → 照常出块(不误伤)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'assets-ok', extraAssetBytes: 1024 });
+  greenDemo(dir);
+  const pr = prBlock(dir);
+  assert.equal(pr.status, 0, `阳性对照被误伤:${pr.stdout}${pr.stderr}`);
+  assert.ok(!/assets:/.test(pr.stdout + pr.stderr), '不该报任何资产问题');
+});

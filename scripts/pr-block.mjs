@@ -170,12 +170,44 @@ if (existsSync(join(demoDir, 'assets'))) {
       problems.push(`assets: ${ASSETS_REPORT_NAME} 不是合法 JSON:${err.message}`);
     }
     if (ar) {
+      // 审核 #5c:原来只查 hash + ok:true,而这两项都写在同一份可手写的 JSON 里——
+      // 手写一份 { ok:true, totalBytes:0, inputHashes:<真 hash> } 就能把 9MB 资产送过闸。
+      // 现在阀值与体积一律由 pr-block 自己从 assets/ 重算,report 自报的数字只用于对账。
+      const actual = buildAssetsManifest(demoDir).files;
+      const actualTotal = actual.reduce((sum, f) => sum + f.size, 0);
+      const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+      const defaultMb = num(ar.defaultLimitMb);
+      const effectiveMb = num(ar.effectiveLimitMb);
+      const claimedTotal = num(ar.totalBytes);
+      const MB = (b) => (b / 1024 / 1024).toFixed(2);
+
       if (ar.toolVersion !== TOOL_VERSION) problems.push(`assets: ${ASSETS_REPORT_NAME} toolVersion 缺失或不匹配:${ar.toolVersion ?? '(missing)'}——重跑闸门`);
-      if (!sameInputHashes(ar.inputHashes?.assets, buildAssetsManifest(demoDir).files))
+      if (!sameInputHashes(ar.inputHashes?.assets, actual))
         problems.push(`assets: ${ASSETS_REPORT_NAME} 的 assets hash 与当前 assets/ 不一致——闸门跑完又换过资产,重跑 assets-manifest.mjs`);
       if (ar.ok !== true) problems.push(`assets: ${ASSETS_REPORT_NAME} ok 不是 true(资产超闸门未抬闸):${(ar.problems ?? []).join(';')}`);
-      if (ar.overrideReason !== null && ar.overrideReason !== undefined && (typeof ar.overrideReason !== 'string' || !ar.overrideReason.trim()))
-        problems.push(`assets: ${ASSETS_REPORT_NAME} overrideReason 非法(抬闸必须有非空理由)`);
+      // ① 默认阀常量一致性:报告里的默认阀必须等于本工具写死的 8MB(改常量 = 换了口径)
+      if (defaultMb !== DEFAULT_ASSETS_LIMIT_MB)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} defaultLimitMb=${JSON.stringify(ar.defaultLimitMb)} 与本工具默认闸门 ${DEFAULT_ASSETS_LIMIT_MB}MB 不一致——报告不是当前 assets-manifest.mjs 产出的,重跑闸门`);
+      // ② 生效阀必须是有限正数
+      if (effectiveMb === null || effectiveMb <= 0)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} effectiveLimitMb=${JSON.stringify(ar.effectiveLimitMb)} 不是有限正数——报告被手改过,重跑闸门`);
+      // ③ 自报体积必须等于现算体积(手写 totalBytes:0 在这里落地)
+      if (claimedTotal !== actualTotal)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} 自报 totalBytes=${JSON.stringify(ar.totalBytes)} 与现算 ${actualTotal}(${MB(actualTotal)}MB)不符——报告被手改过或资产已变,重跑 assets-manifest.mjs`);
+      // ④ 现算体积必须真的在生效阀内(不看 ok 字段,自己判)
+      if (effectiveMb !== null && effectiveMb > 0 && actualTotal > Math.floor(effectiveMb * 1024 * 1024)) {
+        const top = actual.slice().sort((a, b) => b.size - a.size).slice(0, 5).map((f) => `${f.path}(${MB(f.size)}MB)`);
+        problems.push(`assets: assets/ 现算总体积 ${MB(actualTotal)}MB 超过生效阀 ${effectiveMb}MB——压图/换 webp/删无用资产。最大几项:${top.join('、')}`);
+      }
+      // ⑤ 抬闸 ⟺ 有非空理由(双向:抬了必须有理由;没抬不许挂理由)
+      const raised = effectiveMb !== null && defaultMb !== null && effectiveMb > defaultMb;
+      const reasonOk = typeof ar.overrideReason === 'string' && ar.overrideReason.trim().length > 0;
+      if (raised && !reasonOk)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} 把闸门从 ${defaultMb}MB 抬到 ${effectiveMb}MB 却没有非空 overrideReason——抬闸必须署名理由,理由会印在 PR 上`);
+      if (!raised && ar.overrideReason !== null && ar.overrideReason !== undefined && !reasonOk)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} overrideReason 非法(未抬闸时应为 null)`);
+      if (!raised && reasonOk)
+        problems.push(`assets: ${ASSETS_REPORT_NAME} 未抬闸(生效阀 ${effectiveMb}MB ≤ 默认 ${defaultMb}MB)却带了 overrideReason——报告被手改过,重跑闸门`);
       assetsReport = ar;
     }
   }
