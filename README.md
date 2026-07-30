@@ -95,7 +95,7 @@ templates/
 ## 测试
 
 ```bash
-node --test scripts/__tests__/
+node --test 'scripts/__tests__/*.test.mjs'   # 或裸 npm test
 ```
 
 测试是对抗式的：大量 fixture 专门构造「旧实现会假绿」的场景（合成 click 自证、mask 隐藏
