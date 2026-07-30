@@ -247,6 +247,41 @@ test('mask 边界:差异落 mask 最后一列/行 vs 紧邻第一列/行,odiff �
   }
 });
 
+// 终审缺口 #1b:零面积/完全出界 mask 在 maskBitmap 里 0 贡献,语义等同无 mask——
+// 不得因 ignoreRegions 过滤后为空数组而让 odiff 抛 --ignore "" 错
+test('mask 零面积/出界等同无 mask:点名 odiff 不抛不降级,bad 与无 mask 一致(终审缺口 #1b)', async () => {
+  const { PNG, pixelmatch, odiff } = await pngApi();
+  const W = 8, H = 8;
+  const base = solidPng(PNG, W, H, [10, 10, 10]);
+  const act = solidPng(PNG, W, H, [10, 10, 10]);
+  const i = (5 * W + 5) * 4; // 一个真实差异点(任何 mask 都没遮它)
+  act.data[i] = 200; act.data[i + 1] = 200; act.data[i + 2] = 200;
+  const baseRaw = PNG.sync.write(base);
+  const actRaw = PNG.sync.write(act);
+  const ref = await compareImages({
+    PNG, pixelmatch, odiff, engine: 'odiff',
+    baselineRaw: baseRaw, actualRaw: actRaw,
+    cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+  });
+  assert.equal(ref.status, 'OK');
+  assert.equal(ref.bad, 1, '无 mask 参照应检出 1 个坏点');
+  for (const [label, masks] of [
+    ['零宽 mask [0,0,0,1]', [[0, 0, 0, 1]]],
+    ['零高 mask [0,0,1,0]', [[0, 0, 1, 0]]],
+    ['完全出界 mask [100,100,5,5]', [[100, 100, 5, 5]]],
+  ]) {
+    const res = await compareImages({
+      PNG, pixelmatch, odiff, engine: 'odiff',
+      baselineRaw: baseRaw, actualRaw: actRaw,
+      cssSize: { width: W, height: H }, masks, threshold: 0.1,
+    });
+    assert.equal(res.status, 'OK', `${label}: 点名 odiff 不得抛错(${res.detail})`);
+    assert.equal(res.engine, 'odiff', `${label}: 不得静默降级`);
+    assert.ok(!res.engineNote, `${label}: 不得有降级 engineNote`);
+    assert.equal(res.bad, ref.bad, `${label}: bad 应与无 mask 时一致`);
+  }
+});
+
 // ============ ② 分端基准(platform) ============
 
 test('manifest 覆盖分端子目录:平铺 + <platform>/<key>.png 混合,declared 同构', async () => {
@@ -528,6 +563,68 @@ test('finding #2 阳性对照:真实报告(带 engine 字段)照常放行,防过
   const dir = await writeDemoWithBaselines('forge-none', [{ key: 'one', platform: 'web' }]);
   const real = realReports(dir, env);
   assert.equal(real.results[0].engine, 'odiff', 'pixel-compare 应把 engine 写进 results');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 0, `真实报告被误伤:${pr.stdout}${pr.stderr}`);
+});
+
+// ============ ⑤b status 结论与阈值一致性(终审缺口 #2b) ============
+
+test('finding #2b: 高 diff 伪 PASS(bad:50/100,diffRatio:0.5)→ 拒绝(终审人复现样本)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-hidiff', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  // 终审人样本:计数自洽、engine 合法,但 50% 差异伪装 PASS
+  real.results[0] = { ...real.results[0], status: 'PASS', bad: 50, total: 100, masked: 0, diffRatio: 0.5, engine: 'odiff' };
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2, `伪 PASS 居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /伪 PASS|超阈值/);
+});
+
+test('finding #2b: 零 diff 伪 WARN → 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-lowwarn', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  real.results[0] = { ...real.results[0], status: 'WARN', bad: 0, total: 100, masked: 0, diffRatio: 0, engine: 'odiff' };
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /伪 WARN|未超阈值/);
+});
+
+test('finding #2b: 伪 engine(photoshop)→ 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-engine', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  real.results[0].engine = 'photoshop';
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /engine 非法|photoshop/);
+});
+
+test('finding #2b: 阈值篡改(report.threshold=0.9)→ 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-threshold', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  real.threshold = 0.9;
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /threshold|篡改/);
+});
+
+test('finding #2b 阳性对照:更严校验下真实报告仍放行', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-none-2b', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  assert.equal(real.threshold, 0.005);
+  assert.ok(real.results[0].diffRatio <= real.threshold);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
   assert.equal(pr.status, 0, `真实报告被误伤:${pr.stdout}${pr.stderr}`);
 });
