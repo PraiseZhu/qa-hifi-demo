@@ -111,9 +111,22 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
   （桌面 dev 实例 / 手机模拟器采集），在 Node 可信侧解 PNG、比较 RGBA 并输出 baseline/demo/diff 三图。
   mask 只可跳过小面积动态区，超面积、缺图、尺寸错、ERROR/MISSING 都阻断；WARN 必须有人工裁决 artifact 才允许 PR 附贴。
   无基准时如实标注「像素级未比对」。
+  **比对内核（gate-e-v2）**：优先 **odiff**（`odiff-bin`，`antialiasing:true` 忽略抗锯齿像素、
+  mask 映射 `ignoreRegions`），odiff 不可用时回退 pixelmatch（行为不变并记录 `engineNote`）；
+  `QA_HIFI_COMPARE_ENGINE=odiff|pixelmatch` 可点名（A/B 对比/排障用，点名 odiff 失败直接报错不静默降级）。
+  mask 面积上限 / `minUnmaskedRatio` 护栏在本仓这层，不交给引擎。
+  **分端基准（gate-e-v2）**：`baselines[].platform` 声明 `web|electron-mac|electron-win|ios|android` 后，
+  基准落 `baselines/<platform>/<key>.png`（未声明保持旧平铺）；**不同 platform 的基准永不互比**，
+  各自只与 demo 渲染帧比——跨渲染引擎像素直比不可行（字体/取整/阴影算法差异），跨端一致性走
+  门 D 绑定与真值断言，不走像素。分端条目的 artifact/裁决文件按 `<platform>.<key>` 命名。
   **采集用 `scripts/capture-baseline.mjs`**：`--url <dev实例>` 直接截真沙盒帧元素（DPR 与
-  pixel-compare 同口径），或 `--from-png <截图>` 导入真机截图（先渲染 demo 量帧尺寸，
+  pixel-compare 同口径），`--electron-app <main入口或app目录>` 起真实 Electron 壳截首窗口
+  （桌面端真渲染，mac/win 各存各的基准），或 `--from-png <截图>` 导入真机截图（先渲染 demo 量帧尺寸，
   尺寸不符拒收，防「随手一张图」冒充基准）。key 必须先在 spec.baselines 声明。
+  **移动端采集用 `scripts/capture-mobile.mjs`**：maestro/simctl/adb 截图 → OS chrome 裁切
+  （`--crop`/`--crop-top`）→ DPR 归一化（`--device-dpr`，Chromium canvas 重采样）→ 与 --from-png
+  同口径尺寸校验 → 落分端目录；驱动链路模板见 `templates/maestro-flow.yaml`（testID 定位 +
+  到达断言 + 动画稳定后截图）。
   **来源要如实**：指 demo 自己的地址采基准 = 自证，门 E 失去意义。
 - **门 X 自定义门**（`spec.customGates`）：demo 专属的体外验收脚本（元素重叠检测、特殊交互断言等
   六门覆盖不了的检查）**必须注册进 `spec.customGates`**，由 verify 统一执行（exit 0 = PASS）、
@@ -292,9 +305,11 @@ proposal 点名维护者看 EVOLUTION.md；全是 isNew=false 时整组省略。
   `kind` 枚举：`color` / `length` / `text` / `asset-sha`。`pseudo` 枚举：`::before` / `::after` / `::placeholder`。
   `color` 会拒绝 `inherit/currentColor/var()` 等上下文相关值；`length` 支持严格 CSS length 解析，可按 `__qa.scale()` 缩放；
   `asset-sha` 只允许同源本地资源，按 SHA256 与 truth 比对。
-- `baselines`：门 E 声明——`[{ key, via?, frameSel?, mask?, maxMaskRatio?, minUnmaskedRatio? }]`
+- `baselines`：门 E 声明——`[{ key, platform?, via?, frameSel?, mask?, maxMaskRatio?, minUnmaskedRatio? }]`
   + `baselineFrameSel?` / `baselineThreshold?` / `baselineDpr?` / `pixelmatchThreshold?`；
-  基准图放 `baselines/<key>.png`（真沙盒截图，声明了就必须存在）。热图输出到 `pixel-artifacts/`。
+  `platform` 枚举（gate-e-v2）：`web` / `electron-mac` / `electron-win` / `ios` / `android`——声明后基准图放
+  `baselines/<platform>/<key>.png`，未声明放旧式 `baselines/<key>.png`（真沙盒截图，声明了就必须存在；
+  不同 platform 基准永不互比）。热图输出到 `pixel-artifacts/`（分端条目按 `<platform>.<key>` 命名）。
 - `adaptive`：门 F 声明——`{ min: {w,h}, sampleSizes: [[w,h]...], probes: [{id, sel}], tolerancePx? }`；
   `min` = 沙盒最小窗口宽高（extract 从产品常量提取,如 Electron BrowserWindow minWidth/minHeight）；
   `sampleSizes` 供 extract.mjs 预计算 `truth.adaptive.samples`（每条 = `{w, h, probes:{<id>:{x,y,w,h}}}`）。

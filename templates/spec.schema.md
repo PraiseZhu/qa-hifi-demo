@@ -78,6 +78,10 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
     { "key": "desk-zh-light-id", "via": [ { "expect": "id" } ] },
     { "key": "phone-ko-dark-id", "via": [ { "click": "[data-seg=phone]" }, { "click": "[data-seg=dark]" }, { "click": "[data-seg=ko]" }, { "expect": "id" } ],
       "mask": [[300, 480, 80, 20]] }        // 动态区(倒计时数字等)按 CSS 像素跳过
+    // 分端(gate-e-v2):加 "platform" 后基准落 baselines/<platform>/<key>.png,未声明落旧平铺;
+    // 不同 platform 基准永不互比;同一 key 可跨端各声明一条(唯一性按 platform+key)
+    // { "key": "login", "platform": "electron-mac", "frameSel": ".frame" }
+    // { "key": "login", "platform": "ios", "frameSel": ".frame", "mask": [[0, 0, 390, 24]] }
   ],
   "baselineFrameSel": ".frame",             // ? 截图元素,缺省 .frame
   "baselineThreshold": 0.005,               // ? diff 像素占比阈值,缺省 0.5%
@@ -116,7 +120,7 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
 - `verify.persistence` 必须写 `expected`、`storageKey`、`reloads>=1`；不能只让 demo 的 `__qa.prefs()` 自证。
 - `verify.inputs` 必须写非空 `text`、正数 `tickMs` 与 `tickWitness`；验收会等 witness 真实变化后再断言输入框 DOM 节点未被替换。
 - `bindings.kind` 只允许 `color` / `length` / `text` / `asset-sha`；`pseudo` 只允许 `::before` / `::after` / `::placeholder`。
-- `baselines` 声明的每个 key 必须有 `baselines/<key>.png`；mask 超面积、未遮罩区域过少、WARN 无人工裁决都阻断 PR 附贴。
+- `baselines` 声明的每个 key 必须有对应基准图（声明 `platform` → `baselines/<platform>/<key>.png`，未声明 → `baselines/<key>.png`）；mask 超面积、未遮罩区域过少、WARN 无人工裁决都阻断 PR 附贴。分端条目的裁决文件按 `<platform>.<key>` 命名（`adjudications/<platform>.<key>.json`）。
 - 规范化只排序 object key；语义为集合的数组必须由 `extract.mjs` 按稳定 key 排序后输出。
 
 ## customGates（门 X,2026-07-30 起）

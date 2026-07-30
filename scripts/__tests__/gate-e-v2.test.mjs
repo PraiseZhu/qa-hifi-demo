@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { compareImages, loadPngApi } from '../lib/png-compare.mjs';
+import { compareImages, loadPngApi, readPng } from '../lib/png-compare.mjs';
 import { buildBaselineManifest } from '../lib/fs-utils.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -333,8 +333,71 @@ test('--electron-app 最小 Electron app 截图成功并落分端目录', async 
   assert.equal(out.out, 'baselines/electron-mac/electron-one.png');
   const outFile = join(demo, 'baselines/electron-mac/electron-one.png');
   assert.ok(existsSync(outFile), `基准未落盘:${outFile}`);
-  const { readPng } = await import('../lib/png-compare.mjs');
   const png = readPng(PNG, outFile);
   // .frame = 16x16 CSS × force-device-scale-factor 2 = 32x32(容差 2×dpr)
   assert.ok(Math.abs(png.width - 32) <= 4 && Math.abs(png.height - 32) <= 4, `截图尺寸异常:${png.width}x${png.height}`);
+});
+
+// ============ ④ 移动端采集脚手架(capture-mobile) ============
+
+test('capture-mobile: @3x 截图 DPR 归一化到 ×2 并落 ios 分端目录', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 模拟 @3x 真机截图:16x16 CSS 帧 × 3 = 48x48 纯红
+  const shot = join(tmpDemo('shot3x'), 'ios-shot.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 48, 48, [255, 0, 0])));
+  const demo = writePixelDemo({ name: 'mobile-3x', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '3'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.mode, 'mobile-import');
+  assert.equal(out.out, 'baselines/ios/one.png');
+  assert.deepEqual(out.normalized, { width: 32, height: 32 });
+  const png = readPng(PNG, join(demo, 'baselines/ios/one.png'));
+  assert.equal(png.width, 32);
+  assert.equal(png.height, 32);
+});
+
+test('capture-mobile: 归一化后尺寸与 demo 帧不符 → 拒收(防截错帧)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 48x48 但声称 device-dpr=2 → 不缩放,48 ≠ 32±4 → 必须拒
+  const shot = join(tmpDemo('shot-bad'), 'bad.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 48, 48, [255, 0, 0])));
+  const demo = writePixelDemo({ name: 'mobile-bad', baselines: [{ key: 'one', platform: 'android', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '2'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 2);
+  assert.match(res.stdout, /不符|拒绝作为基准/);
+  assert.ok(!existsSync(join(demo, 'baselines/android/one.png')), '拒收时不得落盘');
+});
+
+test('capture-mobile: --crop-top 裁掉状态栏后取到的必须是目标区域', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 48x96:上半绿色(状态栏)下半红色(目标帧) → --crop-top 48 后应取到纯红 48x48 → 归一化 32x32
+  const shot = join(tmpDemo('shot-crop'), 'crop.png');
+  writeFileSync(shot, PNG.sync.write(paintPng(PNG, 48, 96, (x, y) => (y < 48 ? [0, 200, 0] : [255, 0, 0]))));
+  const demo = writePixelDemo({ name: 'mobile-crop', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '3', '--crop-top', '48'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.cropRect, { sx: 0, sy: 48, sw: 48, sh: 48 });
+  const png = readPng(PNG, join(demo, 'baselines/ios/one.png'));
+  assert.equal(png.width, 32);
+  // 中心像素必须是红色(裁到的是下半),不是绿色——证明裁切方向正确
+  const i = (16 * 32 + 16) * 4;
+  assert.ok(png.data[i] > 200 && png.data[i + 1] < 60, `裁切结果颜色异常:(${png.data[i]},${png.data[i + 1]},${png.data[i + 2]})`);
 });
