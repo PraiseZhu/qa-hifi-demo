@@ -45,11 +45,10 @@
 // 残余风险(诚实标注):demo 代码在 ④ 之后仍能改磁盘,只是核心观察已完成;没有把
 // extractor/custom gate 放进 OS 级 sandbox(Node vm 不是安全边界,不拿它假装隔离)。
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
 import {
   buildInputHashes,
   checkDemoNoNodeModules,
@@ -59,7 +58,6 @@ import {
   recheckComponentOutputs,
   recheckComponentCss,
   recheckComponentInputs,
-  hashFile,
   sameInputHashes,
   sha256Buffer,
   stableJson,
@@ -70,6 +68,18 @@ import { validateSpec, validateTruth, validateCustomGateFiles, truthAt, buildVer
    的根因就是 verify 与 pr-block 各写了一份、两份都漏了 E。 */
 import { lettersFor } from './lib/gates.mjs';
 import { createSafeStaticServer } from './lib/safe-server.mjs';
+/* I-OBSERVE 的实现只有一处(r8 条目 A):整树快照 / 双向 manifest / output root / 可信脚本副本。
+   pixel-compare(门 E)吃的是同一份实现 —— 「所有核心浏览器观察共用同一不可变快照」这句话
+   之前对门 E 不成立(它直接 serve/read demoDir),现在两侧同源。 */
+import {
+  SNAPSHOT_SKIP_TOP,
+  isSkippedRel,
+  listFilesRel,
+  makeObservationSnapshot,
+  makeOutputRoot,
+  snapshotManifestDiff,
+  trustedScriptCopy,
+} from './lib/observe.mjs';
 import { launchChromium } from './lib/resolve-playwright.mjs';
 import { applyCase, freshLoad, reachTabState, replay, measureAdaptive } from './lib/replay.mjs';
 
@@ -151,46 +161,17 @@ function skippedGate(name) {
   return { name, pass: false, skipped: true, detail: '本次为增量运行(--gate 过滤),该门未执行' };
 }
 
-/* r8 条目 A:豁免清单**只有这一份**,snapshot 排除 / drift 双向比对 / 页面可达性检查三处共用。
-   以前 snapshot 排除是独立定义的一张表,而没有任何东西禁止 index.html 引用被排除的路径 ——
-   于是 `<script src="verify-artifacts/x.js">` 在 snapshot 里 404、在最终交付的 demo 原地却
-   **会生效**:被验证的页面 ≠ 交付的页面,而前后 inputHashes(不覆盖这两个目录)与旧版
-   单向 snapshotDrift(只从 snapshot 一侧遍历)全都自洽 —— 观察对象与交付对象可以不同而无人发现。
-   现在三件事绑在同一份清单上:
-     ① 排除项收窄到**仅顶层**(旧代码 `rel.some(...)` 是任意层级命中,`sub/report.json`
-        这种也被漏掉);报告类只按**具体文件名**豁免,不按目录。
-     ② 页面**不得引用**任何豁免路径 —— 静态扫 index.html + 运行期记录对豁免路径的请求,命中即门 A 红。
-     ③ drift 改**双向**:snapshot→disk(删除/改写)+ disk→snapshot(新增),新增侧跳过豁免路径。
-   剩下的豁免全部是「工具自己写的」或「前置门已无条件拒掉/非交付物」,不再是任意字节的盲区。 */
-const EXEMPT_TOP_FILES = ['report.json', 'report-pixel.json', 'report-assets.json'];
-const EXEMPT_TOP_DIRS = ['verify-artifacts', 'pixel-artifacts', 'node_modules', '.git'];
-/** rel 是 demo 相对路径(/ 或 \ 分隔)。只认**顶层**命中:嵌套同名一律进 snapshot、受 drift 管。 */
-function isExemptRel(rel) {
-  const segs = String(rel).split(/[\\/]/).filter((s) => s && s !== '.');
-  if (!segs.length) return false;
-  if (segs.length === 1) return EXEMPT_TOP_FILES.includes(segs[0]) || EXEMPT_TOP_DIRS.includes(segs[0]);
-  return EXEMPT_TOP_DIRS.includes(segs[0]);
-}
-
-/** index.html 里对豁免路径的引用(静态扫描)。命中 = 被验证页面与交付页面可以不同。 */
-function exemptRefsInHtml(source) {
+/* r8 条目 A:页面可达输入**全部进快照**,所以这里不再有「豁免清单」需要维护。
+   仍需挡住的只有一类:引用了**快照里根本不存在**的顶层目录 —— 即 `node_modules/`(前置门已
+   无条件拒)与 `.git/`(不属交付产物)。除这两项之外,demo 树里的一切都在快照里,引用它们
+   不再构成「被验页面 ≠ 交付页面」。这份检查因此是从 SNAPSHOT_SKIP_TOP 推导出来的,不会漂移。 */
+function refsOutsideSnapshot(source) {
   const hits = new Set();
-  // 结构化:src= / href= / srcset 里的相对路径(给得出准确报文)
   for (const m of source.matchAll(/\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
     const raw = (m[1] ?? m[2] ?? m[3] ?? '').trim();
     if (!raw || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#|data:)/i.test(raw)) continue;
     const rel = raw.split(/[?#]/)[0].replace(/^\.?\//, '');
-    if (isExemptRel(rel)) hits.add(rel);
-  }
-  /* 兜住动态构造(`fetch('verify-artifacts/x.js')`、`@import`、CSS url())——属性扫描只看得见
-     声明式引用。这里对豁免路径名做整文本扫描,但**只认出现在路径起始位置**的那种:
-     前面紧跟 `/` 或单词字符时说明它是 `assets/verify-artifacts/...` 这类嵌套同名路径 ——
-     那种是进 snapshot、受 drift 管的,豁免不到它,不能误杀。 */
-  for (const name of [...EXEMPT_TOP_DIRS, ...EXEMPT_TOP_FILES]) {
-    if (name === '.git' || name === 'node_modules') continue;   // 前置门已无条件拒 / .git 名太易撞
-    const at = new RegExp(`(^|[^\\w./-])${name.replace(/[.]/g, '\\.')}(?=[/'"\\s)\\\\?#]|$)`, 'm');
-    // 已有结构化命中覆盖同一个名字时不重复列(报文更干净)
-    if (at.test(source) && ![...hits].some((h) => h === name || h.startsWith(`${name}/`))) hits.add(name);
+    if (isSkippedRel(rel)) hits.add(rel);
   }
   return [...hits];
 }
@@ -206,18 +187,16 @@ let gateAHardFail = false;
 if (!runGate('A')) gateA = skippedGate('真值一致');
 else {
   gateA = { name: '真值一致', pass: false, detail: '', provenance: 'required', extractorDrift: 'pending' };
-  /* r8 条目 A ②:页面不得引用**观察豁免路径**。这些路径不进 snapshot(或不受 drift 管),
-     引用它们 = 被验证的页面与最终交付的页面可以不同,而全链 hash 仍然自洽。 */
-  const exemptRefs = exemptRefsInHtml(html);
-  gateA.exemptPathRefs = exemptRefs.length ? exemptRefs : 'none';
-  if (exemptRefs.length) {
+  /* r8 条目 A:页面不得引用快照之外的路径(只剩 node_modules/ 与 .git/ 两类)。 */
+  const outsideRefs = refsOutsideSnapshot(html);
+  gateA.refsOutsideSnapshot = outsideRefs.length ? outsideRefs : 'none';
+  if (outsideRefs.length) {
     gateAHardFail = true;
     gateA.detail = [
       gateA.detail,
-      `index.html 引用了观察豁免路径(${exemptRefs.join('、')})——这些路径不进不可变 snapshot,`
-      + '浏览器验证时它们 404、最终交付的 demo 原地加载时却会生效:被验证的页面与交付的页面可以不同,'
-      + `而前后 inputHashes 与 snapshot 偏离比对都覆盖不到它们。\n豁免路径:${[...EXEMPT_TOP_DIRS, ...EXEMPT_TOP_FILES].join('、')}`
-      + '(工具自己的报告/取证产物)。修法:页面需要的资源一律放进 assets/ 等普通目录,不要借用这些名字。',
+      `index.html 引用了不可变快照之外的路径(${outsideRefs.join('、')})——快照跳过的顶层目录只有 `
+      + `${SNAPSHOT_SKIP_TOP.join(' / ')}(前置门已拒 / 不属交付产物)。引用它们意味着浏览器验证时取不到、`
+      + '交付原地却可能取到:被验证的页面与交付的页面不同。修法:页面需要的资源一律放进 assets/ 等普通目录。',
     ].filter(Boolean).join('\n');
   }
   const m = html.match(/<script[^>]*id=["']qa-truth["'][^>]*>([\s\S]*?)<\/script>/);
@@ -236,9 +215,19 @@ else {
       gateA.detail = `真值块解析失败:${err.message}`;
     }
   }
-  // 组件模式追加一段:component.inputs.json 必须等于 esbuild 现算的输入图(审核 #2c)。
-  // 清单是可手改的 JSON,不能自己当自己的真相源——「缩清单 → 只重跑 verify」必须在这里被抓住。
-  if (isComponentMode) {
+}
+
+/* ── 三项可信侧字节复算(组件模式)──
+   r8 条目 B/A:调用点在**快照建立之后**,并由紧邻的双向 manifest 检查点把它读到的磁盘字节与
+   快照字节绑在一起(见 bindObservationToDisk)。为什么复算仍然读磁盘而不是读快照:
+   `component-build-core --check-inputs` 必须以 **demoDir 为 cwd** 跑 esbuild(metafile 的 key
+   相对 cwd,换 cwd 会改整份清单的规范化结果),且产品组件源码是靠 demo 所在的 **git 仓根**解析的
+   —— 快照住在 tmpdir、不在产品仓内,拿快照当 cwd 会直接 repoRoot=UNRESOLVED 硬失败。
+   所以「复算与观察绑定同一份字节」这条不变式的落地方式是:复算读磁盘 ∧ 紧随其后的双向 manifest
+   当场证明 snapshot ≡ 磁盘。语义不丢(「磁盘产物 == canonical 现算」原样保留),只多一层锁。 */
+function runComponentRechecks() {
+  if (gateA.skipped || !isComponentMode) return;
+  {
     const recheck = recheckComponentInputs(demoDir);
     gateA.inputsRecheck = recheck.status;
     if (recheck.problems.length) {
@@ -274,61 +263,35 @@ else {
 }
 
 const needBrowser = runGate('B') || runGate('C') || runGate('D') || runGate('F');
+// 门 A 也要靠快照(复算与观察的绑定检查点在快照上做),所以只要跑门 A 就得建快照
+const needSnapshot = needBrowser || runGate('A');
 
-/* ── 不可变 snapshot(r7 条目 4,不变式 I-OBSERVE) ──
-   把 demo 的验证输入整树复制到 demo 之外的临时目录,浏览器一律从这里加载。
-   整树复制(而不是挑几个文件)是为了保住 index.html 里的相对路径依赖;排除的只有
-   「生成物 / 报告 / 取证目录」—— 它们不参与渲染,复制它们只会让快照变大并把
-   本轮自己写的截图也算进比对。node_modules 已在前置门无条件拒过,不可能存在。
+/* ── 不可变 snapshot(r7 条目 4 / r8 条目 A,不变式 I-OBSERVE) ──
+   实现在 lib/observe.mjs(与门 E 共用同一份):**整树**复制到 demo 之外的临时目录,浏览器一律
+   从这里加载。r7 的版本带一张排除表(整个 verify-artifacts/ / pixel-artifacts/ / 三个
+   report*.json),而没有任何东西禁止页面引用被排除的路径 —— 审核人 PoC:index.html 加
+   `<script src="pixel-artifacts/late.js">` 把门 D 绑定的 .box 从 16px 改成 99px,快照里该文件
+   404(门 D 量到 16px 绿)、交付原地却真加载(computed 99px),单向 drift 报 "none",全链放行。
+   r8 起:整树进快照(只跳 node_modules / .git —— 前置门已拒 / 不属交付产物),工具自己的运行期
+   输出改写到 demo 之外的 output root,盲区本身被消掉。
    失败即 fail-closed:拿不到不可变观察对象就不许继续(不静默退回原地加载)。 */
 let snapshotDir = null;
-function makeObservationSnapshot() {
-  const dir = mkdtempSync(join(tmpdir(), 'qa-hifi-snapshot-'));
-  cpSync(demoDir, dir, {
-    recursive: true,
-    dereference: true,
-    filter: (src) => {
-      if (resolve(src) === resolve(demoDir)) return true;
-      return !isExemptRel(resolve(src).slice(resolve(demoDir).length + 1));
-    },
-  });
-  return dir;
-}
-/** 目录整树的相对路径集合(文件,不含目录本身);豁免目录不进入遍历(省时,也不产生豁免项)。 */
-function listFilesRel(root) {
-  const out = [];
-  const walk = (rel) => {
-    for (const name of readdirSync(rel ? join(root, rel) : root)) {
-      const childRel = rel ? `${rel}/${name}` : name;
-      if (statSync(join(root, childRel)).isDirectory()) {
-        if (!isExemptRel(`${childRel}/x`)) walk(childRel);   // 豁免目录整棵跳过
-      } else out.push(childRel);
-    }
-  };
-  walk('');
-  return out;
-}
-/** 快照 ⟷ 磁盘的**双向**逐字节比对(分界线之后跑):不等 = 观察对象与交付对象已经不是一份。 */
-function snapshotDrift() {
-  const drift = [];
-  // ① snapshot → disk:删除 / 字节改写
-  for (const rel of listFilesRel(snapshotDir)) {
-    const dAbs = join(demoDir, rel);
-    if (!existsSync(dAbs)) { drift.push(`${rel}(验收期间被删除)`); continue; }
-    if (hashFile(join(snapshotDir, rel)) !== hashFile(dAbs)) drift.push(`${rel}(字节被改写)`);
-  }
-  // ② disk → snapshot:运行期新增的页面可达文件(旧版单向遍历完全看不见这一类)
-  for (const rel of listFilesRel(demoDir)) {
-    if (isExemptRel(rel)) continue;                       // 工具自己写的报告 / 取证目录
-    if (!existsSync(join(snapshotDir, rel))) drift.push(`${rel}(验收期间新增)`);
-  }
-  return drift;
+
+/* ── 工具运行期输出的独立根(r8 条目 A ②)──
+   失败截图与门 X/extractor 的可信脚本副本一律写在这里,不再写进 demo 树 —— 这样 demo 树里
+   就没有「本轮运行期新写入」的文件,双向 manifest 不需要任何按名豁免。 */
+const outputRoot = makeOutputRoot();
+const artifactDir = join(outputRoot, 'verify-artifacts');
+
+/** 双向 manifest 检查点:证明快照(观察对象)与磁盘(复算对象 / 交付对象)逐字节相同。 */
+function manifestCheckpoint(when) {
+  const diff = snapshotManifestDiff(snapshotDir, demoDir);
+  return { when, ...diff };
 }
 let safeServer;
 let browser;
 let page = null;
 let currentPageKey = null;
-const artifactDir = join(demoDir, 'verify-artifacts');
 let shotSeq = 0;
 /** 页面未捕获异常(r5 #1c 第二层);哨兵断言时非空即 fail-closed。 */
 const pageErrors = [];
@@ -352,7 +315,8 @@ async function pageFor(testCase = {}) {
   return page;
 }
 
-/** 失败现场截图(best-effort):落 verify-artifacts/,返回相对路径供 failure 条目引用。 */
+/** 失败现场截图(best-effort):落 **output root** 的 verify-artifacts/(r8 条目 A:不再写进 demo 树),
+    返回相对 output root 的路径;绝对根记在 report.artifactRoot 里供人查看。 */
 async function failShot(label) {
   if (!page) return null;
   try {
@@ -367,8 +331,30 @@ async function failShot(label) {
 
 try {
   let base = null;
+  /* ══════════ I-OBSERVE 的次序(r8 条目 A/B,勿调换)══════════
+     ① 建立**整树**不可变快照(所有核心观察的唯一来源,门 E 用同一份实现);
+     ② 三项可信侧字节复算(读磁盘,原因见 runComponentRechecks 的注释);
+     ③ **双向 manifest 检查点**:证明 ② 读到的磁盘字节 ≡ ① 的快照字节 —— 这就是「复算与
+        B/C/D/F/E 绑定同一份字节」的落地方式,也堵掉了「① 与 ② 之间同步的外部写入者」这个窗口;
+     ④ 浏览器门 B/C/D/F 全部从快照加载;⑤ 分界线之后才执行 demo 代码;⑥ 收口再做一次双向 manifest。 */
+  if (needSnapshot) {
+    snapshotDir = makeObservationSnapshot(demoDir);
+  }
+  runComponentRechecks();                       // ② 读磁盘;字节由 ③ 当场绑到快照上
+  if (needSnapshot && !gateA.skipped) {         // ③ 检查点:snapshot ≡ 磁盘
+    const bind = manifestCheckpoint('post-recheck');
+    gateA.observeBinding = bind.all.length ? bind.all.slice(0, 10) : 'bound';
+    if (bind.all.length) {
+      gateAHardFail = true;
+      gateA.detail = [
+        gateA.detail,
+        `快照与磁盘在「建立快照 → 三项复算」这段窗口内就已不一致(${bind.all.length} 项):`
+        + `${bind.all.slice(0, 5).join('、')}\n有并发写入者在动 demo —— 复算读到的字节与浏览器将要观察的`
+        + '字节不是同一份,本次结论不可信。',
+      ].filter(Boolean).join('\n');
+    }
+  }
   if (needBrowser) {
-    snapshotDir = makeObservationSnapshot();
     // I-OBSERVE:服务的是快照,不是 demo 原地
     safeServer = createSafeStaticServer(snapshotDir);
     base = await safeServer.listen();
@@ -825,8 +811,18 @@ try {
      ⑤ 字节绑定:执行前就地算一次脚本 sha256 并记进 report,与观察前 inputHashes 里那份
         比对 —— 「注册的是 A 脚本、跑的是 B 脚本」在这里落地。 */
   function runDemoScript(scriptAbs, extraArgs = [], { timeout } = {}) {
-    const sha = existsSync(scriptAbs) ? hashFile(scriptAbs) : null;
-    const res = spawnSync(process.execPath, [scriptAbs, ...extraArgs], {
+    /* r8 条目 C:执行**已 hash 的那份字节的副本**,不是 hash 完再按同一路径 spawn。
+       后者中间有窄 check/use 竞态:hash 与 spawn 之间的写入者可以换掉文件,于是
+       「精确 hash 的脚本字节被执行」这句话不成立。副本落在 demo 之外的 output root,
+       被审方的后置脚本改不到它。copy 后再算一次副本 hash,不等即 fail-closed。
+       注意(接口约定):被执行的是副本,所以脚本必须用 `--demo` argv 或 cwd(仍是 demoDir)
+       定位 demo,**不能**靠 `import.meta.url` 推断自己在 demo 里 —— 已写进 SKILL.md。 */
+    const copy = trustedScriptCopy(scriptAbs, outputRoot);
+    const sha = copy.sha256;
+    if (copy.mismatch) {
+      return { status: 1, stdout: '', stderr: `脚本字节在 hash 与复制之间被换过(${sha} → ${copy.copySha256})——拒绝执行`, scriptSha256: sha, trustedCopyMismatch: true };
+    }
+    const res = spawnSync(process.execPath, [copy.exec, ...extraArgs], {
       cwd: demoDir,
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
@@ -848,7 +844,7 @@ try {
       gateA.extractorDrift = 'no-extractor';
       gateA.detail = [gateA.detail, '缺 extract.mjs——无法证明 truth 由源码提取(只有 provenance hash 声明,不构成机械证明);请补 extractor'].filter(Boolean).join('\n');
     } else {
-      const run = runDemoScript(extractor);
+      const run = runDemoScript(extractor, ['--demo', demoDir]);
       gateA.extractorSha256 = run.scriptSha256;
       try {
         if (run.status !== 0) throw new Error(String(run.stderr || run.stdout || `exit ${run.status}`));
@@ -914,32 +910,35 @@ try {
     /* I-OBSERVE 的收口比对:快照(观察对象)与磁盘逐字节比对。比单纯的 hash-vs-hash 更强 ——
        快照住在 demo 之外,demo 侧代码碰不到它,所以「改了又恢复」在这里同样无处可藏的前提是
        改动发生在快照建立之后且未复原;真正的保证仍来自「观察对象一开始就固定了」。 */
-    /* r8 条目 A ②(运行期兜底):页面在观察期间实际请求过豁免路径 = 它依赖 snapshot 里没有的
-       字节。静态扫描看不见动态构造的 URL,这里看得见 —— 请求打到服务的是 snapshot,
-       所以命中的往往是一次 404,而交付原地却能取到真文件。 */
-    const exemptHits = [...new Set((safeServer?.requestedPaths() ?? [])
-      .filter((r) => isExemptRel(r.path))
+    /* 运行期兜底:页面在观察期间请求过**快照之外**的路径(只剩 node_modules/ 与 .git/)。
+       静态扫描看不见动态构造的 URL,而服务的是快照,所以这类请求在服务端留下的是一次 404 记录。 */
+    const outsideHits = [...new Set((safeServer?.requestedPaths() ?? [])
+      .filter((r) => isSkippedRel(r.path))
       .map((r) => `${r.path}(HTTP ${r.status})`))];
-    gateA.exemptPathRequests = exemptHits.length ? exemptHits.slice(0, 10) : 'none';
-    if (exemptHits.length) {
+    gateA.requestsOutsideSnapshot = outsideHits.length ? outsideHits.slice(0, 10) : 'none';
+    if (outsideHits.length) {
       gateA.pass = false;
       gateA.detail = [
         gateA.detail,
-        `页面在观察期间请求了观察豁免路径(${exemptHits.slice(0, 5).join('、')})——`
-        + '这些路径不在不可变 snapshot 里,验证时取不到、交付原地却能取到:被验证的页面与交付的页面不同。'
-        + '\n修法:页面需要的资源一律放进 assets/ 等普通目录。',
+        `页面在观察期间请求了快照之外的路径(${outsideHits.slice(0, 5).join('、')})——`
+        + '验证时取不到、交付原地却可能取到:被验证的页面与交付的页面不同。',
       ].filter(Boolean).join('\n');
     }
-    const drift = snapshotDrift();
-    gateA.snapshotDrift = drift.length ? drift.slice(0, 10) : 'none';
-    if (drift.length) {
+    /* ⑥ 收口:双向 manifest(r8 条目 A)。disk→snapshot 与 snapshot→disk 都遍历 ——
+       单向 walk 看不见「验收期间新增页面可达文件」这一整类,而 PoC 用的就是「加一个 late.js」。
+       工具自己的运行期输出已经全部写在 demo 之外的 output root,所以这里不需要任何按名豁免。 */
+    const diff = manifestCheckpoint('post-run');
+    gateA.snapshotDrift = diff.all.length ? diff.all.slice(0, 10) : 'none';
+    gateA.snapshotManifest = { added: diff.added.length, removed: diff.removed.length, changed: diff.changed.length };
+    if (diff.all.length) {
       gateA.pass = false;
       gateA.detail = [
         gateA.detail,
-        `验收期间 demo 侧文件与观察快照发生偏离(${drift.length} 项):${drift.slice(0, 5).join('、')}`
+        `验收期间 demo 侧文件与观察快照发生偏离(新增 ${diff.added.length} / 删除 ${diff.removed.length} / 改写 ${diff.changed.length}):`
+        + `${diff.all.slice(0, 5).join('、')}`
         + '\n浏览器观察用的是验证开始时的不可变快照,所以本次测量结果本身仍然可信;'
         + '但磁盘上的 demo 已不是被观察的那一份,PR 带走的会是另一个版本。'
-        + '\n修法:extract.mjs 与自定义门必须只读,不得改写 demo 输入。',
+        + '\n修法:extract.mjs 与自定义门必须只读,不得改写或新增 demo 文件。',
       ].filter(Boolean).join('\n');
     }
   }
@@ -976,6 +975,9 @@ try {
        pr-block 原先在流程末尾重读 demo 的 truth.json —— 那是 TOCTOU 变体(demo 代码可能
        已在中途改过它),现在末尾不再重读任何可变文件。 */
     truthStats: { fixtureLeaves: countFixtureLeaves(truthObj) },
+    /* r8 条目 A:工具运行期输出(失败截图、门 X/extractor 的可信脚本副本)不再写进 demo 树,
+       改落这个 demo 之外的 output root。failure 条目里的 screenshot 是相对本根的路径。 */
+    artifactRoot: outputRoot,
     coverage: { cases: cases.map((c) => ({ id: c.id, prefs: c.prefs, source: c.source, ...(c.viewport ? { viewport: c.viewport } : {}) })) },
     gateA,
     gateB,

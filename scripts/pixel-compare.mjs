@@ -7,13 +7,13 @@
 // 算术自洽校验(diffRatio===bad/total、threshold===spec…),从不重新对真实图片跑
 // odiff/pixelmatch —— 手写一份满足全部自洽约束的 JSON 就能把视觉回归伪造成 PASS。
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
-  hashFile,
   failJson,
   failProblems,
+  sha256Buffer,
   TOOL_VERSION,
 } from './lib/fs-utils.mjs';
 import { validateSpec } from './lib/schema.mjs';
@@ -21,6 +21,10 @@ import { createSafeStaticServer } from './lib/safe-server.mjs';
 import { launchChromium } from './lib/resolve-playwright.mjs';
 import { freshLoad, replay } from './lib/replay.mjs';
 import { compareImages, loadPngApi, readPng, writePng } from './lib/png-compare.mjs';
+/* r8 条目 A:门 E 此前**完全不走快照** —— 直接 serve/read demoDir 与 baseline PNG,于是
+   「所有核心浏览器观察共用同一不可变快照」这句话对门 E 不成立(审核人指出的组成性不一致)。
+   现在与 verify 共用同一份实现:整树快照(含 baseline PNG)+ 双向 manifest。 */
+import { makeObservationSnapshot, snapshotManifestDiff } from './lib/observe.mjs';
 
 const args = process.argv.slice(2);
 const demoIdx = args.indexOf('--demo');
@@ -63,13 +67,20 @@ if (declared.length === 0) {
 }
 
 const { PNG, pixelmatch, odiff } = await loadPngApi(demoDir);
+/* I-OBSERVE(r8 条目 A):门 E 的观察对象也是**整树不可变快照** —— 页面从快照加载,
+   baseline PNG 也从快照读。artifact 三图仍写回 demo 的 pixel-artifacts/(WARN 人工裁决要按
+   demo 相对路径看图,r7/r8 的裁决绑定就建立在这份路径上),但**写入排在双向 manifest 检查之后**:
+   比对期间 demo 树零写入,manifest 因此不需要任何按名豁免。 */
+const snapshotDir = makeObservationSnapshot(demoDir, { prefix: 'qa-hifi-pixel-snap-' });
 const artifactDir = join(demoDir, 'pixel-artifacts');
+/** 比对期间先把三图字节留在内存,manifest 检查通过后再落盘(见上)。 */
+const pendingArtifacts = [];
 let safeServer;
 let browser;
 let page;
 const results = [];
 try {
-  safeServer = createSafeStaticServer(demoDir);
+  safeServer = createSafeStaticServer(snapshotDir);   // 服务快照,不是 demo 原地
   const base = await safeServer.listen();
   ({ browser } = await launchChromium(demoDir, { headless: true }));
   page = await browser.newPage({ viewport: { width: 1440, height: 960 }, deviceScaleFactor: spec.baselineDpr ?? 2 });
@@ -81,7 +92,7 @@ try {
     if (entry.platform) item.platform = entry.platform;
     const artKey = entry.platform ? `${entry.platform}.${entry.key}` : entry.key;
     const baselineRel = entry.platform ? `baselines/${entry.platform}/${entry.key}.png` : `baselines/${entry.key}.png`;
-    const baselinePath = join(demoDir, baselineRel);
+    const baselinePath = join(snapshotDir, baselineRel);   // 基准图同样取自快照
     try {
       if (!existsSync(baselinePath)) {
         item.status = 'MISSING';
@@ -137,28 +148,29 @@ try {
         item.detail = item.status === 'PASS'
           ? ''
           : `diff ${(item.diffRatio * 100).toFixed(2)}% 超阈值 ${(threshold * 100).toFixed(2)}%`;
-        const baseOut = join(artifactDir, `${artKey}.baseline.png`);
-        const demoOut = join(artifactDir, `${artKey}.demo.png`);
-        const diffOut = join(artifactDir, `${artKey}.diff.png`);
-        mkdirSync(artifactDir, { recursive: true });
-        copyFileSync(baselinePath, baseOut);
-        writeFileSync(demoOut, shot);
-        writePng(PNG, diffOut, compared.diff);
+        const bytes = {
+          baseline: readFileSync(baselinePath),
+          demo: shot,
+          diff: PNG.sync.write(compared.diff),
+        };
         item.artifacts = {
           baseline: `pixel-artifacts/${artKey}.baseline.png`,
           demo: `pixel-artifacts/${artKey}.demo.png`,
           diff: `pixel-artifacts/${artKey}.diff.png`,
         };
+        // 落盘推迟到双向 manifest 之后(比对期间 demo 树必须零写入)
+        for (const kind of ['baseline', 'demo', 'diff'])
+          pendingArtifacts.push({ file: join(artifactDir, `${artKey}.${kind}.png`), data: bytes[kind] });
         /* r7 条目 8:artifact 三图的 **sha256** 一并记进 report。
            它是「人工裁决判的是哪三张图」的唯一凭据 —— 只校验路径存在是不够的:
            路径可以指向后来被换掉的图,裁决就绑不住任何具体字节。可信侧重跑会覆盖这三张图,
            于是 report 里的 hash 就是**可信侧生成字节**的 hash。 */
         item.artifactHashes = {
-          baseline: hashFile(baseOut),
-          demo: hashFile(demoOut),
-          diff: hashFile(diffOut),
+          baseline: sha256Buffer(bytes.baseline),
+          demo: sha256Buffer(bytes.demo),
+          diff: sha256Buffer(bytes.diff),
         };
-        const adj = readAdjudication(demoDir, artKey);
+        const adj = readAdjudication(snapshotDir, artKey);   // 裁决文件是输入,同样取自快照
         if (item.status === 'WARN') {
           /* 裁决要能影响放行,前提是它**同时绑定这次比对的四项**(r8):
                key(含 platform 的复合 key) / diffRatio / threshold / 三图 sha256。
@@ -235,7 +247,20 @@ function readAdjudication(root, key) {
 }
 
 if (process.exitCode === 2) process.exit();
-const ok = results.every((r) => r.status === 'PASS' || (r.status === 'WARN' && r.adjudication?.ok === true));
+
+/* ── 双向 manifest 检查点 + artifact 落盘(r8 条目 A)──
+   比对全程 demo 树零写入,所以这里可以对**整树**做双向比对而不需要任何按名豁免:
+   disk→snapshot(新增)与 snapshot→disk(删除/改写)都遍历。通过之后才把三图写进 demo 的
+   pixel-artifacts/ —— WARN 人工裁决按 demo 相对路径看图,这条路径契约保持不变。 */
+const manifest = snapshotManifestDiff(snapshotDir, demoDir);
+if (manifest.all.length === 0) {
+  mkdirSync(artifactDir, { recursive: true });
+  for (const a of pendingArtifacts) writeFileSync(a.file, a.data);
+}
+try { rmSync(snapshotDir, { recursive: true, force: true }); } catch {}
+
+const ok = manifest.all.length === 0
+  && results.every((r) => r.status === 'PASS' || (r.status === 'WARN' && r.adjudication?.ok === true));
 const out = {
   ok,
   skipped: false,
@@ -244,6 +269,9 @@ const out = {
   compared: results.filter((r) => r.status !== 'MISSING').length,
   declared: declared.length,
   inputHashes: buildInputHashes(demoDir, spec),
+  // 门 E 的观察快照与磁盘的双向 manifest 结论(r8 条目 A);非 none 时 ok 强制 false
+  snapshotDrift: manifest.all.length ? manifest.all.slice(0, 10) : 'none',
+  snapshotManifest: { added: manifest.added.length, removed: manifest.removed.length, changed: manifest.changed.length },
   results,
   generatedAt: new Date().toISOString(),
 };
