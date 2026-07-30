@@ -143,3 +143,49 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
 
 - 移动端 case 必须声明移动端视口,verify 为该 case 换用对应尺寸/DPR 的页面;
 - 不声明 = 1440×960 桌面视口(mobile 的截断/溢出/适配结论在桌面视口下不成立)。
+
+## truth.themeVars(组件模式主题桥,2026-07-30 起)
+
+组件模式(demo 直接渲染产品组件,而不是手写复刻)需要一份 CSS 自定义属性表把产品主题
+搬进 demo。这份色表必须走 truth——写死在 build 脚本里的色值不在 provenance 链上,
+产品改了色表没人报警(门 A 的 extractor-drift 只核 truth.json)。
+
+extract.mjs 侧一行拿到:
+
+```js
+import { extractThemeVars, findRepoRoot } from './extract-helpers.mjs';
+
+const repo = findRepoRoot();
+truth.themeVars = extractThemeVars(
+  `${repo}/apps/desktop/src/renderer/themes/colors.ts`,
+  { prefix: 'login-' },   // ? 只要某前缀的 token,缺省全量
+);
+```
+
+truth 结构(每个模式各一个标准叶子,直接过 `validateTruth`):
+
+```jsonc
+"themeVars": {
+  "surface": {
+    "light": { "value": "#f8f8f6", "provenance": { "source": "...colors.ts", "locator": "...defaults.light", "hash": "...", "locatorPattern": "..." } },
+    "dark":  { "value": "#1f1f1e", "provenance": { /* 同上,锚指向 defaults.dark */ } }
+  },
+  "radius": {
+    "light": { "value": "0.5rem", "provenance": { /* 带锚 */ } },
+    // dark 在源码里是 null → 按 theme-service.resolveThemeValue 回退 light;
+    // 源码里没有对应字面量,故该叶子**不带** locatorPattern(给锚只会写错位置)
+    "dark":  { "value": "0.5rem", "provenance": { "locator": "...dark 为 null/未写,回退 light" } }
+  }
+}
+```
+
+约定与边界:
+
+- 值语义与 `themes/theme-service.ts` 的 `resolveThemeValue` 对齐:`dark` 为 `null`/未写 → 回退 `light`;
+- CSS 变量名 = `--<token>`(即 truth 里的 key 加 `--` 前缀),由 adapter/runtime 侧按模式序列化成
+  `:root{--a:v;--b:v}` 注入 demo,**不在 extract 侧拼字符串**(拼出来的整串没法逐 token 核对);
+- 静态取不到真值的 token(`light`/`dark` 是函数调用、变量、带插值的模板字面量)整条跳过,
+  不猜值、不拿 light 顶替 dark;跳过清单经 `onSkip` 回调交出,不传回调则打 stderr 汇总;
+- token 顺序 = 源码注册顺序(可复现,门 A 重跑 extract 不漂移);
+- `bindings.truth` 引用写 `themeVars.<token>.light` / `themeVars.<token>.dark`(token 名含连字符不含点,
+  与点分路径不冲突)。
