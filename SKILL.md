@@ -61,7 +61,7 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
-| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` glob 命中的每个文件** / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓 |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` glob 命中的每个文件** / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓。该声明由两道机制共同兜住（r4）：复算子进程解析构建期依赖时**候选目录只有 `QA_HIFI_MODULE_ROOT` 与 repoRoot**（绝不含 cwd/demo 目录——否则 `<demo>/node_modules/esbuild` 的顶层代码会在 import 时执行）；且 demo 目录及任意子目录**只要存在 `node_modules` 就 fail-closed**「demo 目录不应自带 node_modules，检测到依赖目录，拒绝——demo 自身不装依赖」（demo 侧依赖既不入哈希链、也不在构建期文件对照表里，是绕过具名 hash 的侧路）|
 
 **「真组件直渲」不靠声明，靠运行期哨兵 —— 而且只认你声明的那个导出。**
 只证明 `entry` 在 `metafile` 输入里是不够的：`import '<entry>'` 这种副作用导入同样让它进图、
