@@ -45,6 +45,9 @@ function baseHtml(truth) {
     #frame{width:16px;height:16px;background:#f00}
   </style></head><body>
   <script id="qa-truth" type="application/json">${safeJsonForScript(truth)}</script>
+  <!-- 组件 bundle 必须真被页面加载:运行期哨兵(__QA_ENTRY_RENDERED__)只在 bundle 执行时才存在,
+       页面不加载 bundle 就谈不上「真组件直渲」——门 B 会当场判否。 -->
+  <script src="assets/component.bundle.js"></script>
   <button data-qa-pref="plat:desk">desk</button><button data-qa-pref="region:cn">cn</button>
   <button data-qa-pref="os:ios">ios</button><button data-qa-pref="mode:light">light</button><button data-qa-pref="lang:zh-CN">zh</button>
   <button id="noop">noop</button><div class="box">x</div><div id="tick">0</div><input id="code">
@@ -170,7 +173,7 @@ test('pr-block: 改未声明但真被 bundle 读到的源文件 → 旧 report �
   const ok = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(ok.status, 0, `未篡改时应放行:${ok.stdout}${ok.stderr}`);
   // 附贴块的 N 来自 manifest 真实输入(3 个),不是自报的 1 个
-  assert.match(ok.stdout, /真组件直渲（3 个源文件 hash 入链）/);
+  assert.match(ok.stdout, /真组件直渲（3 个源文件 hash 入链，运行期哨兵实测入口组件被渲染）/);
   writeFileSync(join(repo, 'src/components/Helper.ts'), "import { DEEP } from './Deep';\nexport const helper = () => `tampered-${DEEP}`;\n");
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 2, `改未声明的真实输入居然放行:${pr.stdout}${pr.stderr}`);

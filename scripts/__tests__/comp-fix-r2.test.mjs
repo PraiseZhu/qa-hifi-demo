@@ -1,0 +1,210 @@
+// comp-fix-r2.test.mjs — 二修(终审 #1c / #2c / #5c)的对抗回归。
+//
+//   #1c entry side-effect import 绕过:`import '<entry>'` 让 entry 进图、hash 入链,
+//       界面却是 bootstrap 手搓的。build.mjs 给 entry 导出套运行期探针,verify 在门 B
+//       挂载后断言「入口组件真被调用过」;探针套不上的形态由 pr-block 诚实降级。
+//   #2c manifest 先缩后重跑 verify:component.inputs.json 是可手改 JSON,不能自己当
+//       真相源。`node build.mjs --check-inputs` 用 esbuild 现算一遍,verify/pr-block 全等比对;
+//       build.mjs 自身 / tailwind config / 读过的 package.json 进 manifest.buildInputs 并入链。
+//   #5c 手写 ok:true 资产报告绕闸:pr-block 不再信 report 自报的体积与阀值,自己重算。
+//
+// 本文件不依赖产品仓的业务代码:自造 mini「产品仓」(含 .git + 真组件源码)+ demo,
+// build 用真 esbuild(从 QA_HIFI_MODULE_ROOT / 本 skill 仓解析)。
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildInputHashes, hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
+import { validateReportIntegrity } from '../lib/report.mjs';
+
+const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+const VERIFY = join(ROOT, 'scripts/verify.mjs');
+const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
+const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
+const BUILD_TEMPLATE = join(ROOT, 'templates/component-build.mjs');
+const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+const URL_ARG = ['--url', 'https://demo.workers.xd.team'];
+
+function run(script, args, opts = {}) {
+  return spawnSync(process.execPath, [script, ...args], {
+    cwd: opts.cwd ?? ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, ...(opts.env ?? {}) },
+    timeout: opts.timeout ?? 150000,
+  });
+}
+const env = () => (MODULE_ROOT ? { QA_HIFI_MODULE_ROOT: MODULE_ROOT } : {});
+const buildDemo = (dir, extra = []) => run(join(dir, 'build.mjs'), extra, { cwd: dir, env: env() });
+const verifyDemo = (dir) => run(VERIFY, ['--demo', dir], { env: env() });
+const prBlock = (dir, extra = []) => run(PR_BLOCK, ['--demo', dir, ...URL_ARG, ...extra], { env: env() });
+const readJson = (f) => JSON.parse(readFileSync(f, 'utf8'));
+const manifestOf = (dir) => readJson(join(dir, 'component.inputs.json'));
+const readSpec = (dir) => readJson(join(dir, 'spec.json'));
+function assetsGate(dir, extra = []) {
+  const r = run(ASSETS_MANIFEST, ['--demo', dir, ...extra], { env: env() });
+  return r;
+}
+
+/** demo 壳:真加载组件 bundle(哨兵只在 bundle 执行时才存在)。 */
+function baseHtml(truth) {
+  return `<!doctype html><html><head><style>
+    .box{width:16px;color:#ff0000;white-space:nowrap}
+    #frame{width:16px;height:16px;background:#f00}
+  </style></head><body>
+  <script id="qa-truth" type="application/json">${safeJsonForScript(truth)}</script>
+  <script src="assets/component.bundle.js"></script>
+  <button data-qa-pref="plat:desk">desk</button><button data-qa-pref="region:cn">cn</button>
+  <button data-qa-pref="os:ios">ios</button><button data-qa-pref="mode:light">light</button><button data-qa-pref="lang:zh-CN">zh</button>
+  <button id="noop">noop</button><div class="box">x</div><div id="tick">0</div><input id="code">
+  <div id="frame" class="frame"></div>
+  <script>
+  const S={step:'id',prefs:{plat:'desk',region:'cn',os:'ios',mode:'light',lang:'zh-CN'},tick:0};
+  window.__qa={
+    current:()=>S.step,
+    goto:(id)=>{ if(id!=='id') throw new Error('unknown'); S.step=id; },
+    prefs:()=>({...S.prefs}),
+    scale:()=>1,
+    resize:(w,h)=>{ document.querySelector('#frame').style.width=w+'px'; document.querySelector('#frame').style.height=h+'px'; },
+    metrics:()=>{ const r=document.querySelector('#frame').getBoundingClientRect(); return {frame:{w:r.width,h:r.height},probes:{}}; }
+  };
+  </script></body></html>`;
+}
+
+/** entry 的几种形态:决定运行期探针能不能套上。 */
+const ENTRY_SRC = {
+  // 常规函数组件(带传递依赖):探针可套
+  fn: "import { helper } from './Helper';\nexport function Claimed(){ return `CLAIMED-${helper()}`; }\nexport default Claimed;\n",
+  // 导出全是常量/纯数据:探针套不上 → 不许判造假,改由 pr-block 降级
+  data: "import { helper } from './Helper';\nexport const CLAIMED = { label: 'x', dep: helper };\n",
+  // 只有类型导出:编译后无任何运行时内容 → 可被整体 tree-shake
+  typeOnly: 'export type Claimed = string;\n',
+};
+/** bootstrap 的几种形态:决定 entry 是「真被渲染」还是只被副作用导入。 */
+const BOOT_SRC = {
+  render: "import { Claimed } from '../../src/components/Claimed';\nglobalThis.__demo = Claimed();\n",
+  sideEffect: "import '../../src/components/Claimed';\nglobalThis.__demo = 'fake-hand-written-ui';\n",
+  dataUse: "import { CLAIMED } from '../../src/components/Claimed';\nglobalThis.__demo = CLAIMED.label;\n",
+  bareImport: "import '../../src/components/Claimed';\nglobalThis.__demo = 1;\n",
+};
+
+function makeFixture({ name, entry = 'fn', boot = 'render', extraAssetBytes = 0 } = {}) {
+  const repo = mkdtempSync(join(tmpdir(), `qa-r2-${name}-`));
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  mkdirSync(join(repo, 'src/components'), { recursive: true });
+  writeFileSync(join(repo, 'src/components/Helper.ts'), 'export const helper = () => "helper-v1";\n');
+  writeFileSync(join(repo, 'src/components/Claimed.ts'), ENTRY_SRC[entry]);
+  writeFileSync(join(repo, 'tailwind.config.js'), 'module.exports = { theme: { colors: { brand: "#ff0000" } } };\n');
+
+  const dir = join(repo, 'qa-demo');
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  mkdirSync(join(dir, 'assets'), { recursive: true });
+  copyFileSync(BUILD_TEMPLATE, join(dir, 'build.mjs'));
+  copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
+  writeFileSync(join(dir, 'src/bootstrap.ts'), BOOT_SRC[boot]);
+  if (extraAssetBytes > 0) writeFileSync(join(dir, 'assets/hero.bin'), Buffer.alloc(extraAssetBytes, 7));
+
+  const source = join(dir, 'source.txt');
+  writeFileSync(source, 'source-v1');
+  const leaf = (value, locator) => ({ value, provenance: { source: 'source.txt', locator, hash: hashFile(source) } });
+  const truth = { geometry: { width: leaf(16, 'width constant') }, colors: { text: leaf('#ff0000', 'text color') } };
+  const spec = {
+    meta: { name, summary: { what: 'what', how: 'how', accept: 'accept' } },
+    matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
+    states: [{ id: 'id', via: [{ expect: 'id' }] }],
+    verify: { cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }], noClip: ['.box'] },
+    bindings: [],
+    component: {
+      mode: 'component',
+      entry: 'src/components/Claimed.ts',
+      sources: [],
+      bundle: 'assets/component.bundle.js',
+      bootstrap: 'src/bootstrap.ts',
+      assetsDir: 'assets',
+    },
+  };
+  writeFileSync(join(dir, 'truth.json'), stableJson(truth));
+  writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
+  writeFileSync(join(dir, 'index.html'), baseHtml(truth));
+  writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
+  return { repo, dir };
+}
+
+/** build → verify → 资产闸门,全绿返回;任一步失败当场断言。 */
+function greenDemo(dir) {
+  assert.equal(buildDemo(dir).status, 0, 'build 应成功');
+  const v = verifyDemo(dir);
+  assert.equal(v.status, 0, `verify 应先绿:${v.stdout}${v.stderr}`);
+  assert.equal(assetsGate(dir).status, 0, '资产闸门应通过');
+  return v;
+}
+
+// ==================== #1c 运行期哨兵 ====================
+
+test('#1c 复现样本: bootstrap 只做 side-effect import → 门 B 首项 fail 并点名', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置(需要宿主 esbuild)');
+  const { dir } = makeFixture({ name: 'side-effect', boot: 'sideEffect' });
+  // 审核实证:build 照旧 exit 0(entry 确实在 bundle 里),声明层抓不到
+  assert.equal(buildDemo(dir).status, 0, 'side-effect import 下 build 仍应成功(这正是原漏洞)');
+  assert.equal(manifestOf(dir).entrySentinel, 'active', '常规函数组件导出必须能挂上哨兵');
+  const v = verifyDemo(dir);
+  assert.notEqual(v.status, 0, 'side-effect import 居然通过了 verify');
+  const report = readJson(join(dir, 'report.json'));
+  assert.equal(report.gateB.pass, false);
+  assert.equal(report.gateB.entryRenderProof, 'unavailable');
+  assert.equal(report.gateB.failures.length, 1, '哨兵只报一次(门 B 首项),不要 N 条重复失败');
+  assert.match(report.gateB.failures[0].error, /entry 已打包但从未被渲染/);
+  assert.match(report.gateB.failures[0].error, /side-effect import/);
+  // 手搓的 UI 字节确实在 bundle 里、真组件也在——两者共存正是这条漏洞的形状
+  const bundle = readFileSync(join(dir, 'assets/component.bundle.js'), 'utf8');
+  assert.ok(bundle.includes('fake-hand-written-ui') && bundle.includes('CLAIMED'));
+});
+
+test('#1c 阳性对照: bootstrap 真调用入口组件 → 哨兵置位、门 B 绿、附贴块声明直渲', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'render-ok' });
+  const v = greenDemo(dir);
+  assert.equal(readJson(join(dir, 'report.json')).gateB.entryRenderProof, 'proved');
+  assert.match(v.stdout, /"ok": true/);
+  const pr = prBlock(dir);
+  assert.equal(pr.status, 0, `阳性对照被误伤:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /真组件直渲/);
+  assert.match(pr.stdout, /运行期哨兵实测入口组件被渲染/);
+});
+
+test('#1c 探针套不上的形态(导出全是纯数据)→ 不误判造假,附贴块降级为需人工审查', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'unwrappable', entry: 'data', boot: 'dataUse' });
+  assert.equal(buildDemo(dir).status, 0);
+  const v = verifyDemo(dir);
+  assert.equal(v.status, 0, `纯数据导出不该被判造假:${v.stdout}${v.stderr}`);
+  assert.equal(readJson(join(dir, 'report.json')).gateB.entryRenderProof, 'unavailable');
+  assert.equal(assetsGate(dir).status, 0);
+  const pr = prBlock(dir);
+  assert.equal(pr.status, 0, `降级不等于阻断:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /产品模块已打包/);
+  assert.match(pr.stdout, /需人工审查/);
+  assert.ok(!pr.stdout.includes('真组件直渲'), '哨兵没证明就不许宣称真组件直渲');
+});
+
+test('#1c tree-shake 样本: entry 只有类型导出、整段没进产物 → build exit 2', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'treeshake', entry: 'typeOnly', boot: 'bareImport' });
+  const r = buildDemo(dir);
+  assert.equal(r.status, 2, `被整体摇掉的 entry 居然构建成功:${r.stdout}${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /被整体 tree-shake/);
+  assert.match(r.stdout + r.stderr, /字节数是 0/);
+});
+
+test('#1c 手改 bundle 抹掉哨兵 → 门 B 报「bundle 不是当前 build.mjs 产出的」', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'strip-sentinel' });
+  assert.equal(buildDemo(dir).status, 0);
+  writeFileSync(join(dir, 'assets/component.bundle.js'), 'globalThis.__demo = "hand-written";\n');
+  const v = verifyDemo(dir);
+  assert.notEqual(v.status, 0, '抹掉哨兵的 bundle 居然过了');
+  assert.match(readJson(join(dir, 'report.json')).gateB.failures[0].error, /运行期哨兵未在页面里出现/);
+});

@@ -17,6 +17,7 @@ import {
   buildInputHashes,
   failJson,
   failProblems,
+  readComponentInputsManifest,
   sha256Buffer,
   stableJson,
   TOOL_VERSION,
@@ -70,6 +71,7 @@ const schemaProblems = [
 ];
 if (schemaProblems.length) failProblems(schemaProblems);
 
+const isComponentMode = spec.component?.mode === 'component';
 const inputHashes = buildInputHashes(demoDir, spec);
 const allCases = buildVerifyCases(spec);
 const cases = caseFilter ? allCases.filter((c) => caseFilter.includes(c.id)) : allCases;
@@ -177,6 +179,34 @@ try {
   if (!runGate('B')) gateB = skippedGate('状态覆盖');
   else {
     gateB = makeGate('状态覆盖', cases.length * statesRun.length);
+    // 组件模式运行期哨兵(审核 #1c):entry 的导出被 build.mjs 套过调用探针,
+    // 真被渲染(React 调函数组件 / new 类组件 / memo·forwardRef 的 render)才会置位。
+    // `import '<entry>'` 这种副作用导入让 entry 进图、hash 入链,但一次也不会调用它——
+    // 界面全是 bootstrap 手搓的。这里在挂载完成后、第一个状态断言前查一次。
+    // 只有哨兵真挂上(manifest.entrySentinel === 'active')才断言;entry 导出全是常量/
+    // 纯数据时探针套不上,不误判为造假,由 pr-block 把结论诚实降级为「需人工审查」。
+    const sentinelExpected = isComponentMode && readComponentInputsManifest(demoDir)?.entrySentinel === 'active';
+    let sentinelChecked = false;
+    // 'proved' = 哨兵实测入口组件被调用;'unavailable' = 探针套不上(需人工审查);
+    // 'n/a' = 非组件模式。pr-block 据此决定附贴块写「真组件直渲」还是降级文案。
+    let entryRenderProof = isComponentMode ? 'unavailable' : 'n/a';
+    const assertSentinel = async (p) => {
+      if (!sentinelExpected || sentinelChecked) return;
+      sentinelChecked = true;
+      const st = await p.evaluate(() => ({
+        rendered: globalThis.__QA_ENTRY_RENDERED__ === true,
+        shape: globalThis.__QA_ENTRY_SHAPE__ ?? null,
+      }));
+      if (st.rendered) { entryRenderProof = 'proved'; return; }
+      if (!st.shape?.sentinel)
+        throw new Error('运行期哨兵未在页面里出现——assets/component.bundle.js 不是当前 build.mjs 产出的(手改过 bundle?),重跑 node build.mjs');
+      if (!(st.shape.wrappable > 0)) return; // 探针一个都套不上:不断言,由 pr-block 降级
+      throw new Error(
+        'entry 已打包但从未被渲染——bootstrap 是不是只做了 side-effect import?'
+        + `(哨兵:探针 ${st.shape.wrappable}/${st.shape.total} 个导出已就位,渲染期一次调用都没发生)`
+        + '\n修法:让 bootstrap 真的 import 并渲染该入口组件;若 entry 只是被间接用到,把 component.entry 改成真正渲染的那个组件。',
+      );
+    };
     for (const testCase of cases) {
       const caseResult = { id: testCase.id, prefs: testCase.prefs, passed: 0, total: statesRun.length, failures: [] };
       const p = await pageFor(testCase);
@@ -184,6 +214,7 @@ try {
         try {
           await freshLoad(p, base, { adaptive: !!spec.adaptive });
           await applyCase(p, testCase);
+          await assertSentinel(p);
           if (Array.isArray(st.via)) await replay(p, st.via);
           else await reachTabState(p, st);
           const cur = await p.evaluate(() => window.__qa.current());
@@ -198,6 +229,7 @@ try {
       }
       gateB.cases.push(caseResult);
     }
+    gateB.entryRenderProof = entryRenderProof;
     gateB.pass = gateB.failures.length === 0;
   }
 

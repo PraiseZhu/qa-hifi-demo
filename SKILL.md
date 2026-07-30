@@ -63,6 +63,20 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
 | `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `skippedExternal`。**代码层防伪链的真相源**——门 A 对清单里每个输入 + 清单自身逐文件 sha256；缺清单 = `NO_MANIFEST` fail-closed |
 
+**「真组件直渲」不靠声明，靠运行期哨兵。** 只证明 `entry` 在 `metafile` 输入里是不够的：
+`import '<entry>'` 这种副作用导入同样让它进图、hash 入链，而界面完全可以是 bootstrap 手搓的。
+`build.mjs` 给 `entry` 的每个导出套一层调用探针，真被调用/实例化（React 调函数组件、`new`
+类组件、`memo`/`forwardRef` 的 `render`）时置 `globalThis.__QA_ENTRY_RENDERED__`；verify 在
+门 B 挂载完成后、第一个状态断言前查一次，没置位就是门 B 首项 fail（报文点名 side-effect import）。
+另有 tree-shake 护栏：`entry` 在图里但 `bytesInOutput` 为 0（只被 `import type`、或导出全未
+被引用且无副作用）→ build exit 2。
+
+诚实边界（不隐瞒）：探针只能套函数/类/`memo`·`forwardRef`。`entry` 的导出全是常量或纯数据、
+或全靠 `export *` 转出时套不上，此时 **verify 不判造假**（避免误伤），改由 `pr-block` 把结论
+降级成「产品模块已打包（N 个源文件 hash 入链）｜⚠️ 运行期哨兵无法覆盖该入口的导出形态，
+bootstrap 使用方式需人工审查」。同理，bootstrap 调用 `entry` 的非组件导出（工具函数）也会
+置位——这两个缺口由降级文案与人工 review 兜，工具不宣称自己做到了做不到的事。
+
 `spec.json` 多一个 `component` 段：`mode:"component"` / `entry`（必须是 bootstrap 真正
 import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bundle 真实输入里就 exit 2）/
 `sources[]`（可选的人读声明；代码层防伪链的真相源是 build.mjs 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /

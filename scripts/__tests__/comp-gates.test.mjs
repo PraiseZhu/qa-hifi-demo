@@ -272,7 +272,7 @@ test('组件模式:改 bundle 产物 → 旧 report 被 pr-block 拒', async (t)
   assert.match(pr.stdout + pr.stderr, /hash|不一致|重跑/);
 });
 
-test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附贴块声明真组件直渲', async (t) => {
+test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附贴块给出组件模式结论行', async (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
   const { dir } = makeRepoDemo({ name: 'e2e-gated' });
@@ -284,7 +284,11 @@ test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附
   assert.match(report.gateD.detail, /组件模式|产品代码路径/);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 0, `${pr.stdout}${pr.stderr}`);
-  assert.match(pr.stdout, /真组件直渲（2 个源文件 hash 入链）/);
+  // 本 fixture 的 bundle 是手写替身、页面里没有运行期哨兵 → 附贴块必须诚实降级,
+  // 不许宣称「真组件直渲」(哨兵证明到了才许,覆盖见 comp-fix-r2.test.mjs)。
+  assert.match(pr.stdout, /产品模块已打包（2 个源文件 hash 入链）/);
+  assert.match(pr.stdout, /需人工审查/);
+  assert.ok(!pr.stdout.includes('真组件直渲'), '哨兵未证明却宣称真组件直渲');
 });
 
 test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) => {
@@ -361,5 +365,5 @@ test('fail-closed 阳性对照: 源文件与 bundle 全部真 hash → 照常放
   const pr = verifyThenPrBlock(dir, env);
   assert.equal(pr.status, 0, `健康组件 demo 被误伤:${pr.stdout}${pr.stderr}`);
   assert.ok(!/防伪链未锁住/.test(pr.stdout + pr.stderr), 'fail-closed 误报');
-  assert.match(pr.stdout, /真组件直渲/);
+  assert.match(pr.stdout, /产品模块已打包/);
 });

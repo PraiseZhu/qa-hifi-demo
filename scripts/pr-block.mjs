@@ -209,9 +209,15 @@ lines.push(`| 交互鲁棒（${report.gateC.checks.map((c) => c.id).join(' / ')}
 if (report.gateD.total > 0) lines.push(`| 渲染绑定（${report.gateD.total} 条 computed-style ≡ truth） | ✅ |`);
 else lines.push('| 渲染绑定 | ⚠️ 未配置 bindings，还原承诺仅到数据层 |');
 // 组件模式:声明「真组件直渲」并给出进链的源文件数——读者一眼看出渲染不是手搓复刻
+// 组件模式:结论强度取决于运行期哨兵是否真的证明了「入口组件被渲染」。
+// 证明到了 → 「真组件直渲」;探针套不上(entry 导出全是常量/纯数据、或 export * 转出)
+// → 不许继续宣称直渲,降级成「已打包 + 使用方式需人工审查」。机械宣称做不到的事就是造假。
 if (spec.component?.mode === 'component') {
   const srcCount = Object.keys(report.inputHashes?.componentSources?.sources ?? {}).length;
-  lines.push(`| 真组件直渲（${srcCount} 个源文件 hash 入链） | ✅ |`);
+  if (report.gateB?.entryRenderProof === 'proved')
+    lines.push(`| 真组件直渲（${srcCount} 个源文件 hash 入链，运行期哨兵实测入口组件被渲染） | ✅ |`);
+  else
+    lines.push(`| 产品模块已打包（${srcCount} 个源文件 hash 入链） | ⚠️ 运行期哨兵无法覆盖该入口的导出形态，bootstrap 使用方式需人工审查 |`);
 }
 if (report.gateF.total > 0) lines.push(`| 适配还原（${report.gateF.total} 点） | ✅ |`);
 else lines.push('| 适配还原（窗口拉伸行为） | ⚠️ 未配置 adaptive，拉伸未验证 |');
