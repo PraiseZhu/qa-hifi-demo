@@ -189,7 +189,8 @@ test('buildInputHashes: 非组件模式不长出 componentSources(回归)', () =
   const { dir } = makeRepoDemo({ name: 'hash-plain', component: false });
   const h = buildInputHashes(dir, readSpec(dir));
   assert.equal(h.componentSources, undefined);
-  assert.deepEqual(Object.keys(h).sort(), ['baselines', 'index.html', 'spec.json', 'truth.json']);
+  // fixture 自带 assets/(bundle 落位),合并后 assets 段对所有 demo 合法入链(comp-assets 设计)
+  assert.deepEqual(Object.keys(h).sort(), ['assets', 'baselines', 'index.html', 'spec.json', 'truth.json']);
 });
 
 test('findGitRepoRoot: 定位到 demo 所在仓根', () => {
