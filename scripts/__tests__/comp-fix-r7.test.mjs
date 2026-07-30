@@ -715,8 +715,11 @@ test('条目 4 源码契约(不 skip): 快照在前置门之后、任何 demo �
   assert.ok(iBoundary < iDrift, '快照偏离比对必须排在执行 demo 代码之后');
   assert.ok(!/createSafeStaticServer\(demoDir\)/.test(v), 'verify 仍在从 demo 原地提供文件(I-OBSERVE 不成立)');
   assert.match(v, /I-OBSERVE/, '不变式名必须写进源码');
-  // 快照要整树复制以保住相对路径依赖,只排除生成物/取证目录
-  assert.match(v, /SNAPSHOT_EXCLUDE/);
+  // 快照要整树复制以保住相对路径依赖,只豁免生成物/取证目录
+  // (r8 条目 A:豁免清单更名为 EXEMPT_TOP_FILES/EXEMPT_TOP_DIRS,并与 drift/页面可达性共用一份)
+  assert.match(v, /EXEMPT_TOP_FILES/);
+  assert.match(v, /EXEMPT_TOP_DIRS/);
+  assert.match(v, /isExemptRel/);
   assert.match(v, /recursive: true/);
 });
 
