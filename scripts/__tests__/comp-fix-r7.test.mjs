@@ -1203,3 +1203,79 @@ test('条目 13 契约(不 skip): DEMO_BUILD_FILES 恰等于 demo 侧构建期�
   // 每个被钉的文件都必须真有 canonical 源可比(否则 checkDemoBuilderIntegrity 会静默跳过它)
   for (const name of DEMO_BUILD_FILES) assert.ok(existsSync(LOCAL[name]), `${name} 没有 canonical 源文件`);
 });
+
+// ============================================================================
+// 条目 14 / 15 — 测试环境敏感性 与 skill 自身依赖钉版
+// ============================================================================
+
+test('条目 14 契约(不 skip): 「产品仓无 tailwind」必须自建隔离 fixture，不许依赖宿主碰巧没装', () => {
+  /* 根因回顾:原用例用 `repoDeps: true`(整份宿主 node_modules symlink)+ 假设"宿主产品仓碰巧
+     没装 tailwind"。MivoCanvas 没装 → 绿;Project CINDY 装了 3.4.19 → --check-css 正常成功、
+     断言失败(lead 实测 278/280)。这类"看起来有保护、其实是环境碰巧"正是我们花七轮在防的东西,
+     出现在我们自己的测试里。 */
+  const r6 = readFileSync(join(ROOT, 'scripts/__tests__/comp-fix-r6.test.mjs'), 'utf8');
+  assert.match(r6, /function makeNoTailwindNodeModules/, '必须有自建「无 tailwind CLI 产品仓」的 fixture 构造');
+  assert.match(r6, /repoDeps: 'no-tailwind'/, 'fail-closed 用例必须用隔离 fixture');
+  // 那个用例不许再出现「假设宿主没装」的写法
+  const caseSrc = r6.slice(r6.indexOf("test('条目 1 fail-closed"), r6.indexOf("test('条目 1 真 tailwind 分支"));
+  assert.ok(!/repoDeps: true/.test(caseSrc), 'fail-closed 用例仍在整份 symlink 宿主 node_modules(会随宿主装了什么而变)');
+  assert.match(caseSrc, /repoDeps: 'no-tailwind'/);
+  // 构造必须是确定性的:显式跳过 tailwindcss 并自查
+  const helper = r6.slice(r6.indexOf('function makeNoTailwindNodeModules'), r6.indexOf('/** 出块前的三件事'));
+  assert.match(helper, /name === 'tailwindcss'/, '构造必须显式跳过 tailwindcss 包');
+  assert.match(helper, /if \(name === 'tailwindcss'\) continue;/, '.bin 也必须跳过 tailwindcss');
+  assert.match(helper, /隔离 fixture 构造失败/, '构造完必须自查前提成立(否则又变成靠环境碰巧)');
+  // r6 的「引擎同源性」旧用例(把运行时解析结果与 skill 自身比,恒失败)已随条目 2 下线
+  assert.ok(!/createRequire\(join\(ROOT, 'package\.json'\)\)[\s\S]{0,300}fast-glob/.test(r6),
+    '旧的「与 skill 自身的 fast-glob 比对」写法必须已下线(比较对象选错 → 恒失败)');
+});
+
+test('条目 15 契约(不 skip): skill 自身依赖钉版与 README/实现一致，且不靠产品仓兜住', () => {
+  const pkg = readJson(join(ROOT, 'package.json'));
+  const lock = readJson(join(ROOT, 'package-lock.json'));
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+
+  /* ── typescript:必须 5.x ──
+     根因:fix-r6 把它钉成 ^7.0.2(实装 7.0.2),而 README 明写必须 5.x、writeback.mjs 依赖
+     TS5 的 lib/typescript.js(TS7 原生版没有该文件)。全量没暴露是因为
+     QA_HIFI_MODULE_ROOT 优先解析了产品仓的 TS 5.9.3 —— skill 自己的依赖错误被产品仓掩盖。 */
+  assert.match(readme, /typescript 必须 5\.x/, 'README 的 TS 版本要求是这条断言的依据');
+  assert.match(pkg.devDependencies.typescript, /^\^?5\./, `package.json 的 typescript 必须钉 5.x(当前 ${pkg.devDependencies.typescript})`);
+  const tsLocked = lock.packages?.['node_modules/typescript']?.version ?? '';
+  assert.match(tsLocked, /^5\./, `package-lock 里的 typescript 必须是 5.x(当前 ${tsLocked})`);
+  // 实装那份必须真有 Compiler API 入口(writeback.mjs 取的就是它)
+  assert.ok(
+    existsSync(join(ROOT, 'node_modules/typescript/lib/typescript.js')),
+    'skill 实装的 typescript 里没有 lib/typescript.js —— keyPath 写回会 fail-closed(不许靠产品仓的 TS 兜住)',
+  );
+  // 实现与钉版一致:writeback 显式取经典入口,而不是在模块形态上猜
+  assert.match(readFileSync(join(ROOT, 'scripts/writeback.mjs'), 'utf8'), /lib\/typescript\.js/);
+
+  /* ── tailwindcss:钉法与实现/文档一致(顺带核) ──
+     实现依赖 v3 的 CLI 参数形态(-c/-i/-o/--content)与 lib/lib/content.js 的 parseCandidateFiles
+     (条目 2/5 的交叉验证靠它),因此必须钉在 3.x。 */
+  assert.match(pkg.devDependencies.tailwindcss, /^\^?3\./, `tailwindcss 必须钉 3.x(当前 ${pkg.devDependencies.tailwindcss})`);
+  const twLocked = lock.packages?.['node_modules/tailwindcss']?.version ?? '';
+  assert.match(twLocked, /^3\./, `package-lock 里的 tailwindcss 必须是 3.x(当前 ${twLocked})`);
+  assert.ok(existsSync(join(ROOT, 'node_modules/tailwindcss/lib/lib/content.js')), 'tailwind 内部 API 路径变了 → 条目 2/5 的交叉验证需显式适配');
+  // 钉版清单与「版本联动闸门」那份 fixture 必须一致(否则升级时两处会漂移)
+  const pinned = readJson(join(ROOT, 'scripts/__tests__/fixtures/r7-content-engine-versions.json'));
+  assert.equal(pinned.tailwindcss, twLocked, '版本联动 fixture 与 package-lock 的 tailwindcss 版本不一致');
+});
+
+test('条目 15 自足性(不 skip): 只需 TS 的那组在没有产品仓时也必须能真跑', () => {
+  /* sync-v2(keyPath 写回)只依赖 typescript,不需要 esbuild/playwright ——
+     所以它在**不设 QA_HIFI_MODULE_ROOT** 时也必须全绿(这是条目 15 的验收硬标准)。
+     这里用源码契约保证它不会被误加「缺产品仓就 skip」的 guard,把自足性悄悄丢掉。 */
+  const sync = readFileSync(join(ROOT, 'scripts/__tests__/sync-v2.test.mjs'), 'utf8');
+  assert.ok(!/NEEDS_PRODUCT_REPO/.test(sync), 'sync-v2 不该依赖产品仓依赖(它只需要 typescript)');
+  // writeback 的 TS 解析候选链必须含 skillRoot,否则没有产品仓时它解析不到自己的 TS
+  const wb = readFileSync(join(ROOT, 'scripts/writeback.mjs'), 'utf8');
+  assert.match(wb, /resolveFrom\('typescript\/package\.json', \[process\.env\.QA_HIFI_MODULE_ROOT, repoRoot, skillRoot\]\)/,
+    'TS 解析候选链必须包含 skillRoot(自足)且不含 demoDir(不可信)');
+  // 只看可执行代码:注释里说明「候选链不放 demoDir」是必要的,不能被反向断言误判
+  const wbCode = stripComments(wb);
+  const at = wbCode.indexOf("resolveFrom('typescript/package.json'");
+  assert.ok(!/demoDir/.test(wbCode.slice(at - 200, at + 200)),
+    'TS 解析候选链里不许出现 demoDir(那是 demo 侧任意代码执行)');
+});

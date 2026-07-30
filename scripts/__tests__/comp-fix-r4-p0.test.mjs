@@ -41,6 +41,11 @@ const BUILD_FILES = [
   ['scripts/lib/repo-glob.mjs', 'repo-glob.mjs'],
 ];
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+/* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
+   必须显式 skip 并说明缺什么 —— 原先它们直接 fail,把「宿主缺依赖」伪装成「实现有 bug」。
+   skill 自身故意不 vendor esbuild/playwright(重依赖 + 浏览器二进制),它们由产品仓提供;
+   canonical 测试命令一直带 QA_HIFI_MODULE_ROOT,两个真实产品仓下这些用例全部实跑。 */
+const NEEDS_PRODUCT_REPO = '需要产品仓提供 esbuild/playwright:设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓(skill 自身不 vendor 这两个重依赖)';
 const env = () => (MODULE_ROOT ? { QA_HIFI_MODULE_ROOT: MODULE_ROOT } : {});
 function run(script, args, opts = {}) {
   return spawnSync(process.execPath, [script, ...args], {
@@ -229,7 +234,8 @@ test('#2c-b 空数组同样 fail-closed(不 skip)', () => {
   assert.ok(validateSpec(spec).some((p) => /component\.css\.content 必须是非空 string 数组/.test(p)));
 });
 
-test('#2c-b 构建核心独立 fail-closed(不 skip): 省略 content 时 --check-inputs 直接 exit 2', () => {
+test('#2c-b 构建核心独立 fail-closed(不 skip): 省略 content 时 --check-inputs 直接 exit 2', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // 不靠 schema 兜:构建核心自己也必须拒(--check-inputs 是复算 oracle 的入口,
   // 它若放行,「清单只记 config、不记命中文件」的旧形状就又能算出一致 hash)。
   const { dir } = makeFixture({ name: 'core-implicit', css: { tailwindConfig: 'tailwind.config.js' } });
