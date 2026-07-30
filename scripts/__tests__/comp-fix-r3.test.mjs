@@ -9,6 +9,10 @@
 //       r3:复算跑 skill 仓自己的 component-build-core,且 demo 侧构建期文件 hash
 //       必须等于 canonical,不等 → fail-closed「检测到自定义构建器」。
 //
+//   #2c-b tailwind content 命中的文件不入链:改样式源文件 hash 不变,旧 CSS+旧 report 照过。
+//       r3:content 每个 glob 按 repoRoot 展开、逐文件进 buildInputs.product;零命中或
+//       非标准 glob 一律 exit 2。
+//
 // 与 comp-fix-r2 同构:自造 mini「产品仓」(含 .git + 真组件源码)+ demo,真 esbuild。
 
 import test from 'node:test';
@@ -267,3 +271,69 @@ test('#2c-a 复算路径不执行 demo 目录里的代码(伪 build.mjs 的副�
   assert.equal(existsSync(join(dir, 'EXECUTED')), false, 'verify 的复算居然执行了 demo 目录里的 build.mjs');
 });
 
+// ==================== #2c-b tailwind content 入链 ====================
+
+const CSS_SPEC = { tailwindConfig: 'tailwind.config.js', content: ['src/styles/*.css'] };
+
+test('#2c-b content 命中的文件逐个进 buildInputs.product,改它 → 旧 report 被拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { repo, dir } = makeFixture({
+    name: 'content-chain',
+    boot: 'renderTarget',
+    exportName: 'Claimed',
+    css: CSS_SPEC,
+    styleFiles: { 'src/styles/theme.css': '.a{color:red}\n', 'src/styles/extra.css': '.b{color:blue}\n' },
+  });
+  // 产品仓没装 tailwindcss CLI,不能跑完整 build(CSS 步会报缺 CLI);清单本身用 skill 侧
+  // 构建核心直算(与 build.mjs 走的是同一份实现),再落盘 —— 与 build.mjs 的行为等价。
+  const check = coreCheck(dir);
+  assert.equal(check.status, 0, `${check.stdout}${check.stderr}`);
+  const manifest = JSON.parse(check.stdout);
+  assert.deepEqual(
+    manifest.buildInputs.product,
+    ['src/styles/extra.css', 'src/styles/theme.css', 'tailwind.config.js'],
+    'content 命中的每个文件都必须入链(#2c-b:漏了它们改样式源文件 hash 不变)',
+  );
+  writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  const spec = readSpec(dir);
+  const before = buildInputHashes(dir, spec);
+  assert.match(before.componentSources.buildInputs.product['src/styles/theme.css'], /^[0-9a-f]{64}$/);
+  // 攻击:只改样式源文件(旧 CSS 产物与旧 report 都不动)
+  writeFileSync(join(repo, 'src/styles/theme.css'), '.a{color:lime}\n');
+  const after = buildInputHashes(dir, spec);
+  assert.notEqual(stableJson(after), stableJson(before), '改 content 命中的文件居然没让 hash 变');
+  assert.ok(
+    validateReportIntegrity(dir, spec, { toolVersion: 'x', inputHashes: before }).some((p) => /输入 hash 与当前/.test(p)),
+    '改样式源文件后旧 report 应被拒',
+  );
+});
+
+test('#2c-b content glob 零命中 → exit 2(声明了却匹配不到 = 配置错误)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({
+    name: 'content-nomatch',
+    boot: 'renderTarget',
+    exportName: 'Claimed',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/styles/*.css'] },
+  });
+  const r = buildDemo(dir);
+  assert.equal(r.status, 2, `零命中 content 居然构建成功:${r.stdout}${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /零命中/);
+  assert.match(r.stdout + r.stderr, /src\/styles\/\*\.css/);
+});
+
+test('#2c-b content 用了非标准 glob(brace / 否定 / 绝对路径)→ exit 2 并说明受限格式', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  for (const pattern of ['src/**/*.{ts,tsx}', '!src/skip.css', '/abs/path/*.css']) {
+    const { dir } = makeFixture({
+      name: `content-badglob-${Buffer.from(pattern).toString('hex').slice(0, 8)}`,
+      boot: 'renderTarget',
+      exportName: 'Claimed',
+      css: { tailwindConfig: 'tailwind.config.js', content: [pattern] },
+      styleFiles: { 'src/styles/theme.css': '.a{color:red}\n' },
+    });
+    const r = buildDemo(dir);
+    assert.equal(r.status, 2, `${JSON.stringify(pattern)} 居然被接受:${r.stdout}${r.stderr}`);
+    assert.match(r.stdout + r.stderr, /不是本工具可解析的标准 glob/);
+  }
+});

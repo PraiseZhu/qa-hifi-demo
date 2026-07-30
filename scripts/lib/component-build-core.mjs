@@ -18,6 +18,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { findRepoRoot, resolveFrom } from './extract-helpers.mjs';
+import { expandRepoGlob } from './repo-glob.mjs';
 
 export const CORE_FILE_NAME = 'component-build-core.mjs';
 export const BUILDER_FILE_NAME = 'build.mjs';
@@ -315,6 +316,35 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
   // qa-entry-orig 下,这里剥掉前缀,让它照常按真实文件路径归位。
   const stripNs = (key) => (key.startsWith(`${ENTRY_ORIG_NS}:`) ? key.slice(ENTRY_ORIG_NS.length + 1) : key);
 
+  /** tailwind content:声明了就必须能展开成实际文件并逐一入链(审核 #2c-b)。 */
+  function tailwindContentFiles() {
+    const list = Array.isArray(comp.css?.content) ? comp.css.content : [];
+    const out = new Set();
+    for (const pattern of list) {
+      if (typeof pattern !== 'string' || !pattern.trim())
+        fail('component.css.content 每一项必须是非空 string(仓内相对 glob)', 2);
+      // 受限格式一律拒绝:本工具的 glob 只认 * / ** / ?,brace/否定/对象/require() 形式
+      // 展不开就等于「声明了却没入链」,那正是 #2c-b 的漏洞形状,不许静默跳过。
+      if (/[{}()!,]/.test(pattern) || pattern.startsWith('/') || pattern.includes('\\') || pattern.split('/').includes('..'))
+        fail(
+          `component.css.content["${pattern}"] 不是本工具可解析的标准 glob——只支持仓内相对路径 + * / ** / ?;`
+          + '不支持 {a,b} brace、! 否定、绝对路径、".."、逗号多值,以及 tailwind config 里的 require()/对象形式。'
+          + '\n修法:拆成多条标准 glob 写进 component.css.content。',
+          2,
+        );
+      const matched = expandRepoGlob(repoRoot, pattern).filter((rel) => existsSync(join(repoRoot, rel)));
+      if (matched.length === 0)
+        fail(
+          `component.css.content["${pattern}"] 在产品仓内零命中(仓根 ${repoRoot})——`
+          + '声明了 content 却匹配不到任何文件 = 配置错误(CSS 会按空 content 编译,改样式源文件也不会让 hash 变)。'
+          + '\n修法:修正该 glob,或从 component.css.content 里删掉它。',
+          2,
+        );
+      matched.forEach((rel) => out.add(toPosix(rel)));
+    }
+    return out;
+  }
+
   function normalizeInputs(metafile) {
     const productInputs = new Set();
     const demoInputs = new Set();
@@ -333,6 +363,7 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     for (const name of DEMO_BUILD_FILES) if (existsSync(join(demoDir, name))) buildDemo.add(name);
     const buildProduct = new Set();
     if (comp.css?.tailwindConfig) buildProduct.add(toPosix(comp.css.tailwindConfig));
+    for (const rel of tailwindContentFiles()) buildProduct.add(rel);
     for (const pkgJson of readPackageJsons) {
       const abs = real(pkgJson);
       if (inside(demoReal, abs)) buildDemo.add(toPosix(relative(demoReal, abs)));
