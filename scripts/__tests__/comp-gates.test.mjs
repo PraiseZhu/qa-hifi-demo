@@ -67,6 +67,18 @@ function baseHtml(truth) {
  * 造一个「demo 位于产品仓内」的 fixture:<repo>/.git + <repo>/src/*.tsx + <repo>/qa-demo/。
  * component=false 时不写 spec.component(回归用:非组件模式旧 demo)。
  */
+// build.mjs 测试替身:--check-inputs 时回显 demo 内现有 component.inputs.json。
+// 让「清单被改 → 复算不一致」这条新门在本文件里保持中性(本文件测的是 hash 链状态机),
+// 真正的复算对抗(缩清单 / 改 build.mjs / 改 tailwind config)在 comp-fix-r2.test.mjs。
+const STUB_BUILDER = [
+  "import { readFileSync } from 'node:fs';",
+  "import { dirname, join } from 'node:path';",
+  "import { fileURLToPath } from 'node:url';",
+  "const d = dirname(fileURLToPath(import.meta.url));",
+  "if (process.argv.includes('--check-inputs')) process.stdout.write(readFileSync(join(d, 'component.inputs.json'), 'utf8'));",
+  '',
+].join('\n');
+
 function makeRepoDemo({
   name = 'comp',
   component = true,
@@ -110,6 +122,9 @@ function makeRepoDemo({
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
   writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   writeFileSync(join(dir, 'assets/component.bundle.js'), '/* bundle v1 */\n');
+  // 本 fixture 不跑真 esbuild,给一个只回显现有清单的 build.mjs 测试替身,
+  // 满足「组件 demo 必须带构建器供独立复算」这条门(复算本身的对抗覆盖在 comp-fix-r2.test.mjs)。
+  writeFileSync(join(dir, 'build.mjs'), STUB_BUILDER);
   if (component && manifest) {
     writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({
       generator: 'qa-hifi-demo/component-build',
@@ -272,7 +287,7 @@ test('组件模式:改 bundle 产物 → 旧 report 被 pr-block 拒', async (t)
   assert.match(pr.stdout + pr.stderr, /hash|不一致|重跑/);
 });
 
-test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附贴块声明真组件直渲', async (t) => {
+test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附贴块给出组件模式结论行', async (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
   const { dir } = makeRepoDemo({ name: 'e2e-gated' });
@@ -284,7 +299,11 @@ test('组件模式:门 D 文案改为「渲染由产品代码路径承载」,附
   assert.match(report.gateD.detail, /组件模式|产品代码路径/);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 0, `${pr.stdout}${pr.stderr}`);
-  assert.match(pr.stdout, /真组件直渲（2 个源文件 hash 入链）/);
+  // 本 fixture 的 bundle 是手写替身、页面里没有运行期哨兵 → 附贴块必须诚实降级,
+  // 不许宣称「真组件直渲」(哨兵证明到了才许,覆盖见 comp-fix-r2.test.mjs)。
+  assert.match(pr.stdout, /产品模块已打包（2 个源文件 hash 入链）/);
+  assert.match(pr.stdout, /需人工审查/);
+  assert.ok(!pr.stdout.includes('真组件直渲'), '哨兵未证明却宣称真组件直渲');
 });
 
 test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) => {
@@ -361,5 +380,5 @@ test('fail-closed 阳性对照: 源文件与 bundle 全部真 hash → 照常放
   const pr = verifyThenPrBlock(dir, env);
   assert.equal(pr.status, 0, `健康组件 demo 被误伤:${pr.stdout}${pr.stderr}`);
   assert.ok(!/防伪链未锁住/.test(pr.stdout + pr.stderr), 'fail-closed 误报');
-  assert.match(pr.stdout, /真组件直渲/);
+  assert.match(pr.stdout, /产品模块已打包/);
 });

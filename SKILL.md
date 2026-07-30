@@ -61,7 +61,21 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
-| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `skippedExternal`。**代码层防伪链的真相源**——门 A 对清单里每个输入 + 清单自身逐文件 sha256；缺清单 = `NO_MANIFEST` fail-closed |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建器自身 / tailwind config / alias 读过的 package.json）/ `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都会跑 `node build.mjs --check-inputs` 用 esbuild 现算一遍再全等比对，「先缩清单再重跑 verify」当场被抓（缺 `build.mjs` 也 fail-closed——无法复算） |
+
+**「真组件直渲」不靠声明，靠运行期哨兵。** 只证明 `entry` 在 `metafile` 输入里是不够的：
+`import '<entry>'` 这种副作用导入同样让它进图、hash 入链，而界面完全可以是 bootstrap 手搓的。
+`build.mjs` 给 `entry` 的每个导出套一层调用探针，真被调用/实例化（React 调函数组件、`new`
+类组件、`memo`/`forwardRef` 的 `render`）时置 `globalThis.__QA_ENTRY_RENDERED__`；verify 在
+门 B 挂载完成后、第一个状态断言前查一次，没置位就是门 B 首项 fail（报文点名 side-effect import）。
+另有 tree-shake 护栏：`entry` 在图里但 `bytesInOutput` 为 0（只被 `import type`、或导出全未
+被引用且无副作用）→ build exit 2。
+
+诚实边界（不隐瞒）：探针只能套函数/类/`memo`·`forwardRef`。`entry` 的导出全是常量或纯数据、
+或全靠 `export *` 转出时套不上，此时 **verify 不判造假**（避免误伤），改由 `pr-block` 把结论
+降级成「产品模块已打包（N 个源文件 hash 入链）｜⚠️ 运行期哨兵无法覆盖该入口的导出形态，
+bootstrap 使用方式需人工审查」。同理，bootstrap 调用 `entry` 的非组件导出（工具函数）也会
+置位——这两个缺口由降级文案与人工 review 兜，工具不宣称自己做到了做不到的事。
 
 `spec.json` 多一个 `component` 段：`mode:"component"` / `entry`（必须是 bootstrap 真正
 import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bundle 真实输入里就 exit 2）/
@@ -383,6 +397,12 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
    demo 有 `assets/` 就必须有这份报告、其 assets hash 与当前 `assets/` 一致、且 `ok: true`。
    三者任一不满足即 exit 2——否则本闸门是一条谁都能整段跳过的"自愿门"（跑没跑过、抬没抬闸，
    定稿时完全查不到）。
+
+   **`pr-block` 不信报告自报的数字**：`hash + ok:true` 都写在同一份可手写的 JSON 里，
+   一份 `{ ok:true, totalBytes:0, inputHashes:<真 hash> }` 就能把 9MB 资产送过闸。所以
+   `pr-block` 自己从 `assets/` 重算总体积，再逐条校验：`defaultLimitMb` ≡ 本工具写死的 8、
+   `effectiveLimitMb` 是有限正数、自报 `totalBytes` ≡ 现算值、现算值 ≤ 生效阀、
+   「生效阀 > 默认阀」⟺「`overrideReason` 非空」（双向）。任一不成立即 exit 2。
 
    **抬闸必须留痕**：`--max-total` 高于默认 8MB 时必须同时给非空 `--override-reason "<为什么
    这个 demo 必须更大>"`，否则参数直接被拒。理由进报告并原样印在 PR 附贴块上：
