@@ -15,6 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
+  checkDemoNoNodeModules,
   failJson,
   failProblems,
   readComponentInputsManifest,
@@ -50,6 +51,16 @@ if (gateFilter) {
 }
 const partial = !!(gateFilter || caseFilter || stateFilter);
 const runGate = (letter) => !gateFilter || gateFilter.includes(letter);
+
+/* ── 无条件 fail-fast:demo 自带 node_modules 一律拒(r5 P0-2) ──
+   必须排在**任何** demo 侧输入解析、动态 import、子进程执行、浏览器启动之前:
+   playwright/esbuild 这类模块一旦从 <demo>/node_modules 解析出来,import 的瞬间
+   它的顶层代码就在本进程里跑了。不限组件模式,对所有 demo 生效;命中即退出,
+   不是「标红后继续」。 */
+{
+  const problems = checkDemoNoNodeModules(demoDir);
+  if (problems.length) failProblems(problems);
+}
 
 for (const f of ['spec.json', 'truth.json', 'index.html'])
   if (!existsSync(join(demoDir, f))) failJson(`${f} 不存在于 ${demoDir}`);

@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { findPackageRoot } from './fs-utils.mjs';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
+import { findGitRepoRoot, findPackageRoot } from './fs-utils.mjs';
 
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -46,19 +46,57 @@ function workspaceSiblingRoots(startDir) {
   return out;
 }
 
+const real = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
+const inside = (root, abs) => abs === root || abs.startsWith(root + sep);
+const SELF_DIR = import.meta.dirname;
+
+/**
+ * startDir 作为「不可信 demo 子树」的判定范围。
+ * 若 skill 自身就在 startDir 里面,那它是 skill/工作区根(内部调用与自测的用法),
+ * 不是 demo 目录 —— 不施加子树排除,否则会把 skill 自己的依赖也排掉。
+ */
+function demoScope(startDir) {
+  if (!startDir) return null;
+  const r = real(startDir);
+  return inside(r, real(SELF_DIR)) ? null : r;
+}
+
+/**
+ * demo 的产品仓根——仅当它是 demo 目录的**严格祖先**时才算可信根。
+ * demo 自己就是一个 git 仓时(toplevel === demoDir)一律不采用:那等于把
+ * 不可信目录重新塞回解析候选。
+ */
+function trustedRepoRoot(demoDir) {
+  const root = findGitRepoRoot(demoDir);
+  if (!root) return null;
+  const rootReal = real(root);
+  const demoReal = real(demoDir);
+  return rootReal !== demoReal && inside(rootReal, demoReal) ? root : null;
+}
+
+/* ── 解析候选只许放**不受 demo 目录内容左右**的根(r5 P0-2 CRITICAL) ──
+   r4 之前 candidateDirs 把 startDir(= demoDir)排在最前,还兜了 process.cwd() 与
+   INIT_CWD。requireFrom 从这些目录找 package.json,loadPlaywrightApi 随后 await import()
+   解析出来的路径 —— CJS 顶层代码在 import 时同步执行。于是
+   `<demo>/node_modules/playwright/index.js` 里写 execSync 就是 verify 进程内的 RCE,
+   而且因为 demoDir 排候选第一,它还**优先于**机器上真实的 Playwright。
+   node_modules 既不入哈希链、也不在 checkDemoBuilderIntegrity 的具名文件表里。
+   与 component-build-core 的 resolveFrom('esbuild', [QA_HIFI_MODULE_ROOT, repoRoot])
+   同一模式:env 显式给定的根、git toplevel 得到的产品仓根、skill 自身位置,仅此三类。 */
 function candidateDirs(startDir) {
+  const demoReal = demoScope(startDir);
   const roots = [
     process.env.QA_HIFI_MODULE_ROOT,
     process.env.PLAYWRIGHT_MODULE_ROOT,
-    process.env.INIT_CWD,
-    startDir,
-    process.cwd(),
+    startDir ? trustedRepoRoot(startDir) : null,
     import.meta.dirname,
   ].filter(Boolean);
   const out = [];
   const seen = new Set();
   const add = (dir) => {
     const abs = resolve(dir);
+    // 任何落在 demo 子树里的候选一律不加(env 被指到 demo 里也不行)
+    if (demoReal && inside(demoReal, real(abs))) return;
     if (!seen.has(abs)) {
       seen.add(abs);
       out.push(abs);
@@ -73,19 +111,31 @@ function candidateDirs(startDir) {
   return out;
 }
 
-export function resolveModule(name, startDir = process.cwd()) {
+export function resolveModule(name, startDir = null) {
+  const demoReal = demoScope(startDir);
+  // 兜底纵深:即使某个可信根经 symlink 绕回 demo 子树,解析结果也一律拒收
+  const guard = (modPath) => {
+    if (demoReal && inside(demoReal, real(modPath)))
+      throw new Error(
+        `拒绝加载 ${name}:解析到了 demo 目录内的模块(${modPath})。`
+        + '\ndemo 自身不装依赖——demo 侧的 node_modules 是把不可信代码送进校验进程的侧路。',
+      );
+    return modPath;
+  };
   const attempts = [];
   for (const dir of candidateDirs(startDir)) {
+    let resolved;
     try {
-      const req = requireFrom(dir);
-      return req.resolve(name);
+      resolved = requireFrom(dir).resolve(name);
     } catch (err) {
       attempts.push(`${dir}: ${err.message}`);
+      continue;
     }
+    return guard(resolved);
   }
   const ownReq = createRequire(import.meta.url);
   try {
-    return ownReq.resolve(name);
+    return guard(ownReq.resolve(name));
   } catch (err) {
     attempts.push(err.message);
   }
@@ -94,7 +144,7 @@ export function resolveModule(name, startDir = process.cwd()) {
   throw e;
 }
 
-export async function loadPlaywrightApi(startDir = process.cwd()) {
+export async function loadPlaywrightApi(startDir = null) {
   let modPath;
   let mod;
   try {
@@ -108,7 +158,7 @@ export async function loadPlaywrightApi(startDir = process.cwd()) {
   return { api, modulePath: modPath };
 }
 
-export async function loadChromium(startDir = process.cwd()) {
+export async function loadChromium(startDir = null) {
   const { api, modulePath: modPath } = await loadPlaywrightApi(startDir);
   const chromium = api.chromium;
   if (!chromium) throw new Error(`模块 ${modPath} 未导出 chromium`);

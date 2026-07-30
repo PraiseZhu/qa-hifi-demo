@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
-import { buildAssetsManifest, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
+import { buildAssetsManifest, checkDemoNoNodeModules, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
 import { countFixtureLeaves, validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validateReportIntegrity } from './lib/report.mjs';
 
@@ -46,6 +46,13 @@ if (preview) {
   const p = parseUrl(preview, '--preview');
   if (!PREVIEW_HOSTS.has(p.hostname)) die(`--preview host 不在白名单:${p.hostname}`, 2);
   if (!p.pathname.endsWith('.html')) die('--preview 必须指向 .html 预览/附件链接', 2);
+}
+
+// 与 verify 同一道无条件 fail-fast(r5 P0-2):demo 自带 node_modules 一律拒,
+// 排在读取任何 demo 输入之前。
+{
+  const nm = checkDemoNoNodeModules(demoDir);
+  if (nm.length) failProblems(nm);
 }
 
 const specPath = join(demoDir, 'spec.json');
