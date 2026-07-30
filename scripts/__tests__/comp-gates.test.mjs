@@ -67,6 +67,18 @@ function baseHtml(truth) {
  * 造一个「demo 位于产品仓内」的 fixture:<repo>/.git + <repo>/src/*.tsx + <repo>/qa-demo/。
  * component=false 时不写 spec.component(回归用:非组件模式旧 demo)。
  */
+// build.mjs 测试替身:--check-inputs 时回显 demo 内现有 component.inputs.json。
+// 让「清单被改 → 复算不一致」这条新门在本文件里保持中性(本文件测的是 hash 链状态机),
+// 真正的复算对抗(缩清单 / 改 build.mjs / 改 tailwind config)在 comp-fix-r2.test.mjs。
+const STUB_BUILDER = [
+  "import { readFileSync } from 'node:fs';",
+  "import { dirname, join } from 'node:path';",
+  "import { fileURLToPath } from 'node:url';",
+  "const d = dirname(fileURLToPath(import.meta.url));",
+  "if (process.argv.includes('--check-inputs')) process.stdout.write(readFileSync(join(d, 'component.inputs.json'), 'utf8'));",
+  '',
+].join('\n');
+
 function makeRepoDemo({
   name = 'comp',
   component = true,
@@ -110,6 +122,9 @@ function makeRepoDemo({
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
   writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   writeFileSync(join(dir, 'assets/component.bundle.js'), '/* bundle v1 */\n');
+  // 本 fixture 不跑真 esbuild,给一个只回显现有清单的 build.mjs 测试替身,
+  // 满足「组件 demo 必须带构建器供独立复算」这条门(复算本身的对抗覆盖在 comp-fix-r2.test.mjs)。
+  writeFileSync(join(dir, 'build.mjs'), STUB_BUILDER);
   if (component && manifest) {
     writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({
       generator: 'qa-hifi-demo/component-build',

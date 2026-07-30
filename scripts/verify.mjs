@@ -18,6 +18,7 @@ import {
   failJson,
   failProblems,
   readComponentInputsManifest,
+  recheckComponentInputs,
   sha256Buffer,
   stableJson,
   TOOL_VERSION,
@@ -127,6 +128,16 @@ else {
       }
     } catch (err) {
       gateA.detail = `真值块解析失败:${err.message}`;
+    }
+  }
+  // 组件模式追加一段:component.inputs.json 必须等于 esbuild 现算的输入图(审核 #2c)。
+  // 清单是可手改的 JSON,不能自己当自己的真相源——「缩清单 → 只重跑 verify」必须在这里被抓住。
+  if (isComponentMode) {
+    const recheck = recheckComponentInputs(demoDir);
+    gateA.inputsRecheck = recheck.status;
+    if (recheck.problems.length) {
+      gateA.pass = false;
+      gateA.detail = [gateA.detail, ...recheck.problems].filter(Boolean).join('\n');
     }
   }
 }

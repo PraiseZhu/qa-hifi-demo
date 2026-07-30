@@ -190,7 +190,78 @@ export function readComponentInputsManifest(demoDir) {
   if (!isPlainObject(parsed)) return null;
   if (!Array.isArray(parsed.productInputs) || parsed.productInputs.length === 0) return null;
   if (parsed.demoInputs !== undefined && !Array.isArray(parsed.demoInputs)) return null;
+  if (parsed.buildInputs !== undefined) {
+    const b = parsed.buildInputs;
+    if (!isPlainObject(b) || !Array.isArray(b.demo) || !Array.isArray(b.product)) return null;
+  }
   return parsed;
+}
+
+/**
+ * 独立复算 bundle 输入图(审核 #2c):跑 `node build.mjs --check-inputs`,拿 esbuild
+ * 现算的规范化清单与 demo 内 component.inputs.json 做全等比对。
+ *
+ * 为什么必须复算:manifest 是一份可手改的 JSON。「先把 productInputs 缩到只剩 entry,
+ * 再重跑 build」会被覆盖,但「先缩 manifest,再只重跑 verify」——verify 原来直接把
+ * manifest 当真相源,缩完的窄链照样算出一致 hash,链就白锁了。复算把真相源换回 esbuild。
+ *
+ * 返回 { status, problems }:
+ *   'ok'         — 复算结果与 manifest 全等;
+ *   'mismatch'   — 不等(problems 含 diff 摘要);
+ *   'no-builder' — demo 里没有 build.mjs(不是本工具生成的组件 demo,交给别的门管);
+ *   'error'      — 复算本身跑不起来(缺 esbuild / 构建报错),fail-closed 记 problem。
+ */
+export function recheckComponentInputs(demoDir) {
+  const declared = readComponentInputsManifest(demoDir);
+  if (!declared) return { status: 'no-manifest', problems: [] }; // 由 NO_MANIFEST 那条单独阻断
+  const builder = join(demoDir, 'build.mjs');
+  if (!existsSync(builder)) {
+    return {
+      status: 'no-builder',
+      problems: [`缺 build.mjs——组件模式 demo 必须带构建器才能独立复算 ${COMPONENT_INPUTS_FILE}(重跑 init.mjs --mode component)`],
+    };
+  }
+  let fresh;
+  try {
+    const out = execFileSync(process.execPath, [builder, '--check-inputs'], {
+      cwd: demoDir,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    fresh = JSON.parse(out);
+  } catch (err) {
+    return {
+      status: 'error',
+      problems: [`独立复算 bundle 输入图失败(node build.mjs --check-inputs):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
+    };
+  }
+  if (sameInputHashes(fresh, declared)) return { status: 'ok', problems: [] };
+  const diff = [];
+  const listDiff = (label, a, b) => {
+    const A = new Set(Array.isArray(a) ? a : []);
+    const B = new Set(Array.isArray(b) ? b : []);
+    const only = (x, y) => [...x].filter((v) => !y.has(v));
+    const missing = only(A, B);
+    const extra = only(B, A);
+    if (missing.length) diff.push(`${label} 清单里少了 ${missing.length} 项(现算有、清单无):${missing.slice(0, 5).join(', ')}`);
+    if (extra.length) diff.push(`${label} 清单里多了 ${extra.length} 项(清单有、现算无):${extra.slice(0, 5).join(', ')}`);
+  };
+  listDiff('productInputs', fresh.productInputs, declared.productInputs);
+  listDiff('demoInputs', fresh.demoInputs, declared.demoInputs);
+  listDiff('buildInputs.demo', fresh.buildInputs?.demo, declared.buildInputs?.demo);
+  listDiff('buildInputs.product', fresh.buildInputs?.product, declared.buildInputs?.product);
+  for (const key of ['generator', 'entry', 'entrySentinel', 'skippedExternal']) {
+    if (JSON.stringify(fresh[key]) !== JSON.stringify(declared[key]))
+      diff.push(`${key} 不一致:现算 ${JSON.stringify(fresh[key])} vs 清单 ${JSON.stringify(declared[key])}`);
+  }
+  return {
+    status: 'mismatch',
+    problems: [
+      `${COMPONENT_INPUTS_FILE} 与 esbuild 独立复算结果不一致——清单被手改过(或改了 spec/源码后没重跑 build)。`
+      + `${diff.length ? `\n  ${diff.join('\n  ')}` : ''}`
+      + '\n修法:node build.mjs 重生清单,再重跑 verify。',
+    ],
+  };
 }
 
 /**
@@ -220,6 +291,21 @@ export function buildComponentHashes(demoDir, component) {
     if (!relSafe(rel)) { out.demoInputs[String(rel)] = 'INVALID_PATH'; continue; }
     const abs = join(demoDir, rel);
     out.demoInputs[rel] = existsSync(abs) && statSync(abs).isFile() ? hashFile(abs) : 'MISSING';
+  }
+  // 构建期输入(build.mjs 自身 / tailwind config / alias 插件读过的 package.json):
+  // 它们不在 bundle 的 metafile inputs 里,但改任一项都能改整张图或整份 CSS——
+  // 不入链就等于给「换一份宽松构建器 / 改 tailwind 主题」留后门(审核 #2c-3)。
+  out.buildInputs = { demo: {}, product: {} };
+  for (const [group, base, list] of [
+    ['demo', demoDir, manifest?.buildInputs?.demo],
+    ['product', repoRoot, manifest?.buildInputs?.product],
+  ]) {
+    for (const rel of Array.isArray(list) ? list : []) {
+      if (!relSafe(rel)) { out.buildInputs[group][String(rel)] = 'INVALID_PATH'; continue; }
+      if (!base) { out.buildInputs[group][rel] = 'UNRESOLVED'; continue; }
+      const abs = join(base, rel);
+      out.buildInputs[group][rel] = existsSync(abs) && statSync(abs).isFile() ? hashFile(abs) : 'MISSING';
+    }
   }
   const bundle = typeof component?.bundle === 'string' && component.bundle ? component.bundle : null;
   if (bundle) {

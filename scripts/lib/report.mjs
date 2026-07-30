@@ -5,6 +5,7 @@ import {
   checkDeclaredComponentSources,
   COMPONENT_INPUTS_FILE,
   isPlainObject,
+  recheckComponentInputs,
   sameInputHashes,
   TOOL_VERSION,
 } from './fs-utils.mjs';
@@ -40,7 +41,15 @@ export function validateReportIntegrity(demoDir, spec, report) {
     const cs = actualHashes.componentSources ?? {};
     if (FIX[cs.manifest] || !cs.manifest) problems.push(`component 防伪链未锁住 bundle 输入清单(状态 ${cs.manifest ?? 'NO_MANIFEST'}):${FIX[cs.manifest] ?? FIX.NO_MANIFEST}`);
     problems.push(...checkDeclaredComponentSources(demoDir, spec.component));
-    for (const [group, entries] of [['sources', cs.sources], ['demoInputs', cs.demoInputs], ['bundle', cs.bundle]]) {
+    // manifest 不能自己当自己的真相源:用 esbuild 独立复算一遍输入图再全等比对
+    problems.push(...recheckComponentInputs(demoDir).problems);
+    for (const [group, entries] of [
+      ['sources', cs.sources],
+      ['demoInputs', cs.demoInputs],
+      ['buildInputs.demo', cs.buildInputs?.demo],
+      ['buildInputs.product', cs.buildInputs?.product],
+      ['bundle', cs.bundle],
+    ]) {
       for (const [name, value] of Object.entries(entries ?? {})) {
         if (FIX[value]) problems.push(`component 防伪链未锁住 ${group} "${name}"(状态 ${value}):${FIX[value]}`);
         // 任何非真 sha256 的值都不锁任何东西(手写占位/未知状态一律拒)

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // build.mjs — 组件模式构建器(由 init.mjs --mode component 拷进 demo 目录)。
 //
-//   node build.mjs            # 读 spec.json 的 component 段,产出 assets/component.bundle.js
+//   node build.mjs                  # 读 spec.json 的 component 段,产出 assets/component.bundle.js
+//   node build.mjs --check-inputs   # 不落任何产物,只把输入图重算一遍打到 stdout(防伪链独立复算)
 //
 // 做三件事,全部由 spec.component 驱动(本文件通用,不写任何 demo 专属常量):
 //   1. esbuild bundle:entry = component.bootstrap(demo 内的装配入口,import 真实产品组件);
@@ -17,14 +18,20 @@
 // $QA_HIFI_MODULE_ROOT → repoRoot → cwd。
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { findRepoRoot, resolveFrom } from './extract-helpers.mjs';
 
-const demoDir = dirname(fileURLToPath(import.meta.url));
+const selfFile = fileURLToPath(import.meta.url);
+const demoDir = dirname(selfFile);
 const spec = JSON.parse(readFileSync(join(demoDir, 'spec.json'), 'utf8'));
 const comp = spec.component;
 if (!comp) fail('spec.json 缺 component 段——build.mjs 只用于组件模式 demo');
+
+// --check-inputs:只重算输入图并打印规范化清单,不写 bundle / 不写 manifest / 不编 CSS。
+// verify 与 pr-block 用它对 component.inputs.json 做**独立复算**——manifest 是可手改的
+// JSON,不能自己当自己的真相源(审核 #2c:先缩清单再重跑 verify 可以骗过整条链)。
+const CHECK_ONLY = process.argv.includes('--check-inputs');
 
 const repoRoot = findRepoRoot(demoDir);
 const R = (p) => (isAbsolute(p) ? p : join(repoRoot, p));
@@ -44,7 +51,7 @@ if (!existsSync(R(comp.entry))) fail(`component.entry 不存在:${R(comp.entry)}
 const assetsDir = D(comp.assetsDir ?? 'assets');
 const bundleOut = D(comp.bundle ?? 'assets/component.bundle.js');
 const cssOut = join(assetsDir, 'component.css');
-mkdirSync(assetsDir, { recursive: true });
+if (!CHECK_ONLY) mkdirSync(assetsDir, { recursive: true });
 
 /** 无扩展名路径探测(.ts/.tsx/.js/.jsx/index.*)——alias 目标常写成无后缀。 */
 function probeFile(base) {
@@ -65,7 +72,7 @@ const esc = (s) => s.replace(/[.*+?^${}()|[\]\\/@-]/g, '\\$&');
 /* workspace 包的 exports 子路径表:出口名是 kebab-case 而文件是 camelCase 时
    (如 "./brand-identity": "./src/brandIdentity.ts")只能查 package.json 的 exports,
    路径探测猜不出来。包根 = <packageRoots 值>/..(约定值指到包内 src)。
-   (二修会把读过的 package.json 记进 manifest.buildInputs 一并入链。) */
+   读过的 package.json 同样是构建输入(改 exports 会改整张图),记进 buildInputs 进链。 */
 const packageExports = {};
 const readPackageJsons = [];
 for (const [pkg, root] of Object.entries(packageRoots)) {
@@ -228,6 +235,7 @@ const entrySentinelPlugin = {
 
 const buildResult = await esbuild.build({
   metafile: true,
+  write: !CHECK_ONLY,
   entryPoints: [bootstrap],
   bundle: true,
   format: 'iife',
@@ -262,10 +270,12 @@ const buildResult = await esbuild.build({
    规范化落成 component.inputs.json:
      productInputs — 产品仓内(相对 repoRoot)的真实 bundle 输入,门 A 逐文件 sha256;
      demoInputs    — demo 内(相对 demoDir)的输入(bootstrap / shims / 本地 CSS 等);
+     buildInputs   — 构建**过程**的输入(build.mjs 自身 / tailwind config / 读过的
+                     package.json):改它们能改整张图或整份 CSS,不入链等于留后门;
    node_modules 与仓外文件不入链(第三方依赖版本由产品仓 lockfile 管,不是本工具职责),
    仅记数量供人核对。并强制 component.entry ∈ productInputs,否则构建直接失败。
 
-   规范化收在一个 normalizeInputs 里(二修会让 --check-inputs 复用同一份实现)。 */
+   规范化只有这一份实现:正常 build 与 --check-inputs 走同一个 normalizeInputs,不许两套。 */
 const toPosix = (p) => p.split(sep).join('/');
 // macOS 的 /var → /private/var 这类 symlink 会让「同一个文件」出现两种绝对路径,
 // 归属判断必须在 realpath 空间里做,否则产品输入会被误判成仓外而整体丢链。
@@ -288,12 +298,23 @@ function normalizeInputs(metafile) {
     else if (inside(repoReal, abs)) productInputs.add(toPosix(relative(repoReal, abs)));
     else skippedExternal += 1;
   }
+  // 构建期输入(不来自 metafile,是本脚本自己读/依赖的东西)
+  const buildDemo = new Set([toPosix(basename(selfFile))]);
+  if (existsSync(join(demoDir, 'extract-helpers.mjs'))) buildDemo.add('extract-helpers.mjs');
+  const buildProduct = new Set();
+  if (comp.css?.tailwindConfig) buildProduct.add(toPosix(comp.css.tailwindConfig));
+  for (const pkgJson of readPackageJsons) {
+    const abs = real(pkgJson);
+    if (inside(demoReal, abs)) buildDemo.add(toPosix(relative(demoReal, abs)));
+    else if (inside(repoReal, abs)) buildProduct.add(toPosix(relative(repoReal, abs)));
+  }
   return {
     generator: 'qa-hifi-demo/component-build',
     entry: comp.entry,
     entrySentinel: sentinelActive ? 'active' : 'unavailable',
     productInputs: [...productInputs].sort(),
     demoInputs: [...demoInputs].sort(),
+    buildInputs: { demo: [...buildDemo].sort(), product: [...buildProduct].sort() },
     skippedExternal,
   };
 }
@@ -333,6 +354,11 @@ if (entryOutBytes === 0) {
   );
 }
 
+if (CHECK_ONLY) {
+  // 独立复算模式:只把清单打到 stdout(与 component.inputs.json 可全等比对),不落任何产物
+  process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
+  process.exit(0);
+}
 writeFileSync(join(demoDir, 'component.inputs.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
 /* ── 2. 可选 CSS(产品 tailwind config;不配置也写空文件保证 <link> 不 404) ── */
@@ -362,5 +388,6 @@ console.log(JSON.stringify({
   inputsManifest: 'component.inputs.json',
   productInputs: manifest.productInputs.length,
   demoInputs: manifest.demoInputs.length,
+  buildInputs: manifest.buildInputs.demo.length + manifest.buildInputs.product.length,
   shims: Object.keys(shims),
 }, null, 2));

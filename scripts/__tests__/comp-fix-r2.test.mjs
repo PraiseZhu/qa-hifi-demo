@@ -208,3 +208,96 @@ test('#1c 手改 bundle 抹掉哨兵 → 门 B 报「bundle 不是当前 build.m
   assert.notEqual(v.status, 0, '抹掉哨兵的 bundle 居然过了');
   assert.match(readJson(join(dir, 'report.json')).gateB.failures[0].error, /运行期哨兵未在页面里出现/);
 });
+
+// ==================== #2c 输入图独立复算 ====================
+
+test('#2c 复现样本: 缩 manifest 再重跑 verify → 门 A fail 并给出 diff 摘要', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'shrink' });
+  greenDemo(dir);
+  // 攻击手法:把 Helper.ts 从清单里摘掉,让「改 Helper.ts」不再让 hash 变,然后重跑 verify
+  const m = manifestOf(dir);
+  assert.ok(m.productInputs.includes('src/components/Helper.ts'));
+  m.productInputs = m.productInputs.filter((p) => !p.endsWith('Helper.ts'));
+  writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify(m, null, 2)}\n`);
+  const v = verifyDemo(dir);
+  assert.notEqual(v.status, 0, '缩完清单重跑 verify 居然还绿(#2c 未修)');
+  const report = readJson(join(dir, 'report.json'));
+  assert.equal(report.gateA.pass, false);
+  assert.equal(report.gateA.inputsRecheck, 'mismatch');
+  assert.match(report.gateA.detail, /独立复算|不一致/);
+  assert.match(report.gateA.detail, /Helper\.ts/, '未点名被摘掉的文件');
+});
+
+test('#2c 缩 manifest 后直接手写 report 绕 verify → pr-block 同样拒(双保险)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'shrink-pr' });
+  greenDemo(dir);
+  const report = readJson(join(dir, 'report.json'));
+  const m = manifestOf(dir);
+  m.productInputs = m.productInputs.filter((p) => !p.endsWith('Helper.ts'));
+  writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify(m, null, 2)}\n`);
+  // 连 report 的 hash 段一起改成「缩链之后」的值,把 hash 一致性这道门也绕掉
+  report.inputHashes = buildInputHashes(dir, readSpec(dir));
+  writeFileSync(join(dir, 'report.json'), stableJson(report));
+  const problems = validateReportIntegrity(dir, readSpec(dir), report);
+  assert.ok(problems.some((p) => /独立复算|不一致/.test(p)), `hash 全部对得上却仍应被复算抓住:${JSON.stringify(problems)}`);
+  assert.notEqual(prBlock(dir).status, 0, 'pr-block 居然放行了缩链 demo');
+});
+
+test('#2c --check-inputs 与落盘 manifest 逐字节一致(同一份规范化实现)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'recheck-eq' });
+  assert.equal(buildDemo(dir).status, 0);
+  const check = buildDemo(dir, ['--check-inputs']);
+  assert.equal(check.status, 0, `${check.stdout}${check.stderr}`);
+  assert.equal(check.stdout.trim(), readFileSync(join(dir, 'component.inputs.json'), 'utf8').trim());
+  // --check-inputs 不许落任何产物:清单本身不被重写(mtime 之外用内容判等已足够)
+  assert.deepEqual(readJson(join(dir, 'component.inputs.json')), JSON.parse(check.stdout));
+});
+
+test('#2c 改 build.mjs → 旧 report 被拒(构建器自身入链)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'builder-chain' });
+  greenDemo(dir);
+  const m = manifestOf(dir);
+  assert.ok(m.buildInputs.demo.includes('build.mjs'), 'build.mjs 必须进 buildInputs.demo');
+  assert.equal(prBlock(dir).status, 0, '未改动时应放行');
+  const before = stableJson(buildInputHashes(dir, readSpec(dir)));
+  appendFileSync(join(dir, 'build.mjs'), '// 换一份更宽松的构建器\n');
+  assert.notEqual(stableJson(buildInputHashes(dir, readSpec(dir))), before, '改构建器居然没让 hash 变');
+  const pr = prBlock(dir);
+  assert.notEqual(pr.status, 0, '改了构建器旧 report 居然还能出块');
+  assert.match(pr.stdout + pr.stderr, /hash|不一致|重跑/);
+});
+
+test('#2c 改 tailwind config → 旧 report 被拒(CSS 输入入链)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { repo, dir } = makeFixture({ name: 'tailwind-chain' });
+  assert.equal(buildDemo(dir).status, 0);
+  // 产品仓没装 tailwindcss CLI 时不能真编 CSS,但「config 进链」这条不变量可以直接验:
+  // 把 build.mjs 现算出的清单加上 css 输入声明,hash 链必须跟着锁住那份 config。
+  const m = manifestOf(dir);
+  m.buildInputs.product = [...new Set([...m.buildInputs.product, 'tailwind.config.js'])].sort();
+  writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify(m, null, 2)}\n`);
+  const spec = readSpec(dir);
+  const before = buildInputHashes(dir, spec);
+  assert.match(before.componentSources.buildInputs.product['tailwind.config.js'], /^[0-9a-f]{64}$/, 'tailwind config 必须被真 hash');
+  writeFileSync(join(repo, 'tailwind.config.js'), 'module.exports = { theme: { colors: { brand: "#00ff00" } } };\n');
+  const after = buildInputHashes(dir, spec);
+  assert.notEqual(stableJson(after), stableJson(before), '改 tailwind config 居然没让 hash 变');
+  const report = { toolVersion: 'x', inputHashes: before };
+  assert.ok(
+    validateReportIntegrity(dir, spec, report).some((p) => /输入 hash 与当前/.test(p)),
+    '改 config 后旧 report 应被拒',
+  );
+});
+
+test('#2c 组件 demo 缺 build.mjs → fail-closed(清单无法独立复算)', (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
+  const { dir } = makeFixture({ name: 'no-builder' });
+  greenDemo(dir);
+  execFileSync('rm', [join(dir, 'build.mjs')]);
+  const problems = validateReportIntegrity(dir, readSpec(dir), readJson(join(dir, 'report.json')));
+  assert.ok(problems.some((p) => /缺 build\.mjs/.test(p)), `缺构建器未 fail-closed:${JSON.stringify(problems)}`);
+});

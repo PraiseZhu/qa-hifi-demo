@@ -61,7 +61,7 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
-| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `skippedExternal`。**代码层防伪链的真相源**——门 A 对清单里每个输入 + 清单自身逐文件 sha256；缺清单 = `NO_MANIFEST` fail-closed |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建器自身 / tailwind config / alias 读过的 package.json）/ `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都会跑 `node build.mjs --check-inputs` 用 esbuild 现算一遍再全等比对，「先缩清单再重跑 verify」当场被抓（缺 `build.mjs` 也 fail-closed——无法复算） |
 
 **「真组件直渲」不靠声明，靠运行期哨兵。** 只证明 `entry` 在 `metafile` 输入里是不够的：
 `import '<entry>'` 这种副作用导入同样让它进图、hash 入链，而界面完全可以是 bootstrap 手搓的。
