@@ -17,9 +17,11 @@ import { createRequire } from 'node:module';
 import { hashFile } from '../lib/fs-utils.mjs';
 import { makeLeaf } from '../lib/extract-helpers.mjs';
 import { validateTruth } from '../lib/schema.mjs';
+import { convertDeclarations, validateEntry, isColorValue } from '../lib/style-convert.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const WRITEBACK = join(ROOT, 'scripts/writeback.mjs');
+const STYLE_SYNC = join(ROOT, 'scripts/style-sync.mjs');
 
 function run(script, args, opts = {}) {
   return spawnSync(process.execPath, [script, ...args], {
@@ -164,5 +166,57 @@ test('makeLeaf: keyPath 记进 provenance.locatorKeyPath;坏路径拒绝', () =>
   const bad = { value: 1, provenance: { source: 'tokens.ts', locator: 'x', hash: hashFile(source), locatorKeyPath: 'tokens. .size' } };
   const badProblems = validateTruth({ g: { s: bad } }, { demoDir: dir, requireProvenance: true });
   assert.ok(badProblems.some((p) => p.includes('locatorKeyPath')), badProblems.join(';'));
+});
+
+// ============ style-sync 白名单 ============
+
+test('style-sync: padding shorthand 展开为四边 number', () => {
+  const { mechanical, rejected } = convertDeclarations([{ prop: 'padding', value: '8px 16px' }]);
+  assert.deepEqual(mechanical, { paddingTop: 8, paddingRight: 16, paddingBottom: 8, paddingLeft: 16 });
+  assert.deepEqual(rejected, []);
+});
+
+test('style-sync: passthrough 陷阱必须拒(1rem / calc / var)', () => {
+  const { mechanical, rejected } = convertDeclarations([
+    { prop: 'width', value: '1rem' },
+    { prop: 'height', value: 'calc(100% - 8px)' },
+    { prop: 'color', value: 'var(--fg)' },
+  ]);
+  assert.deepEqual(mechanical, {});
+  assert.equal(rejected.length, 3);
+  assert.match(rejected[0].reason, /非 px 单位/);
+  assert.match(rejected[1].reason, /不可静态求值/);
+  assert.match(rejected[2].reason, /不可静态求值/);
+});
+
+test('style-sync: shorthand 原子——padding 混 1rem 整条拒', () => {
+  const { mechanical, rejected } = convertDeclarations([{ prop: 'padding', value: '8px 1rem' }]);
+  assert.deepEqual(mechanical, {});
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].prop, 'padding');
+});
+
+test('style-sync: 枚举与颜色校验(block 拒、#hex 过、transform 数组过)', () => {
+  const r1 = convertDeclarations([{ prop: 'display', value: 'block' }]);
+  assert.equal(r1.rejected.length, 1);
+  const r2 = convertDeclarations([
+    { prop: 'color', value: '#FAFAFA' },
+    { prop: 'transform', value: 'translate(10px, 5px) scale(2)' },
+    { prop: 'box-shadow', value: '10px 5px 2px black' },
+  ]);
+  assert.equal(r2.mechanical.color, '#FAFAFA');
+  assert.ok(Array.isArray(r2.mechanical.transform));
+  assert.equal(r2.rejected.length, 1); // boxShadow 拒
+  assert.ok(isColorValue('rgba(0,0,0,0.2)') && isColorValue('transparent') && !isColorValue('1rem'));
+  assert.match(validateEntry('fontSize', '1rem'), /不是 number/);
+});
+
+test('style-sync CLI: --decl 输出 mechanical/rejected JSON', () => {
+  const res = run(STYLE_SYNC, ['--decl', 'padding: 8px 16px', '--decl', 'width: 1rem']);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.mechanical.paddingTop, 8);
+  assert.equal(out.rejected.length, 1);
+  assert.equal(out.summary.rejected, 1);
 });
 

@@ -186,6 +186,17 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
   一律拒转走 agent——宁可拒转不写错位置）。脚本保证：唯一定位 + 源码当前值≡truth 旧值
   （防盲写）→ 写回 → **重跑 extract round-trip 证明写回生效** → truth.json + qa-truth
   内嵌块同步更新 → 失败整体回滚。写完重跑 verify，门 A-F 绿 = 双边一致有机械证明。
+- **跨端样式换算**（一次「改值」涉双端语法差异：web `padding:8px 16px` ↔ RN
+  `paddingVertical/Horizontal`；px→数字；transform 数组化；font/textShadow/border shorthand）→
+  **style-sync.mjs 白名单换算**：
+  ```bash
+  node scripts/style-sync.mjs --decl "padding: 8px 16px" [--css-file <path>]
+  ```
+  输出 `{ mechanical: {RN 属性对象}, rejected: [{prop, value, reason}] }`——属性 ∈ RN 合法
+  样式集 ∧ 值可静态保证 RN 侧生效才进 mechanical；`1rem`/`calc()`/`var()`/grid/float 等
+  passthrough 陷阱与无对应语义项**必须**进 rejected。mechanical 属性再由 writeback 逐属性
+  写回；rejected 条目连同原因交 agent 双改。换算不写产品代码，shorthand 原子（任一片段
+  不过校验整条 rejected），防「半边机械写回、半边漂移」。
 - **结构级改动**（新增元素/布局重构/新交互/新状态）→ **agent 双改**：同一轮里既改产品代码
   又改 demo（HTML 与 React/RN 无同构映射，机械直译不存在，诚实走人智），然后 `truth.mjs --embed`
   + `verify.mjs` 闭环——门 A（extractor drift）+ 门 D（渲染绑定）+ 门 F（适配采样）就是
