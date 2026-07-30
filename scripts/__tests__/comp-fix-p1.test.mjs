@@ -367,7 +367,7 @@ test('#5 抬闸无理由 → 闸门自己拒;有理由 → 过且附贴块印出
   assert.equal(report.defaultLimitMb, 8);
   const res = runPrBlock(dir);
   assert.equal(res.status, 0, res.stdout + res.stderr);
-  assert.match(res.stdout, /⚠️ 资产 .* MB 超默认闸门 8 MB（本次生效阀 16 MB），抬闸理由：/);
+  assert.match(res.stdout, /⚠️ 资产 .* MB（可信侧现算）超默认闸门 8 MB（作者声明本次生效阀 16 MB），抬闸理由：/);
   assert.ok(res.stdout.includes(reason), '抬闸理由必须原样印在附贴块上');
 });
 

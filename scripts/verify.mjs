@@ -62,7 +62,10 @@ import {
   stableJson,
   TOOL_VERSION,
 } from './lib/fs-utils.mjs';
-import { validateSpec, validateTruth, validateCustomGateFiles, truthAt, buildVerifyCases, prefsSubsetEqual, normalizeHash } from './lib/schema.mjs';
+import { validateSpec, validateTruth, validateCustomGateFiles, truthAt, buildVerifyCases, prefsSubsetEqual, normalizeHash, countFixtureLeaves } from './lib/schema.mjs';
+/* 门字母的唯一真相源(r7 条目 7a):不许在本文件再手写一份门列表 —— 门 E 那个 CRITICAL
+   的根因就是 verify 与 pr-block 各写了一份、两份都漏了 E。 */
+import { lettersFor } from './lib/gates.mjs';
 import { createSafeStaticServer } from './lib/safe-server.mjs';
 import { launchChromium } from './lib/resolve-playwright.mjs';
 import { applyCase, freshLoad, reachTabState, replay, measureAdaptive } from './lib/replay.mjs';
@@ -85,7 +88,8 @@ function listArg(flag) {
   if (!args[i + 1]) failJson(`${flag} 需要一个逗号分隔的取值列表`);
   return args[i + 1].split(',').map((s) => s.trim()).filter(Boolean);
 }
-const GATE_LETTERS = ['A', 'B', 'C', 'D', 'F', 'X'];
+// 本文件负责的门 = TRUSTED_GATES 里 runner 为 'verify' 的那些(门 E 属 pixel-compare)
+const GATE_LETTERS = lettersFor('verify');
 const gateFilter = listArg('--gate')?.map((g) => g.toUpperCase());
 const caseFilter = listArg('--case');
 const stateFilter = listArg('--state');
@@ -855,6 +859,10 @@ try {
     demo: spec.meta?.name ?? demoDir,
     inputHashes,
     statesResult,
+    /* r7 条目 9:fixture 叶子计数在**观察前**就地统计好,进 report 由 PR 渲染器取用。
+       pr-block 原先在流程末尾重读 demo 的 truth.json —— 那是 TOCTOU 变体(demo 代码可能
+       已在中途改过它),现在末尾不再重读任何可变文件。 */
+    truthStats: { fixtureLeaves: countFixtureLeaves(truthObj) },
     coverage: { cases: cases.map((c) => ({ id: c.id, prefs: c.prefs, source: c.source, ...(c.viewport ? { viewport: c.viewport } : {}) })) },
     gateA,
     gateB,

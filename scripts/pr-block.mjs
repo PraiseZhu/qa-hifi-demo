@@ -8,8 +8,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAssetsManifest, checkDemoNoNodeModules, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
-import { countFixtureLeaves, validateSpec } from './lib/schema.mjs';
+import { validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validatePixelReport, validateReportIntegrity } from './lib/report.mjs';
+/* 门字母 ⟷ runner 的唯一机读映射 + taint 标记(r7 条目 7)。
+   本文件**不许**再手写第二份门列表 —— 门 E 那个 CRITICAL 就是两份手写清单各自漏了它。 */
+import { GATE_LETTERS, TRUSTED_GATES, gateKey, lettersFor, markTrustedRun } from './lib/gates.mjs';
+import { renderPrBlock } from './lib/pr-render.mjs';
 
 /* ══ r5 架构主线(P0-1 CRITICAL):放行依据必须由可信侧亲自算出来 ══
    总原则:**验证方绝不把 demo 目录产出的文件当作「某事已发生」的证明。**
@@ -196,6 +200,13 @@ problems.push(...pixel.problems.map((p) => `pixel(自报): ${p}`));
 // 就是这批字节"的凭据。缺报告 = 闸门没跑;hash 不符 = 跑完又换了图;ok:false = 超阀
 // 没抬闸。三者任一即阻断——否则 assets-manifest.mjs 是一条谁都可以整段跳过的自愿门。
 let assetsReport = null;
+/* ── 可信运行标记的三个盒子(r7 条目 7b) ──
+   只有 canonical runner(trusted verify / trusted pixel-compare)与 pr-block 自己的现算
+   才会给它们赋值;渲染器拿到 null 或未标记对象一律 throw。模块级声明 —— 放进块作用域
+   会让渲染处读不到(实测踩过)。 */
+let trustedVerifyBox = null;
+let trustedPixelBox = null;
+let trustedAssetsBox = null;
 if (existsSync(join(demoDir, 'assets'))) {
   const assetsReportPath = join(demoDir, ASSETS_REPORT_NAME);
   if (!existsSync(assetsReportPath)) {
@@ -251,6 +262,7 @@ if (existsSync(join(demoDir, 'assets'))) {
       if (!raised && reasonOk)
         problems.push(`assets: ${ASSETS_REPORT_NAME} 未抬闸(生效阀 ${effectiveMb}MB ≤ 默认 ${defaultMb}MB)却带了 overrideReason——报告被手改过,重跑闸门`);
       assetsReport = ar;
+      trustedAssetsBox = markTrustedRun('assets-recompute', { totalBytes: actualTotal, files: actual.length });
     }
   }
 }
@@ -267,7 +279,7 @@ if (problems.length === 0) {
      所以:先做像素观察,再去碰 demo 代码。禁止把这两段调换回去(源码契约测试锁住)。
      artifact 三图会被重跑覆盖成**可信侧生成的**那份,WARN 的人工裁决从此绑在可信产物上
      (裁决文件本身仍是作者署名的 —— 人工裁决的性质决定的,但它判的图是我们的)。 */
-  const declaredBaselines = Array.isArray(spec.baselines) ? spec.baselines.length : 0;
+    const declaredBaselines = Array.isArray(spec.baselines) ? spec.baselines.length : 0;
   if (declaredBaselines > 0) {
     const pxOut = join(mkdtempSync(join(tmpdir(), 'qa-hifi-trusted-px-')), 'report-pixel.json');
     const pxRun = spawnSync(process.execPath, [CANONICAL_PIXEL, '--demo', demoDir, '--report-out', pxOut], {
@@ -307,8 +319,9 @@ if (problems.length === 0) {
           + `\n  demo 自报:${pxClaimed}\n  可信重跑:${pxActual}`
           + '\n修法:重跑 node scripts/pixel-compare.mjs --demo <dir> 生成真实 report-pixel.json。',
         );
-      // 出块的像素结论同样取可信侧结果
+      // 出块的像素结论同样取可信侧结果,并打上可信运行标记(条目 7b)
       pixel = { present: true, problems: [], report: trustedPx };
+      trustedPixelBox = markTrustedRun('pixel', trustedPx);
     }
   }
 }
@@ -325,7 +338,7 @@ if (problems.length === 0) {
   const tail = (s) => String(s ?? '').trim().split('\n').slice(-12).join('\n').slice(-1500);
   if (run.status !== 0 || !trusted || trusted.ok !== true) {
     problems.push(
-      'trusted-verify: pr-block 在可信侧重跑 verify 门(A/B/C/D/F/X;门 E 另由 pixel-compare 重跑)未通过——'
+      `trusted-verify: pr-block 在可信侧重跑 verify 门(${lettersFor('verify').join('/')};门 ${lettersFor('pixel').join('/')} 另由 pixel-compare 重跑)未通过——`
       + `不接受 demo 目录里的 report.json 作为「verify 跑过且通过」的证明(exit=${run.status})。`
       + `\n可信侧重跑输出(尾部):\n${tail(run.stdout) || tail(run.stderr) || '(空)'}`,
     );
@@ -339,7 +352,8 @@ if (problems.length === 0) {
       ok: r.ok === true,
       partial: r.partial === true,
       entryRenderProof: r.gateB?.entryRenderProof ?? null,
-      gates: Object.fromEntries(['gateA', 'gateB', 'gateC', 'gateD', 'gateF', 'gateX'].map((k) => [k, r[k]?.pass === true])),
+      // 门集合从 TRUSTED_GATES 派生(条目 7a):runner 为 verify 的那些门,一个不许漏
+      gates: Object.fromEntries(lettersFor('verify').map((l) => [gateKey(l), r[gateKey(l)]?.pass === true])),
       gateB: `${r.gateB?.passed}/${r.gateB?.total}`,
       gateD: `${r.gateD?.passed}/${r.gateD?.total}`,
       cases: (r.coverage?.cases ?? []).map((c) => c?.id).sort(),
@@ -354,87 +368,29 @@ if (problems.length === 0) {
       );
     // 出块用的一切数字/结论都取可信侧重跑结果,不再取 demo 自报
     report = trusted;
+    trustedVerifyBox = markTrustedRun('verify', trusted);
   }
 }
 if (problems.length) failProblems(problems);
 
-const meta = spec.meta ?? {};
-const cases = report.coverage.cases ?? [];
-const lines = [];
-lines.push('### 可交互 QA demo（代替沙盒试用）');
-lines.push('');
-if (preview) lines.push(`**UI 证据（HTML 界面）**：[demo 页面预览](${preview})`);
-// URL 与后缀标注之间必须隔断:全角括号紧贴 URL 会被 GitHub autolink 吞进 href
-// 导致链接 404(2026-07-25 实踩)。用 <> 显式划定链接边界。
-if (url) lines.push(`**体验地址**：<${url}>（内网）`);
+/* ── 出块:渲染器只接受打过可信标记的结果(r7 条目 7b) ──
+   demo 自报的 report / report-pixel 从这里开始**再也不出现** —— 渲染器的签名里没有它们,
+   拿未标记的对象喂进去会直接 throw。这不是靠"记得取可信值",是靠参数结构。 */
+console.log(renderPrBlock({
+  spec,
+  trustedVerify: trustedVerifyBox,
+  trustedPixel: trustedPixelBox,
+  trustedAssets: trustedAssetsBox,
+  // 抬闸是**作者的政策输入**,不是测量证据(条目 11):分开传、分开标注
+  assetsPolicy: assetsReport?.overrideReason
+    ? {
+      overrideReason: assetsReport.overrideReason,
+      effectiveLimitMb: assetsReport.effectiveLimitMb,
+      defaultLimitMb: assetsReport.defaultLimitMb ?? DEFAULT_ASSETS_LIMIT_MB,
+    }
+    : null,
+  url,
+  preview,
+}));
 if (!preview) console.error('⚠️ 未传 --preview:.html 证据链接缺失,建议补 GitHub/GitLab 仓内 .html 链接');
-lines.push('');
-if (meta.summary) {
-  lines.push(`- **做了什么**：${meta.summary.what}`);
-  lines.push(`- **怎么做的**：${meta.summary.how}`);
-  lines.push(`- **怎么验收**：${meta.summary.accept}`);
-  lines.push('');
-}
-lines.push(`**实际执行矩阵**：${cases.map((c) => `${c.id} ${JSON.stringify(c.prefs)}`).join('；')}`);
-lines.push('');
-lines.push('| 验收门 | 结论 |');
-lines.push('|---|---|');
-lines.push('| 真值一致（数据层:truth 提取自源码,每个叶子带 provenance；渲染层由门 D 保证） | ✅ |');
-lines.push(`| 状态覆盖（实际执行 ${report.gateB.passed}/${report.gateB.total}） | ✅ |`);
-lines.push(`| 交互鲁棒（${report.gateC.checks.map((c) => c.id).join(' / ')}） | ✅ |`);
-if (report.gateD.total > 0) lines.push(`| 渲染绑定（${report.gateD.total} 条 computed-style ≡ truth） | ✅ |`);
-else lines.push('| 渲染绑定 | ⚠️ 未配置 bindings，还原承诺仅到数据层 |');
-// 组件模式:声明「真组件直渲」并给出进链的源文件数——读者一眼看出渲染不是手搓复刻
-// 组件模式:结论强度取决于运行期哨兵是否真的证明了「**声明的目标组件导出**被渲染」。
-// 'proved'(声明了 component.export 且它被调用/实例化)→ 「真组件直渲」;
-// 其余一切情形(未声明目标导出 / 目标形态套不上探针 / 只有非目标导出被调用)→ 一律降级,
-// 文案统一为「已打包 + 是否为 UI 组件需人工审查」。机械宣称做不到的事就是造假(终审 #1c)。
-if (spec.component?.mode === 'component') {
-  const srcCount = Object.keys(report.inputHashes?.componentSources?.sources ?? {}).length;
-  if (report.gateB?.entryRenderProof === 'proved')
-    lines.push(`| 真组件直渲（${srcCount} 个源文件 hash 入链，运行期哨兵实测声明的目标组件导出被渲染） | ✅ |`);
-  else
-    lines.push(
-      `| 产品模块已打包（${srcCount} 个源文件 hash 入链） | ⚠️ 运行期哨兵未证明「声明的目标组件导出被渲染」`
-      + '（未声明 component.export／目标导出形态不可探测／仅非目标导出被调用），是否为 UI 组件需人工审查 |',
-    );
-}
-if (report.gateF.total > 0) lines.push(`| 适配还原（${report.gateF.total} 点） | ✅ |`);
-else lines.push('| 适配还原（窗口拉伸行为） | ⚠️ 未配置 adaptive，拉伸未验证 |');
-if (report.gateX?.total > 0) lines.push(`| 自定义门（${report.gateX.gates.map((g) => g.id).join(' / ')}） | ✅ |`);
-if (pixel.present) {
-  const px = pixel.report;
-  if (px.skipped) lines.push('| 像素基准（vs 真沙盒截图） | ⚠️ 未采基准，像素级未比对 |');
-  else {
-    const worst = Math.max(...px.results.map((r) => r.diffRatio ?? 1));
-    const anyWarn = px.results.some((r) => r.status === 'WARN');
-    lines.push(`| 像素基准（${px.compared}/${px.declared} 组合，最大 diff ${(worst * 100).toFixed(2)}%） | ${anyWarn ? '⚠️ WARN 已附人工裁决' : '✅'} |`);
-  }
-} else {
-  lines.push('| 像素基准（vs 真沙盒截图） | ⚠️ 未运行 pixel-compare |');
-}
-lines.push('');
-// 诚实降级声明:服务端驱动的值(providers 配置等)源码里没有字面量,只能录 fixture。
-// 不阻断——但必须在 PR 上写明"这些叶子不是源码溯源",否则 reviewer 会误以为全部可回查源码。
-const fixtureLeaves = (() => {
-  const truthPath = join(demoDir, 'truth.json');
-  if (!existsSync(truthPath)) return 0;
-  try { return countFixtureLeaves(JSON.parse(readFileSync(truthPath, 'utf8'))); } catch { return 0; }
-})();
-if (fixtureLeaves > 0) {
-  lines.push(`⚠️ ${fixtureLeaves} 个叶子来自录制 fixture（非源码溯源），来源见 truth provenance`);
-  lines.push('');
-}
-// 抬闸声明:资产超默认闸门是保真度/体积的取舍,必须让 reviewer 看见理由再决定接不接受。
-// 不抬闸时这行不出现——常贴的声明就没信息量了。
-if (assetsReport?.overrideReason) {
-  const mb = (n) => (Number(n) / 1024 / 1024).toFixed(2);
-  lines.push(
-    `⚠️ 资产 ${mb(assetsReport.totalBytes)} MB 超默认闸门 ${assetsReport.defaultLimitMb ?? DEFAULT_ASSETS_LIMIT_MB} MB` +
-      `（本次生效阀 ${assetsReport.effectiveLimitMb} MB），抬闸理由：${assetsReport.overrideReason}`,
-  );
-  lines.push('');
-}
-lines.push(`<sub>由 qa-hifi-demo 生成 · 工具版本 ${report.toolVersion} · 验收时间 ${report.generatedAt}</sub>`);
 
-console.log(lines.join('\n'));
