@@ -212,12 +212,30 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     const L = [];
     L.push(`import * as __qaOrig from ${JSON.stringify(ENTRY_ORIG_SPEC)};`);
     L.push(`var __qaTarget = ${JSON.stringify(targetExport)};`);
+    /* ── 哨兵证据必须是**封印的只读量**(审核 r4 追加 #1c) ──
+       r3 把证据写在 globalThis.__QA_ENTRY_RENDERED__ / __QA_ENTRY_TARGET_RENDERED__ /
+       __QA_ENTRY_SHAPE__ 这三个公开可写的字段上,而 bootstrap 本就是允许作者编辑、
+       且已入 hash 链的输入 —— 于是「只 `globalThis.keep = Claimed` 持引用、从不调用,
+       再把两个布尔量直接写 true + 手搓 UI」能拿到 proved 与「真组件直渲」。
+       修法:计数/置位全部留在本模块闭包里(bundle 内的模块作用域,页面脚本拿不到),
+       对外只暴露一个 non-writable/non-configurable 的全局,其上只有 get-only 的
+       snapshot 访问器。demo 侧写旧字段不再有任何作用;想顶替这个全局只有两种下场:
+       抢先定义成可配置的 → 被我们覆盖;抢先定义成不可配置的 → 下面的 defineProperty
+       直接抛错、bundle 初始化失败、门 B 红(不 try/catch,就是要 fail-closed)。 */
+    L.push('var __qaRendered = false, __qaTargetRendered = false;');
     L.push('var __qaShape = { total: 0, wrappable: 0, sentinel: true, target: __qaTarget, targetWrappable: 0 };');
-    L.push('globalThis.__QA_ENTRY_SHAPE__ = __qaShape;');
     L.push('var __qaMark = function (isTarget) {');
-    L.push('  globalThis.__QA_ENTRY_RENDERED__ = true;');
-    L.push('  if (isTarget) globalThis.__QA_ENTRY_TARGET_RENDERED__ = true;');
+    L.push('  __qaRendered = true;');
+    L.push('  if (isTarget) __qaTargetRendered = true;');
     L.push('};');
+    L.push('var __qaSeal = {};');
+    L.push('Object.defineProperty(__qaSeal, "snapshot", { enumerable: false, configurable: false, get: function () {');
+    L.push('  return Object.freeze({ rendered: __qaRendered, targetRendered: __qaTargetRendered,');
+    L.push('    shape: Object.freeze({ total: __qaShape.total, wrappable: __qaShape.wrappable,');
+    L.push('      targetWrappable: __qaShape.targetWrappable, target: __qaShape.target, sentinel: true }) });');
+    L.push('} });');
+    L.push('Object.freeze(__qaSeal);');
+    L.push('Object.defineProperty(globalThis, "__QA_ENTRY_SENTINEL__", { value: __qaSeal, writable: false, configurable: false, enumerable: false });');
     L.push('var __qaFn = function (f, isTarget) { return new Proxy(f, {');
     L.push('  apply: function (t, th, a) { __qaMark(isTarget); return Reflect.apply(t, th, a); },');
     L.push('  construct: function (t, a, nt) { __qaMark(isTarget); return Reflect.construct(t, a, nt); },');
