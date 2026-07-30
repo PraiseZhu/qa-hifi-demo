@@ -57,7 +57,7 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 
 | 产物 | 作用 |
 |---|---|
-| `build.mjs` + `component-build-core.mjs` + `repo-glob.mjs` | 构建器**薄壳 + 规范正本**：core 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 输入清单；`build.mjs` 只负责落清单 + 图片落 `assets/` + 可选 tailwind CSS。三份都是 skill canonical 的逐字节拷贝，改写任一份 → 门 A fail-closed「检测到自定义构建器，需人工审查」 |
+| `build.mjs` + `component-build-core.mjs` + `repo-glob.mjs` | 构建器**薄壳 + 规范正本**：core 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 输入清单；`build.mjs` 只负责落清单 + 图片落 `assets/` + 可选 tailwind CSS（产物 `assets/component.css` 的字节由门 A 的 `--check-css` 可信侧重编复算，r6）。三份都是 skill canonical 的逐字节拷贝，改写任一份 → 门 A fail-closed「检测到自定义构建器，需人工审查」 |
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
@@ -75,8 +75,8 @@ r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_R
 「只持引用不调用 + 把布尔量写 true + 手搓 UI」当时能拿到 `proved`；r4 改成封印形态校验
 （不可写 / 只读访问器 / 对象已冻结）后，**这套形状本身是公开可仿造的**：index.html 在 bundle
 之前抢先 `defineProperty` 一个同形封印（不可配置的 `snapshot` getter），真 bundle 的
-`defineProperty` 抛错、verify 又不听 `pageerror`，于是读到的是假证据。r5 起三层叠加，全部落在
-可信侧：
+`defineProperty` 抛错、verify 又不听 `pageerror`，于是读到的是假证据。r5 起多层叠加、r6 再加一层，全部落在可信侧（真正的安全锚是前三条字节/异常层，
+第四条只是形态检查）：
 
 * **bundle 字节全等复算**：门 A 跑 skill 仓自己那份 `component-build-core.mjs --check-bundle`
   （`write:false`，不落产物、不执行 demo 目录里的任何代码）现算一遍期望产物，与磁盘上的
@@ -84,12 +84,24 @@ r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_R
   bundle**，而真 bundle 里的哨兵是真的；顺带堵死一切手改 bundle（塞手写 UI / 摘哨兵）。
 * **`pageerror` fail-closed**：verify 监听页面未捕获异常，哨兵断言处非空即硬失败——预占封印
   导致真 bundle 初始化抛错的场景在这里直接暴露（bundle 初始化**故意不 try/catch**）。
-* **不可预测 challenge**：封印上有不可写/不可配置的 `prove(nonce)`，回应原样带回 nonce；
-  verify 每次运行生成随机 nonce，并**以回应而非静态 `snapshot` 为结论来源**，回应缺失或 nonce
-  不符即硬失败。静态预置的冻结对象预知不了 nonce；要能回应就得写真函数，而那躲不过前两层。
+* **CSS 字节全等复算（r6 条目 1）**：同型的一条 —— 门 A 跑 `component-build-core.mjs
+  --check-css`，用**产品仓的 tailwind config** 把 CSS 重编到临时目录，与磁盘上的
+  `assets/component.css` 做 sha256 全等比对（未配 tailwind 时期望值是共享常量
+  `CSS_PLACEHOLDER` 的字节）。r5 之前 CSS 产物**全仓没有任何字节复算**：`buildComponentHashes`
+  / `buildAssetsManifest` 只把它的字节记进清单做「report 是否过期」检测，于是合法构建后
+  手改 `component.css`（改样式 / 删规则 / 插任意 CSS），只要不动入链的输入文件，
+  verify / pr-block 全流程零检测通过。同输入编译两遍字节不等 → 直接 fail（不静默容忍
+  不确定性）；产品仓没有 tailwindcss CLI → fail-closed 拒绝放行，不是静默跳过。
+* **`prove(nonce)` challenge —— 形态检查，不是安全锚（r6 校准）**：封印上有不可写/不可配置的
+  `prove(nonce)`，verify 每次运行生成随机 nonce 并要求回应原样带回。**它只是一次 nonce
+  回显**：nonce 由 verify 通过页面求值传进去，页面里的任何函数都能收到并原样返回，
+  所以它**不构成 secret**，也不构成「哨兵是真的」的证明 —— 审核人与 r5 修复者独立得出同一结论。
+  它的实际作用只是把「静态预置一份冻结对象」抬高成「必须写一个真函数」，而真函数躲不过
+  上面的字节复算与 `pageerror`。**真正的锚是 bundle 字节复算 + CSS 字节复算 + `pageerror`
+  fail-closed 这三条。**
 
-封印形态校验仍在（不可写 / 只读访问器 / `prove` 形态 / 对象已冻结），但它只是形态检查，
-**不再是结论的来源**。
+封印形态校验与 `prove` 回应仍在（不可写 / 只读访问器 / `prove` 形态 / 对象已冻结），
+但它们只是形态检查，**不是安全锚，也不是结论强度的来源**。
 
 判定分三种（`manifest.entrySentinel`）：
 
@@ -269,15 +281,93 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
 （历史事故:全量 verify 超时把整轮验收堵死,obs 16320）。任一过滤参数出现 →
 `report.partial=true`，**pr-block 一律拒收 partial 报告**——增量只用于调试，定稿必须全量重跑。
 
-**pr-block 定稿前会在可信侧把全门重跑一遍（r5）**：`report.json` 整份都住在 demo 目录里、
+**pr-block 定稿前会在可信侧亲自重跑（r5 立规、r6 补上门 E）**：`report.json` 整份都住在 demo 目录里、
 是被审方可写的，而 `inputHashes` 是用**可导出的** `buildInputHashes()` 对被审方自己控制的文件
 现算的——天然自洽，锁不住任何东西。所以「正常 build + 只持引用不调用 + 手搓 UI + **完全不跑
 verify** + 手写一份全 pass 的 `report.json`」曾能让 pr-block exit 0 并打出「真组件直渲」。
 r5 起 pr-block 用 **skill 仓自己那份 `verify.mjs`** 重跑 A/B/C/D/F/X（`--report-out` 写到 demo
 之外，不覆盖作者的 `report.json`），**以自己重跑的结果为唯一放行依据**；demo 的 `report.json`
-降级为仅供对账的自报材料——两者在 `ok`/`partial`/`entryRenderProof`/六门 pass/`gateB`·`gateD`
+降级为仅供对账的自报材料——两者在 `ok`/`partial`/`entryRenderProof`/A·B·C·D·F·X 六门 pass/`gateB`·`gateD`
 计数/coverage case 集上不一致即阻断。代价是定稿时会多跑一次浏览器验收（已有其它 problems 时
 跳过重跑）。
+
+**门 E 不在 `verify.mjs` 里**（`GATE_LETTERS = A/B/C/D/F/X`），r5 的可信重跑因此**漏掉了它**
+（r6 条目 2 CRITICAL）：门 E 当时的唯一校验是 `validatePixelForPr`，它全是
+`report-pixel.json` 自身字段的算术自洽（`diffRatio === bad/total`、`threshold === spec` 声明值、
+`bad <= total`、`engine` 枚举、WARN 需 adjudication + 存在的 artifact 图），**从不重新调用
+odiff/pixelmatch 对真实图片比对**。于是手写一份满足全部自洽约束的 `report-pixel.json`
+（`inputHashes` 用可导出的 `buildInputHashes()` 现算）就能让门 E 判通过 —— 基准图甚至可以
+不是 PNG，视觉回归被伪造成 PASS。r6 起：`spec.baselines` 非空时 pr-block **亲自 spawn skill
+自己那份 `pixel-compare.mjs`**（`--report-out` 写到 demo 之外），以可信结果为放行依据；
+可信结果同样过一遍完整校验（阈值 / 计数 / engine / WARN 裁决与 artifact 全绑在这份上，
+artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自报做结论对账
+（`ok`/`skipped`/`declared`/`threshold` + 每个基准的 `status`；`bad`/`total` 因重新渲染有
+像素级抖动，不做全等以免假阴性）。
+
+### 门级全表（结论进 PR 附贴块 ⇒ 必须有可信侧来源）
+
+**原则（写死）：任何结论会进 PR 附贴块的门，都必须有可信侧来源。** 没有可信来源的门不许出块。
+
+| 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
+|---|---|---|---|
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-bundle`（bundle 字节）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对 | 复算路径上不执行 demo 目录里的任何代码 |
+| B 状态覆盖 | ✅ 进（`passed/total`） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | 哨兵结论同门 |
+| C 交互鲁棒 | ✅ 进（checks 列表） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
+| D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
+| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 标注） | **pr-block 亲自 spawn canonical `pixel-compare.mjs`**（r6 条目 2；不在 verify 的门集合里） | 未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
+| F 适配还原 | ✅ 进（点数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
+| X 自定义门 | ✅ 进（gate id 列表） | pr-block 重跑 canonical `verify.mjs`；门脚本字节进 `inputHashes.customGates`，verify 后改脚本即 hash 不符 | 体外门不游离于完整性校验之外 |
+| 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 体积） | pr-block **自己**从 `assets/` 重算体积与阀值比对；`report-assets.json` 自报数字仅对账 | 见下表 |
+| 部署一致性（`--require-deployed`） | ❌ 不进附贴块（只作为出块前置条件） | pr-block 自己 fetch 线上字节与本地逐文件 sha256 比对 | |
+| 入库检查（`--require-committed`） | ❌ 不进附贴块 | pr-block 自己跑 `git ls-files` / `git status` | |
+
+### 产物全表（组件模式下"由外部工具生成"的产物）
+
+判据三档：**需可信侧复算** / **hash 输入已足够**（内容被上游锚住，改它必然让某条 hash 不符）/
+**不影响验收结论**。
+
+| 产物 | 生成者 | 判定 | 依据 |
+|---|---|---|---|
+| `assets/component.bundle.js` | esbuild（build.mjs） | **需可信侧复算** ✅ 已做（r5） | `--check-bundle` 字节全等 |
+| `assets/component.css` | tailwindcss CLI（build.mjs） | **需可信侧复算** ✅ r6 补上 | `--check-css` 字节全等；未配 tailwind 时对 `CSS_PLACEHOLDER` 字节复算 |
+| `assets/` 下 esbuild 派生资产（图片/字体 `[name]-[hash]`） | esbuild file loader | **需可信侧复算**（间接达成） | 它们是 bundle 输入图的产物：文件名含内容 hash 且被 bundle 引用，bundle 字节复算 + `inputHashes.assets` 逐文件 sha256 双向锁死；换图不重跑 = report hash 不符 |
+| `component.inputs.json` | build.mjs（esbuild metafile） | **需可信侧复算** ✅ 已做（r3） | `--check-inputs` 全等比对；清单自身也进 hash |
+| `truth.json` | demo `extract.mjs` | **需可信侧复算** ✅ 已做 | 门 A 现跑 `extract.mjs`，结果必须 ≡ `truth.json`（extractor drift）；且每个叶子带 provenance |
+| `index.html`（init 生成的组件壳 / adapter / chrome 模板产物） | `init.mjs` 模板 | **hash 输入已足够** | 进 `inputHashes['index.html']`；内嵌 `qa-truth` 块必须 ≡ `truth.json`（门 A）；渲染结论由门 B/C/D 在真浏览器里实测，不靠模板可信 |
+| `build.mjs` / `component-build-core.mjs` / `extract-helpers.mjs` / `repo-glob.mjs`（demo 侧拷贝） | init 拷贝 | **需可信侧复算**（更强：钉死） | `checkDemoBuilderIntegrity` 要求与 skill canonical 逐字节全等；且复算一律跑 skill 那份，不执行 demo 拷贝 |
+| `baselines/**.png`（像素基准图） | `capture-baseline.mjs` / 人工采集 | **hash 输入已足够 + 门 E 可信重跑** | 基准图进 `inputHashes.baselines`（换图 → report 失效）；比对本身由 pr-block 重跑 pixel-compare 亲自做。**基准图的"来源真实性"（是否真是产品沙盒截图）工具无法机械证明——这一条如实降级为需人工审查** |
+| `pixel-artifacts/*.png`（baseline/demo/diff 三图） | pixel-compare | **需可信侧复算** ✅ r6 起 | 被可信重跑覆盖成我们生成的那份，WARN 人工裁决判的是这份 |
+| `adjudications/*.json`（WARN 人工裁决） | 人工 | **不影响机械结论 / 如实标注** | 人工裁决的性质决定它由作者署名；工具只保证它判的**图**是可信生成的，并把裁决印在 PR 上让 reviewer 看见 |
+| `report.json` | verify | **不作为放行依据** | pr-block 重跑 canonical verify，自报仅对账（r5） |
+| `report-pixel.json` | pixel-compare | **不作为放行依据** | pr-block 重跑 canonical pixel-compare，自报仅对账（r6） |
+| `report-assets.json` | assets-manifest | **不作为放行依据** | 体积/阀值由 pr-block 自己重算，自报仅对账（r5 #5c） |
+| `verify-artifacts/*.png`（失败截图） | verify | **不影响验收结论** | 只为人读复现，不进任何判定 |
+
+**pr-block 直接读 demo 目录文件的位置（逐个核过，无第四第五处放行依据）**：
+
+| 位置 | 读什么 | 是放行依据还是仅对账 |
+|---|---|---|
+| `pr-block.mjs` 读 `spec.json` | 声明输入 | **放行依据**（但它是被验对象本身：schema 校验 + 进 `inputHashes`，且可信重跑读的是同一份） |
+| 读 `report.json` | 作者自报的 A-F/X 结论 | **仅对账**（结论取可信重跑） |
+| 经 `validatePixelForPr` 读 `report-pixel.json` | 作者自报的门 E 结论 | **仅对账**（结论取可信重跑） |
+| 读 `report-assets.json` | 作者自报的体积数字 | **仅对账**（阀值与体积由 pr-block 自己从 `assets/` 重算） |
+| 读 `index.html` + `assets/**` 字节 | `--require-deployed` 的本地侧 | 比对对象本身（拿它与线上字节比） |
+| 读 `truth.json`（`countFixtureLeaves`） | fixture 叶子计数 | 只用于生成"⚠️ N 个叶子来自录制 fixture"的**诚实降级声明**；内容已被门 A 的 extractor 复算锚住 |
+| `component.inputs.json` | —— | pr-block **不直接读**；由 verify / `report.mjs` 经复算与逐文件 hash 处理 |
+
+> **Tailwind content 入链集的准确性（r6 条目 3/4/5，如实标注局限）**：`component.css.content`
+> 的展开改为复用**与 Tailwind 同族的 fast-glob**，不再自研 glob 语义（自研已被证伪四次：
+> 字符类 `[ab]` → `content.relative` 基准 → `node_modules` 非对称扫描 → `***`/`a**` 语法差异）。
+> fast-glob 只从可信侧解析（`QA_HIFI_MODULE_ROOT` / `PLAYWRIGHT_MODULE_ROOT` / 产品 repoRoot；
+> **故意不含 skill 自身**——本模块会被拷进 demo，skill-self 在 demo 侧就等于 demo 目录），
+> 解析结果落在 demo 子树内一律拒收；展开时**不跳过 `node_modules`**（与 Tailwind 对齐）。
+> 仍存在的局限：① `content.relative` 用静态文本扫描判定，由 preset 间接打开时扫不出来；
+> ② 我们解析到的 fast-glob 与 Tailwind 内部那份**未必同源**（产品仓正常安装时同源，已有实跑
+> 断言；不同源时展开语义可能有版本差异）；③ tailwind config `require` 的 presets/plugins
+> 不做递归入链追踪。**这三条都只影响入链清单的精确度，不影响安全性**——它们统一由
+> `--check-css` 的 CSS 字节复算兜住：只要有人改了 Tailwind 实扫到的任何文件而不重建，
+> 可信侧现编的字节就不等于磁盘字节，门 A 直接红。受限 glob 白名单保留，但已**降级为
+> 「快速失败 + 可读报错」，不再是安全锚**。
 
 **失败取证**：任一动态门失败自动截图到 `verify-artifacts/`，failure 条目带 `screenshot`
 字段——不用再开 `--headed` 人肉复现失败现场。`verify-artifacts/` 是生成产物，不入库。

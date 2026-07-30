@@ -1,2 +1,5 @@
 node_modules/
+# 裸名(无斜杠)也要挡:worktree 里 node_modules 常是 symlink,
+# "node_modules/" 只匹配目录 —— 本轮已因此误提交过一次
+node_modules
 .DS_Store

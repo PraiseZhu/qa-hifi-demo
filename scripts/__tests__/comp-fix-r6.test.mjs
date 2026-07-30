@@ -529,3 +529,39 @@ test('条目 1 占位模式也入锚: 未配 tailwind 时手改占位 CSS 同样
   assert.notEqual(v.status, 0, '占位模式下手写 CSS 居然放行');
   assert.match(`${v.stdout}${v.stderr}`, /CSS 字节与可信侧复算结果不一致/);
 });
+
+// ==================== 条目 6 — 文档校准(两张全表 + 信任锚表述) ====================
+
+test('条目 6 文档契约(不 skip): SKILL.md 必须有门级全表与产物全表,且信任锚表述如实', () => {
+  const raw = readFileSync(join(ROOT, 'SKILL.md'), 'utf8');
+  // 全角/半角标点在文档里混用,断言前统一成半角再比,免得测的是标点风格
+  const md = raw.replace(/[，、]/g, ',').replace(/[：]/g, ':').replace(/[（]/g, '(').replace(/[）]/g, ')').replace(/[。]/g, '.');
+
+  // 两张表必须在(以后加新门/新产物有判据,不再靠人肉记)
+  assert.match(md, /### 门级全表/, '缺门级全表');
+  assert.match(md, /### 产物全表/, '缺产物全表');
+  assert.match(md, /任何结论会进 PR 附贴块的门,都必须有可信侧来源/, '门级全表必须写死这条原则');
+  // 门级全表要逐门列全 A-F/X
+  for (const letter of ['A 真值一致', 'B 状态覆盖', 'C 交互鲁棒', 'D 渲染绑定', 'E 像素基准', 'F 适配还原', 'X 自定义门']) {
+    assert.ok(md.includes(`| ${letter}`), `门级全表漏了 ${letter}`);
+  }
+  // 产物全表要逐个列出「由外部工具生成」的产物
+  for (const artifact of [
+    'assets/component.bundle.js', 'assets/component.css', 'component.inputs.json',
+    'truth.json', 'baselines/**.png', 'pixel-artifacts/*.png', 'report-pixel.json', 'report-assets.json',
+  ]) {
+    assert.ok(md.includes(artifact), `产物全表漏了 ${artifact}`);
+  }
+  // pr-block 直接读 demo 目录 json 的位置必须逐个交代
+  assert.match(md, /pr-block 直接读 demo 目录文件的位置/);
+
+  // 信任锚表述:challenge 只是 nonce 回显,不是 secret、不是安全锚
+  assert.match(md, /不构成 secret/, 'challenge 不构成 secret 这条必须写明');
+  assert.match(md, /形态检查,不是安全锚/, 'challenge 必须被明确标注为形态检查而非安全锚');
+  assert.ok(
+    !/不可预测 challenge/.test(md),
+    'SKILL.md 仍把 challenge 写成「不可预测」——它是 nonce 回显,页面函数能收到 nonce,不构成 secret',
+  );
+  // 「全门」这类不实声明不许再出现
+  assert.ok(!/把全门重跑/.test(md), 'SKILL.md 仍在声称「把全门重跑」,而 verify 的门集合不含 E');
+});
