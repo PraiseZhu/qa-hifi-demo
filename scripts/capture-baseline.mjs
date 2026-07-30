@@ -6,6 +6,8 @@
 //
 //   真沙盒采集(推荐):
 //     node capture-baseline.mjs --demo <dir> --key <key> --url <dev实例地址> --sel <帧selector> [--wait-ms 1500]
+//   Electron 真壳采集(gate-e-v2):
+//     node capture-baseline.mjs --demo <dir> --key <key> --electron-app <main入口或app目录> [--wait-ms 1500]
 //   导入既有截图(手机模拟器等无法直连的场景):
 //     node capture-baseline.mjs --demo <dir> --key <key> --from-png <截图文件>
 //
@@ -15,14 +17,17 @@
 //   - --from-png 会先渲染 demo 量帧尺寸,校验导入图尺寸 ≈ 帧CSS尺寸×DPR(容差 2px/边),
 //     尺寸不符直接拒绝——防止「随手一张图」冒充基准。
 //   - 基准来源要如实:--url 采的是你指的那个实例;指了 demo 自己的地址 = 自证,门 E 失去意义。
+//   - 分端(gate-e-v2):entry 声明 platform 时落到 baselines/<platform>/<key>.png,
+//     未声明落旧式 baselines/<key>.png;--electron-app 采集强烈建议声明 electron-mac/win。
 
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { failJson, failProblems } from './lib/fs-utils.mjs';
 import { validateSpec } from './lib/schema.mjs';
 import { createSafeStaticServer } from './lib/safe-server.mjs';
-import { launchChromium } from './lib/resolve-playwright.mjs';
+import { launchChromium, loadPlaywrightApi, resolveModule } from './lib/resolve-playwright.mjs';
 import { freshLoad, replay } from './lib/replay.mjs';
 import { loadPngApi, readPng } from './lib/png-compare.mjs';
 
@@ -35,11 +40,13 @@ const demoDir = argOf('--demo') ? resolve(argOf('--demo')) : null;
 const key = argOf('--key');
 const url = argOf('--url');
 const fromPng = argOf('--from-png');
+const electronAppArg = argOf('--electron-app');
 const waitMs = Number(argOf('--wait-ms') ?? 1500);
 if (!demoDir) failJson('缺 --demo <dir>');
 if (!key) failJson('缺 --key <baseline key>');
-if (!url && !fromPng) failJson('二选一:--url <真沙盒地址> 或 --from-png <截图文件>');
-if (url && fromPng) failJson('--url 与 --from-png 互斥');
+const modes = [url && '--url', fromPng && '--from-png', electronAppArg && '--electron-app'].filter(Boolean);
+if (modes.length === 0) failJson('三选一:--url <真沙盒地址> / --from-png <截图文件> / --electron-app <main入口或app目录>');
+if (modes.length > 1) failJson(`${modes.join(' 与 ')} 互斥,一次只能用一种采集方式`);
 
 let spec;
 try {
@@ -54,12 +61,14 @@ const entry = (spec.baselines ?? []).find((b) => b.key === key);
 if (!entry) failJson(`key "${key}" 未在 spec.baselines 声明——先声明(带 via/frameSel/mask)再采集`, 2);
 const dpr = Number(spec.baselineDpr ?? 2);
 const frameSel = entry.frameSel ?? spec.baselineFrameSel ?? '.frame';
-const baseDir = join(demoDir, 'baselines');
-const outPath = join(baseDir, `${key}.png`);
+// 分端输出:声明 platform → baselines/<platform>/<key>.png;未声明 → 旧式平铺(兼容)
+const outRel = entry.platform ? `baselines/${entry.platform}/${key}.png` : `baselines/${key}.png`;
+const outPath = join(demoDir, outRel);
 
 let browser;
 let page;
 let safeServer;
+let electronAppInst;
 try {
   if (url) {
     // 真沙盒采集:直接截产品 dev 实例的帧元素
@@ -73,13 +82,45 @@ try {
     const box = await loc.boundingBox({ timeout: 8000 });
     if (!box) failJson(`截图元素不可见:${frameSel}(确认 --sel/spec.baselineFrameSel 在沙盒页面同样成立)`, 2);
     const shot = await loc.screenshot();
-    mkdirSync(baseDir, { recursive: true });
+    mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, shot);
     console.log(JSON.stringify({
-      ok: true, mode: 'live-capture', key, out: `baselines/${key}.png`, dpr,
+      ok: true, mode: 'live-capture', key, platform: entry.platform ?? null, out: outRel, dpr,
       cssFrame: { width: box.width, height: box.height },
       source: target.href,
       note: '来源要如实:这是你指定实例的截图;下一步跑 pixel-compare.mjs 比对',
+    }, null, 2));
+  } else if (electronAppArg) {
+    // Electron 真壳采集:playwright _electron 起真实 app,截第一个窗口的帧元素。
+    // 与 --url 的差异:渲染环境是产品真实 Electron(真实 Chrome 版本/窗口配置/注入样式),
+    // 不再是 dev 实例的裸 Chromium——门 E 桌面端采集侧升级(gate-e-v2)。
+    // electron 二进制与 app 路径都从调用方环境解析(QA_HIFI_MODULE_ROOT/工作区兄弟项目)。
+    const { api } = await loadPlaywrightApi(demoDir);
+    if (typeof api?._electron?.launch !== 'function') failJson('当前 playwright 模块不含 _electron API(需要 playwright/playwright-core ≥1.9)');
+    let electronBinary;
+    try {
+      const electronPkg = resolveModule('electron', demoDir);
+      electronBinary = createRequire(electronPkg)(electronPkg); // electron 包入口导出二进制路径字符串
+    } catch (err) {
+      failJson(`解析不到 electron 二进制(装 electron,或用 QA_HIFI_MODULE_ROOT 指向含 electron 的项目):${String(err.message || err).slice(0, 200)}`);
+    }
+    const appPath = resolve(electronAppArg);
+    if (!existsSync(appPath)) failJson(`--electron-app 路径不存在:${appPath}`);
+    electronAppInst = await api._electron.launch({ executablePath: electronBinary, args: [appPath] });
+    const win = await electronAppInst.firstWindow();
+    if (waitMs > 0) await win.waitForTimeout(waitMs);
+    const loc = win.locator(frameSel).first();
+    const box = await loc.boundingBox({ timeout: 8000 });
+    if (!box) failJson(`截图元素不可见:${frameSel}(确认该 selector 在 Electron 首窗口页面成立)`, 2);
+    const shot = await loc.screenshot();
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, shot);
+    console.log(JSON.stringify({
+      ok: true, mode: 'electron-capture', key, platform: entry.platform ?? null, out: outRel,
+      cssFrame: { width: box.width, height: box.height },
+      source: appPath,
+      note: (entry.platform ? '' : '建议给该 entry 声明 platform:"electron-mac"/"electron-win"(分端基准,mac 与 win 基准永不互比);') +
+        '这是 Electron 真壳首窗口截图;下一步跑 pixel-compare.mjs 比对',
     }, null, 2));
   } else {
     // 导入模式:渲染 demo 量帧尺寸,校验导入图尺寸后落位
@@ -105,10 +146,10 @@ try {
         2,
       );
     }
-    mkdirSync(baseDir, { recursive: true });
+    mkdirSync(dirname(outPath), { recursive: true });
     copyFileSync(pngFile, outPath);
     console.log(JSON.stringify({
-      ok: true, mode: 'import', key, out: `baselines/${key}.png`, dpr,
+      ok: true, mode: 'import', key, platform: entry.platform ?? null, out: outRel, dpr,
       imported: { width: png.width, height: png.height },
       note: '导入的必须是真沙盒/真机截图;下一步跑 pixel-compare.mjs 比对',
     }, null, 2));
@@ -117,6 +158,7 @@ try {
   console.log(JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2));
   process.exitCode = 2;
 } finally {
+  try { if (electronAppInst) await electronAppInst.close(); } catch {}
   try { if (page) await page.close(); } catch {}
   try { if (browser) await browser.close(); } catch {}
   try { if (safeServer) await safeServer.close(); } catch {}

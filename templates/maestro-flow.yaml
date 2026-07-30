@@ -1,0 +1,43 @@
+# maestro-flow.yaml — 门 E 移动端截图采集 Maestro 流模板(gate-e-v2)
+#
+# 用途:驱动真 app(Expo dev client / 已构建的 .app/.apk)到目标屏并截图,
+# 输出 PNG 交给 scripts/capture-mobile.mjs 做 OS chrome 裁切 + DPR 归一化后落分端基准。
+#
+# 用法:
+#   1) 复制本文件到 demo 目录,按目标屏改 APP_ID / 链路步骤 / OUT_PNG;
+#   2) maestro test maestro-flow.yaml        # 环境变量:APP_ID、OUT_PNG、TARGET_TESTID 等
+#   3) node scripts/capture-mobile.mjs --demo <dir> --key <key> --png $OUT_PNG \
+#        --device-dpr 3 --crop-top <状态栏px>
+#
+# 硬规:
+#   - 元素定位一律用 testID(id:),不用文本/坐标——文本随 i18n 变、坐标随布局变;
+#   - 截图前必须有明确的「到达目标屏」断言(assertVisible),截错屏 = 基准污染;
+#   - 动画/加载未结束的屏,先 waitForAnimationToEnd 或显式 waitMs,防帧间抖动。
+#
+# Maestro 环境安装(best-effort):curl -Ls "https://get.maestro.mobile.dev" | bash
+# iOS 需 Xcode 模拟器;Android 需 adb + 模拟器/真机。装不上不阻塞——
+# xcrun simctl io <device> screenshot <out.png> / adb exec-out screencap -p > <out.png>
+# 产出的 PNG 同样可以喂 capture-mobile.mjs。
+
+appId: ${APP_ID}               # 例:host.exp.Exponent(Expo Go)或你的 dev client bundle id
+---
+- launchApp
+
+# —— 链路:按目标屏改写。每一步都是真实点击,不用 goto 类捷径 ——
+# 例:从登录屏进入主界面
+# - tapOn:
+#     id: "login-guest-button"
+# - assertVisible:
+#     id: "home-panel"          # 到达断言:没有它,截图无意义
+
+- tapOn:
+    id: ${TARGET_TESTID}        # 目标屏入口的 testID(按屏替换)
+- assertVisible:
+    id: ${TARGET_TESTID}        # 兜底:入口本身至少在屏上
+
+# 等动画/加载稳定(截帧间抖动 = 假漂移)
+- waitForAnimationToEnd:
+    timeout: 5000
+
+# 截图:输出 PNG 给 capture-mobile.mjs
+- takeScreenshot: ${OUT_PNG}    # 例:/tmp/qa-hifi-shots/login-ios.png

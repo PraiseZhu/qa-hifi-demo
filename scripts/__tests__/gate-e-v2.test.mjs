@@ -1,0 +1,403 @@
+// gate-e-v2.test.mjs — 门 E v2:odiff 比对内核 / 分端基准 / Electron 采集 / 移动端脚手架。
+// 独立新文件(不改 qa-hifi-demo.test.mjs),fixture 自给自足。
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { compareImages, loadPngApi, readPng } from '../lib/png-compare.mjs';
+import { buildBaselineManifest } from '../lib/fs-utils.mjs';
+
+const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+const PIXEL = join(ROOT, 'scripts/pixel-compare.mjs');
+const CAPTURE = join(ROOT, 'scripts/capture-baseline.mjs');
+const CAPTURE_MOBILE = join(ROOT, 'scripts/capture-mobile.mjs');
+const STATES = join(ROOT, 'scripts/states.mjs');
+// 集成用例需要 playwright/electron:从环境变量指向的项目解析(本地=CINDY 仓)
+const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+
+function run(script, args, opts = {}) {
+  return spawnSync(process.execPath, [script, ...args], {
+    cwd: opts.cwd ?? ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, ...(opts.env ?? {}) },
+    timeout: opts.timeout ?? 60000,
+  });
+}
+
+function tmpDemo(name = 'g2') {
+  return mkdtempSync(join(tmpdir(), `qa-hifi-g2-${name}-`));
+}
+
+// 最小合法 spec + 最小自证 HTML(契约与旧 fixture 一致:__qa 五要素 + goto(unknown) 必抛)
+function writePixelDemo({ name = 'g2', baselines, baselineDpr = 2, pixelmatchThreshold } = {}) {
+  const dir = tmpDemo(name);
+  const spec = {
+    meta: { name, summary: { what: 'what', how: 'how', accept: 'accept' } },
+    matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
+    states: [{ id: 'id', via: [{ expect: 'id' }] }],
+    verify: {
+      cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }],
+      noClip: ['.box'],
+    },
+    bindings: [{ sel: '.box', prop: 'color', truth: 'colors.text', kind: 'color' }],
+    baselineDpr,
+    ...(pixelmatchThreshold !== undefined ? { pixelmatchThreshold } : {}),
+    ...(baselines ? { baselines } : {}),
+  };
+  const truth = { colors: { text: { value: '#ff0000', provenance: { source: 'fixture', locator: 'fixture', hash: '0'.repeat(64) } } } };
+  writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
+  writeFileSync(join(dir, 'truth.json'), JSON.stringify(truth, null, 2));
+  writeFileSync(join(dir, 'index.html'), `<!doctype html><html><head><style>
+    .box{color:#ff0000}
+    #frame{width:16px;height:16px;background:#f00}
+  </style></head><body>
+  <div class="box">x</div><div id="frame" class="frame"></div>
+  <script>
+  const S={step:'id',prefs:{plat:'desk',region:'cn',os:'ios',mode:'light',lang:'zh-CN'}};
+  window.__qa={
+    current:()=>S.step,
+    goto:(id)=>{ if(id!=='id') throw new Error('unknown'); S.step=id; },
+    prefs:()=>({...S.prefs}),
+    scale:()=>1,
+    resize:(w,h)=>{},
+  };
+  </script></body></html>`);
+  return dir;
+}
+
+// 纯 JS 画 PNG(走引擎真实 PNG 编解码,不经浏览器)
+async function pngApi() {
+  return loadPngApi(ROOT);
+}
+
+function paintPng(PNG, w, h, painter) {
+  const png = new PNG({ width: w, height: h });
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const [r, g, b, a] = painter(x, y);
+      png.data[i] = r; png.data[i + 1] = g; png.data[i + 2] = b; png.data[i + 3] = a ?? 255;
+    }
+  }
+  return png;
+}
+
+function solidPng(PNG, w, h, rgba) {
+  return paintPng(PNG, w, h, () => rgba);
+}
+
+// ============ ① odiff 比对内核 ============
+
+test('odiff 与 pixelmatch 双路径同 fixture 判定一致(相同→PASS,大差异→超阈值)', async () => {
+  const { PNG, pixelmatch, odiff } = await pngApi();
+  assert.ok(pixelmatch, 'pixelmatch 应可解析');
+  assert.ok(odiff, 'odiff-bin 应可解析');
+  const W = 24, H = 24;
+  const base = solidPng(PNG, W, H, [255, 255, 255]);
+  const same = solidPng(PNG, W, H, [255, 255, 255]);
+  // 非 AA 大差异:整块 8x8 实心反色块(内部像素邻域全同色,任何 AA 检测都不会吞掉)
+  const diverged = paintPng(PNG, W, H, (x, y) => (x < 8 && y < 8 ? [0, 0, 0] : [255, 255, 255]));
+  const baseRaw = PNG.sync.write(base);
+  const threshold = 0.05; // diffRatio 判定线 5%(diverged: 64/576≈11% 必超)
+
+  for (const engine of ['odiff', 'pixelmatch']) {
+    const okRes = await compareImages({
+      PNG, pixelmatch, odiff, engine,
+      baselineRaw: baseRaw, actualRaw: PNG.sync.write(same),
+      cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+    });
+    assert.equal(okRes.status, 'OK', `${engine}: ${okRes.detail}`);
+    assert.equal(okRes.bad, 0, `${engine}: 相同图 bad 应为 0`);
+    assert.equal(okRes.engine, engine, `${engine}: 应如实记录引擎`);
+    assert.ok(0 / okRes.total <= threshold);
+
+    const diffRes = await compareImages({
+      PNG, pixelmatch, odiff, engine,
+      baselineRaw: baseRaw, actualRaw: PNG.sync.write(diverged),
+      cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+    });
+    assert.equal(diffRes.status, 'OK', `${engine}: ${diffRes.detail}`);
+    const ratio = diffRes.bad / diffRes.total;
+    assert.ok(ratio > threshold, `${engine}: 11% 大差异必须超 5% 阈值(实际 ${(ratio * 100).toFixed(2)}%,bad=${diffRes.bad})`);
+  }
+});
+
+test('AA 噪声(边缘亚像素位移)在 odiff 路径不计入 diff,关掉 antialiasing 则计入', async () => {
+  const { PNG, pixelmatch, odiff } = await pngApi();
+  const W = 24, H = 24;
+  // 白底上的黑色竖边:baseline 的 AA 灰列在 x=10,actual 灰列移到 x=11 —— 教科书级 AA 噪声
+  const base = paintPng(PNG, W, H, (x) => (x < 10 ? [0, 0, 0] : x === 10 ? [128, 128, 128] : [255, 255, 255]));
+  const act = paintPng(PNG, W, H, (x) => (x < 10 ? [0, 0, 0] : x === 10 ? [128, 128, 128] : x === 11 ? [200, 200, 200] : [255, 255, 255]));
+  const baseRaw = PNG.sync.write(base);
+  const actRaw = PNG.sync.write(act);
+
+  // 先证明 fixture 真的是 AA 型噪声:odiff 关 antialiasing → 24 个坏点全计
+  const probe = mkdtempSync(join(tmpdir(), 'qa-hifi-aa-'));
+  writeFileSync(join(probe, 'b.png'), baseRaw);
+  writeFileSync(join(probe, 'a.png'), actRaw);
+  const raw = await odiff.compare(join(probe, 'b.png'), join(probe, 'a.png'), join(probe, 'd.png'), { threshold: 0.1, antialiasing: false, outputDiffMask: true });
+  assert.equal(raw.match, false);
+  assert.equal(raw.diffCount, 24, `fixture 应含 24 个 AA 像素(实际 ${raw.diffCount})——fixture 失效,需重调`);
+
+  // 门 E odiff 路径(antialiasing:true):同一 fixture bad 必须为 0
+  const res = await compareImages({
+    PNG, pixelmatch, odiff, engine: 'odiff',
+    baselineRaw: baseRaw, actualRaw: actRaw,
+    cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+  });
+  assert.equal(res.status, 'OK', res.detail);
+  assert.equal(res.engine, 'odiff');
+  assert.equal(res.bad, 0, `AA 噪声不应计入 odiff diff(实际 bad=${res.bad})`);
+
+  // 同口径下 pixelmatch 路径(includeAA:false)也是 0 —— 两引擎对 AA 的处理语义一致
+  const resPm = await compareImages({
+    PNG, pixelmatch, odiff, engine: 'pixelmatch',
+    baselineRaw: baseRaw, actualRaw: actRaw,
+    cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+  });
+  assert.equal(resPm.bad, 0);
+});
+
+test('odiff 不可用时 auto 回退 pixelmatch(行为不变并记录 engineNote);点名 odiff 则直接报错', async () => {
+  const { PNG, pixelmatch } = await pngApi();
+  const brokenOdiff = { compare: async () => { throw new Error('spawn odiff ENOENT'); } };
+  const W = 16, H = 16;
+  const base = solidPng(PNG, W, H, [255, 255, 255]);
+  const baseRaw = PNG.sync.write(base);
+
+  const res = await compareImages({
+    PNG, pixelmatch, odiff: brokenOdiff, engine: 'auto',
+    baselineRaw: baseRaw, actualRaw: baseRaw,
+    cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+  });
+  assert.equal(res.status, 'OK', res.detail);
+  assert.equal(res.engine, 'pixelmatch');
+  assert.match(res.engineNote ?? '', /odiff 不可用/);
+  assert.equal(res.bad, 0);
+
+  await assert.rejects(
+    compareImages({
+      PNG, pixelmatch, odiff: brokenOdiff, engine: 'odiff',
+      baselineRaw: baseRaw, actualRaw: baseRaw,
+      cssSize: { width: W, height: H }, masks: [], threshold: 0.1,
+    }),
+    /ENOENT/,
+    '点名 odiff 时必须把环境问题抛出来,不许静默降级',
+  );
+});
+
+test('mask 护栏(面积上限/未遮罩下限)在 odiff 路径同样先于引擎拦截', async () => {
+  const { PNG, pixelmatch, odiff } = await pngApi();
+  const W = 16, H = 16;
+  const base = solidPng(PNG, W, H, [255, 0, 0]);
+  const baseRaw = PNG.sync.write(base);
+  const res = await compareImages({
+    PNG, pixelmatch, odiff, engine: 'odiff',
+    baselineRaw: baseRaw, actualRaw: baseRaw,
+    cssSize: { width: W, height: H },
+    masks: [[0, 0, 16, 16]], // 全遮罩
+    threshold: 0.1, maxMaskRatio: 0.25,
+  });
+  assert.equal(res.status, 'ERROR');
+  assert.match(res.detail, /mask 面积|超上限/);
+});
+
+// ============ ② 分端基准(platform) ============
+
+test('manifest 覆盖分端子目录:平铺 + <platform>/<key>.png 混合,declared 同构', async () => {
+  const { PNG } = await pngApi();
+  const dir = tmpDemo('manifest');
+  const png = PNG.sync.write(solidPng(PNG, 4, 4, [255, 0, 0]));
+  mkdirSync(join(dir, 'baselines/web'), { recursive: true });
+  mkdirSync(join(dir, 'baselines/ios'), { recursive: true });
+  writeFileSync(join(dir, 'baselines/legacy.png'), png);
+  writeFileSync(join(dir, 'baselines/web/login.png'), png);
+  writeFileSync(join(dir, 'baselines/ios/login.png'), png);
+  const spec = {
+    baselines: [
+      { key: 'legacy' },
+      { key: 'login', platform: 'web' },
+      { key: 'login', platform: 'ios' },
+    ],
+  };
+  const m = buildBaselineManifest(dir, spec);
+  assert.deepEqual(m.declared.sort(), ['ios/login', 'legacy', 'web/login']);
+  assert.deepEqual(m.files.map((f) => f.key).sort(), ['ios/login', 'legacy', 'web/login']);
+  assert.ok(m.files.every((f) => /^[0-9a-f]{64}$/.test(f.sha256)));
+});
+
+test('schema: 非法 platform 拒绝;同一 key 跨 platform 允许、同端重复拒绝', () => {
+  const bad = writePixelDemo({ name: 'bad-platform', baselines: [{ key: 'one', platform: 'webos' }] });
+  const r1 = run(STATES, ['--demo', bad]);
+  assert.equal(r1.status, 2);
+  assert.match(r1.stdout, /platform 必须是/);
+
+  const dup = writePixelDemo({
+    name: 'dup-platform',
+    baselines: [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'ios' }],
+  });
+  const r2 = run(STATES, ['--demo', dup]);
+  assert.equal(r2.status, 2);
+  assert.match(r2.stdout, /platform\+key 组合重复/);
+
+  const crossOk = writePixelDemo({
+    name: 'cross-ok',
+    baselines: [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'android' }, { key: 'one' }],
+  });
+  const r3 = run(STATES, ['--demo', crossOk]);
+  assert.equal(r3.status, 0, r3.stdout + r3.stderr);
+});
+
+test('分端目录解析:platform=web 命中 baselines/web/;旧式无 platform 命中平铺;声明了端却没图=MISSING', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 16x16 CSS 帧 × dpr2 = 32x32 纯红基准(与 fixture HTML 渲染一致)
+  const framePng = PNG.sync.write(solidPng(PNG, 32, 32, [255, 0, 0]));
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+
+  // ① 分端:platform=web,图在 baselines/web/one.png → PASS 且走 odiff
+  const d1 = writePixelDemo({ name: 'plat-web', baselines: [{ key: 'one', platform: 'web', frameSel: '#frame' }] });
+  mkdirSync(join(d1, 'baselines/web'), { recursive: true });
+  writeFileSync(join(d1, 'baselines/web/one.png'), framePng);
+  const r1 = run(PIXEL, ['--demo', d1], { env, timeout: 90000 });
+  assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+  const rep1 = JSON.parse(readFileSync(join(d1, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep1.results[0].status, 'PASS');
+  assert.equal(rep1.results[0].platform, 'web');
+  assert.equal(rep1.results[0].engine, 'odiff');
+  assert.equal(rep1.results[0].bad, 0);
+
+  // ② 旧式兼容:无 platform,图在平铺 baselines/one.png → PASS(行为与旧版一致)
+  const d2 = writePixelDemo({ name: 'plat-legacy', baselines: [{ key: 'one', frameSel: '#frame' }] });
+  mkdirSync(join(d2, 'baselines'), { recursive: true });
+  writeFileSync(join(d2, 'baselines/one.png'), framePng);
+  const r2 = run(PIXEL, ['--demo', d2], { env, timeout: 90000 });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  const rep2 = JSON.parse(readFileSync(join(d2, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep2.results[0].status, 'PASS');
+  assert.equal(rep2.results[0].platform, undefined);
+
+  // ③ 声明 platform=ios 但图只在平铺位置 → 必须 MISSING(分端不 fallback 到平铺,防张冠李戴)
+  const d3 = writePixelDemo({ name: 'plat-missing', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  mkdirSync(join(d3, 'baselines'), { recursive: true });
+  writeFileSync(join(d3, 'baselines/one.png'), framePng);
+  const r3 = run(PIXEL, ['--demo', d3], { env, timeout: 90000 });
+  assert.equal(r3.status, 2);
+  const rep3 = JSON.parse(readFileSync(join(d3, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep3.results[0].status, 'MISSING');
+  assert.match(rep3.results[0].detail, /baselines\/ios\/one\.png/);
+});
+
+// ============ ③ Electron 真壳采集 ============
+
+function writeMinimalElectronApp() {
+  const dir = tmpDemo('electron-app');
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'qa-hifi-min-app', version: '0.0.0', main: 'main.js' }));
+  // 20 行最小 app:强制 DPR2(截图尺寸可断言),加载带 .frame 的极简页
+  writeFileSync(join(dir, 'main.js'), `const { app, BrowserWindow } = require('electron');
+app.commandLine.appendSwitch('force-device-scale-factor', '2');
+app.whenReady().then(() => {
+  const win = new BrowserWindow({
+    width: 320, height: 240,
+    webPreferences: { backgroundThrottling: false },
+  });
+  const html = '<!doctype html><html><head><style>body{margin:0}.frame{width:16px;height:16px;background:#f00}</style></head><body><div class="frame"></div></body></html>';
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+});
+app.on('window-all-closed', () => app.quit());
+`);
+  return dir;
+}
+
+test('--electron-app 最小 Electron app 截图成功并落分端目录', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright + electron)');
+  const { PNG } = await pngApi();
+  const appDir = writeMinimalElectronApp();
+  const demo = writePixelDemo({
+    name: 'electron-cap',
+    baselines: [{ key: 'electron-one', platform: 'electron-mac', frameSel: '.frame' }],
+  });
+  const res = run(
+    CAPTURE,
+    ['--demo', demo, '--key', 'electron-one', '--electron-app', appDir],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 120000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.mode, 'electron-capture');
+  assert.equal(out.out, 'baselines/electron-mac/electron-one.png');
+  const outFile = join(demo, 'baselines/electron-mac/electron-one.png');
+  assert.ok(existsSync(outFile), `基准未落盘:${outFile}`);
+  const png = readPng(PNG, outFile);
+  // .frame = 16x16 CSS × force-device-scale-factor 2 = 32x32(容差 2×dpr)
+  assert.ok(Math.abs(png.width - 32) <= 4 && Math.abs(png.height - 32) <= 4, `截图尺寸异常:${png.width}x${png.height}`);
+});
+
+// ============ ④ 移动端采集脚手架(capture-mobile) ============
+
+test('capture-mobile: @3x 截图 DPR 归一化到 ×2 并落 ios 分端目录', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 模拟 @3x 真机截图:16x16 CSS 帧 × 3 = 48x48 纯红
+  const shot = join(tmpDemo('shot3x'), 'ios-shot.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 48, 48, [255, 0, 0])));
+  const demo = writePixelDemo({ name: 'mobile-3x', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '3'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.mode, 'mobile-import');
+  assert.equal(out.out, 'baselines/ios/one.png');
+  assert.deepEqual(out.normalized, { width: 32, height: 32 });
+  const png = readPng(PNG, join(demo, 'baselines/ios/one.png'));
+  assert.equal(png.width, 32);
+  assert.equal(png.height, 32);
+});
+
+test('capture-mobile: 归一化后尺寸与 demo 帧不符 → 拒收(防截错帧)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 48x48 但声称 device-dpr=2 → 不缩放,48 ≠ 32±4 → 必须拒
+  const shot = join(tmpDemo('shot-bad'), 'bad.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 48, 48, [255, 0, 0])));
+  const demo = writePixelDemo({ name: 'mobile-bad', baselines: [{ key: 'one', platform: 'android', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '2'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 2);
+  assert.match(res.stdout, /不符|拒绝作为基准/);
+  assert.ok(!existsSync(join(demo, 'baselines/android/one.png')), '拒收时不得落盘');
+});
+
+test('capture-mobile: --crop-top 裁掉状态栏后取到的必须是目标区域', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 48x96:上半绿色(状态栏)下半红色(目标帧) → --crop-top 48 后应取到纯红 48x48 → 归一化 32x32
+  const shot = join(tmpDemo('shot-crop'), 'crop.png');
+  writeFileSync(shot, PNG.sync.write(paintPng(PNG, 48, 96, (x, y) => (y < 48 ? [0, 200, 0] : [255, 0, 0]))));
+  const demo = writePixelDemo({ name: 'mobile-crop', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  const res = run(
+    CAPTURE_MOBILE,
+    ['--demo', demo, '--key', 'one', '--png', shot, '--device-dpr', '3', '--crop-top', '48'],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 90000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.cropRect, { sx: 0, sy: 48, sw: 48, sh: 48 });
+  const png = readPng(PNG, join(demo, 'baselines/ios/one.png'));
+  assert.equal(png.width, 32);
+  // 中心像素必须是红色(裁到的是下半),不是绿色——证明裁切方向正确
+  const i = (16 * 32 + 16) * 4;
+  assert.ok(png.data[i] > 200 && png.data[i + 1] < 60, `裁切结果颜色异常:(${png.data[i]},${png.data[i + 1]},${png.data[i + 2]})`);
+});

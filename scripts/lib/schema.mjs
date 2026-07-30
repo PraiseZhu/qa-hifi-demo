@@ -2,6 +2,10 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { hashFile, isPlainObject } from './fs-utils.mjs';
 
+// 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
+// 分端是「采集/存储」维度的命名空间,不是比对维度的白名单——不同 platform 的基准永不互比。
+export const BASELINE_PLATFORMS = ['web', 'electron-mac', 'electron-win', 'ios', 'android'];
+
 const PREF_KEYS = ['plat', 'region', 'os', 'mode', 'lang'];
 const MATRIX_REQUIRED = {
   plat: ['platforms'],
@@ -222,8 +226,16 @@ export function validateSpec(spec) {
     // 否则 ../../ 可读写 demo 外文件(codex 复审新 P0-B:路径穿越)。
     if (typeof b.key !== 'string' || !b.key) problems.push(`baselines[${i}].key 必须是 string`);
     else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(b.key) || b.key.includes('..')) problems.push(`baselines[${i}].key 只允许 [A-Za-z0-9._-] 且不含 "..":${b.key}`);
-    else if (baselineKeys.has(b.key)) problems.push(`baselines[${i}].key 重复:${b.key}`);
-    else baselineKeys.add(b.key);
+    // platform(分端基准,gate-e-v2):声明后基准路径 = baselines/<platform>/<key>.png;
+    // 未声明 = 兼容旧 baselines/<key>.png。不同 platform 的基准永不互比(各存各的、各比各的)。
+    else {
+      if (b.platform !== undefined && !BASELINE_PLATFORMS.includes(b.platform))
+        problems.push(`baselines[${i}].platform 必须是 ${BASELINE_PLATFORMS.join('/')} 之一:${b.platform}`);
+      // 唯一性按 platform+key 组合:同一 key 可跨端各存一份(如 ios/login 与 android/login)
+      const composite = `${b.platform ?? ''} ${b.key}`;
+      if (baselineKeys.has(composite)) problems.push(`baselines[${i}] 的 platform+key 组合重复:${b.platform ? `${b.platform}/` : ''}${b.key}`);
+      else baselineKeys.add(composite);
+    }
     if (b.frameSel !== undefined && (typeof b.frameSel !== 'string' || !b.frameSel)) problems.push(`baselines[${i}].frameSel 必须是 selector string`);
     for (const key of ['maxMaskRatio', 'minUnmaskedRatio']) {
       if (b[key] === undefined) continue;

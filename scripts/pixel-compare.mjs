@@ -13,7 +13,7 @@ import { validateSpec } from './lib/schema.mjs';
 import { createSafeStaticServer } from './lib/safe-server.mjs';
 import { launchChromium } from './lib/resolve-playwright.mjs';
 import { freshLoad, replay } from './lib/replay.mjs';
-import { comparePngs, loadPngApi, readPng, writePng } from './lib/png-compare.mjs';
+import { compareImages, loadPngApi, readPng, writePng } from './lib/png-compare.mjs';
 
 const args = process.argv.slice(2);
 const demoIdx = args.indexOf('--demo');
@@ -47,8 +47,7 @@ if (declared.length === 0) {
   process.exit(0);
 }
 
-const { PNG, pixelmatch } = await loadPngApi(demoDir);
-const baseDir = join(demoDir, 'baselines');
+const { PNG, pixelmatch, odiff } = await loadPngApi(demoDir);
 const artifactDir = join(demoDir, 'pixel-artifacts');
 let safeServer;
 let browser;
@@ -62,11 +61,16 @@ try {
 
   for (const entry of declared) {
     const item = { key: entry.key, status: 'ERROR', diffRatio: null, bad: 0, total: 0, masked: 0, detail: '' };
-    const baselinePath = join(baseDir, `${entry.key}.png`);
+    // 分端基准(gate-e-v2):声明 platform → baselines/<platform>/<key>.png;未声明 → 兼容旧平铺。
+    // 比对目标始终是 demo 渲染帧;不同 platform 的基准只各自与 demo 比,彼此永不互比。
+    if (entry.platform) item.platform = entry.platform;
+    const artKey = entry.platform ? `${entry.platform}.${entry.key}` : entry.key;
+    const baselineRel = entry.platform ? `baselines/${entry.platform}/${entry.key}.png` : `baselines/${entry.key}.png`;
+    const baselinePath = join(demoDir, baselineRel);
     try {
       if (!existsSync(baselinePath)) {
         item.status = 'MISSING';
-        item.detail = `缺少基准图 baselines/${entry.key}.png`;
+        item.detail = `缺少基准图 ${baselineRel}`;
         results.push(item);
         continue;
       }
@@ -79,17 +83,23 @@ try {
       const shot = await loc.screenshot();
       const baseline = readPng(PNG, baselinePath);
       const actual = readPng(PNG, shot);
-      const compared = comparePngs({
+      const compared = await compareImages({
         PNG,
         pixelmatch,
+        odiff,
+        engine: process.env.QA_HIFI_COMPARE_ENGINE,
         baseline,
         actual,
+        baselineRaw: readFileSync(baselinePath),
+        actualRaw: shot,
         cssSize: { width: box.width, height: box.height },
         masks: entry.mask ?? [],
         threshold: spec.pixelmatchThreshold ?? 0.1,
         maxMaskRatio: entry.maxMaskRatio ?? spec.maxMaskRatio ?? 0.25,
         minUnmaskedRatio: entry.minUnmaskedRatio ?? spec.minUnmaskedRatio ?? 0.5,
       });
+      item.engine = compared.engine ?? null;
+      if (compared.engineNote) item.engineNote = compared.engineNote;
       item.sidecar = {
         dpr: compared.dpr ?? { x: actual.width / box.width, y: actual.height / box.height },
         viewport: page.viewportSize(),
@@ -98,6 +108,7 @@ try {
         screenshot: { width: actual.width, height: actual.height },
         cssFrame: { width: box.width, height: box.height },
         sourceHash: buildInputHashes(demoDir, spec)['index.html'],
+        compareEngine: compared.engine ?? null,
       };
       if (compared.status !== 'OK') {
         item.status = 'ERROR';
@@ -111,19 +122,19 @@ try {
         item.detail = item.status === 'PASS'
           ? ''
           : `diff ${(item.diffRatio * 100).toFixed(2)}% 超阈值 ${(threshold * 100).toFixed(2)}%`;
-        const baseOut = join(artifactDir, `${entry.key}.baseline.png`);
-        const demoOut = join(artifactDir, `${entry.key}.demo.png`);
-        const diffOut = join(artifactDir, `${entry.key}.diff.png`);
+        const baseOut = join(artifactDir, `${artKey}.baseline.png`);
+        const demoOut = join(artifactDir, `${artKey}.demo.png`);
+        const diffOut = join(artifactDir, `${artKey}.diff.png`);
         mkdirSync(artifactDir, { recursive: true });
         copyFileSync(baselinePath, baseOut);
         writeFileSync(demoOut, shot);
         writePng(PNG, diffOut, compared.diff);
         item.artifacts = {
-          baseline: `pixel-artifacts/${entry.key}.baseline.png`,
-          demo: `pixel-artifacts/${entry.key}.demo.png`,
-          diff: `pixel-artifacts/${entry.key}.diff.png`,
+          baseline: `pixel-artifacts/${artKey}.baseline.png`,
+          demo: `pixel-artifacts/${artKey}.demo.png`,
+          diff: `pixel-artifacts/${artKey}.diff.png`,
         };
-        const adj = readAdjudication(demoDir, entry.key);
+        const adj = readAdjudication(demoDir, artKey);
         if (item.status === 'WARN') {
           if (adj?.ok === true) item.adjudication = adj;
           else item.detail += '; 缺人工裁决 artifact';
