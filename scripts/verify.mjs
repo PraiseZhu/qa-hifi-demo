@@ -33,7 +33,10 @@
 //      攻击可以恢复原文件让前后 hash 都自洽,主防线是 ③ 早于 ④)。
 //
 // r7 条目 4 追加(不变式 I-OBSERVE):③ 的浏览器观察**不从 demo 原地加载**,而是从验证开始时
-// 复制出去的**不可变 snapshot**(demo 之外的临时目录)提供文件。只靠时序还有一个缺口:
+// 复制出去的**不可变 snapshot**(demo 之外的临时目录)提供文件。快照建立在 ② 的三项复算**之后**、
+// ③ 的浏览器之前:复算的命题是「磁盘产物 == canonical 现算」,磁盘就是它自己的锚,不依赖快照;
+// 观察的锚才是快照。两者之间没有 demo 代码执行窗口,所以先后不影响安全性(r8 条目 B:此前 SKILL.md
+// 把这段次序写反了,已改文档并由 comp-fix-r8 源码契约锁死)。只靠时序还有一个缺口:
 // demo 侧代码不止 extract.mjs / 自定义门 —— 页面自身的脚本、以及上一轮遗留的 detached
 // 进程,都可能在浏览器观察窗口内换掉 index.html / assets。快照在「demo node_modules
 // fail-fast 之后、执行任何 demo 代码之前」建立,观察对象从此固定;快照路径不在 demo 内,
@@ -148,6 +151,50 @@ function skippedGate(name) {
   return { name, pass: false, skipped: true, detail: '本次为增量运行(--gate 过滤),该门未执行' };
 }
 
+/* r8 条目 A:豁免清单**只有这一份**,snapshot 排除 / drift 双向比对 / 页面可达性检查三处共用。
+   以前 snapshot 排除是独立定义的一张表,而没有任何东西禁止 index.html 引用被排除的路径 ——
+   于是 `<script src="verify-artifacts/x.js">` 在 snapshot 里 404、在最终交付的 demo 原地却
+   **会生效**:被验证的页面 ≠ 交付的页面,而前后 inputHashes(不覆盖这两个目录)与旧版
+   单向 snapshotDrift(只从 snapshot 一侧遍历)全都自洽 —— 观察对象与交付对象可以不同而无人发现。
+   现在三件事绑在同一份清单上:
+     ① 排除项收窄到**仅顶层**(旧代码 `rel.some(...)` 是任意层级命中,`sub/report.json`
+        这种也被漏掉);报告类只按**具体文件名**豁免,不按目录。
+     ② 页面**不得引用**任何豁免路径 —— 静态扫 index.html + 运行期记录对豁免路径的请求,命中即门 A 红。
+     ③ drift 改**双向**:snapshot→disk(删除/改写)+ disk→snapshot(新增),新增侧跳过豁免路径。
+   剩下的豁免全部是「工具自己写的」或「前置门已无条件拒掉/非交付物」,不再是任意字节的盲区。 */
+const EXEMPT_TOP_FILES = ['report.json', 'report-pixel.json', 'report-assets.json'];
+const EXEMPT_TOP_DIRS = ['verify-artifacts', 'pixel-artifacts', 'node_modules', '.git'];
+/** rel 是 demo 相对路径(/ 或 \ 分隔)。只认**顶层**命中:嵌套同名一律进 snapshot、受 drift 管。 */
+function isExemptRel(rel) {
+  const segs = String(rel).split(/[\\/]/).filter((s) => s && s !== '.');
+  if (!segs.length) return false;
+  if (segs.length === 1) return EXEMPT_TOP_FILES.includes(segs[0]) || EXEMPT_TOP_DIRS.includes(segs[0]);
+  return EXEMPT_TOP_DIRS.includes(segs[0]);
+}
+
+/** index.html 里对豁免路径的引用(静态扫描)。命中 = 被验证页面与交付页面可以不同。 */
+function exemptRefsInHtml(source) {
+  const hits = new Set();
+  // 结构化:src= / href= / srcset 里的相对路径(给得出准确报文)
+  for (const m of source.matchAll(/\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+    const raw = (m[1] ?? m[2] ?? m[3] ?? '').trim();
+    if (!raw || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#|data:)/i.test(raw)) continue;
+    const rel = raw.split(/[?#]/)[0].replace(/^\.?\//, '');
+    if (isExemptRel(rel)) hits.add(rel);
+  }
+  /* 兜住动态构造(`fetch('verify-artifacts/x.js')`、`@import`、CSS url())——属性扫描只看得见
+     声明式引用。这里对豁免路径名做整文本扫描,但**只认出现在路径起始位置**的那种:
+     前面紧跟 `/` 或单词字符时说明它是 `assets/verify-artifacts/...` 这类嵌套同名路径 ——
+     那种是进 snapshot、受 drift 管的,豁免不到它,不能误杀。 */
+  for (const name of [...EXEMPT_TOP_DIRS, ...EXEMPT_TOP_FILES]) {
+    if (name === '.git' || name === 'node_modules') continue;   // 前置门已无条件拒 / .git 名太易撞
+    const at = new RegExp(`(^|[^\\w./-])${name.replace(/[.]/g, '\\.')}(?=[/'"\\s)\\\\?#]|$)`, 'm');
+    // 已有结构化命中覆盖同一个名字时不重复列(报文更干净)
+    if (at.test(source) && ![...hits].some((h) => h === name || h.startsWith(`${name}/`))) hits.add(name);
+  }
+  return [...hits];
+}
+
 // ---------- 门 A 第一段(纯静态 + 可信侧字节复算,不执行 demo 侧代码) ----------
 // 门 A 一共四段:① 内嵌 qa-truth ≡ truth.json;② 三项可信侧字节复算(组件模式);
 // ③ truth 由 extract.mjs 现跑重算 ≡ truth.json(证明 value 真由源码提取,不是手抄
@@ -159,6 +206,20 @@ let gateAHardFail = false;
 if (!runGate('A')) gateA = skippedGate('真值一致');
 else {
   gateA = { name: '真值一致', pass: false, detail: '', provenance: 'required', extractorDrift: 'pending' };
+  /* r8 条目 A ②:页面不得引用**观察豁免路径**。这些路径不进 snapshot(或不受 drift 管),
+     引用它们 = 被验证的页面与最终交付的页面可以不同,而全链 hash 仍然自洽。 */
+  const exemptRefs = exemptRefsInHtml(html);
+  gateA.exemptPathRefs = exemptRefs.length ? exemptRefs : 'none';
+  if (exemptRefs.length) {
+    gateAHardFail = true;
+    gateA.detail = [
+      gateA.detail,
+      `index.html 引用了观察豁免路径(${exemptRefs.join('、')})——这些路径不进不可变 snapshot,`
+      + '浏览器验证时它们 404、最终交付的 demo 原地加载时却会生效:被验证的页面与交付的页面可以不同,'
+      + `而前后 inputHashes 与 snapshot 偏离比对都覆盖不到它们。\n豁免路径:${[...EXEMPT_TOP_DIRS, ...EXEMPT_TOP_FILES].join('、')}`
+      + '(工具自己的报告/取证产物)。修法:页面需要的资源一律放进 assets/ 等普通目录,不要借用这些名字。',
+    ].filter(Boolean).join('\n');
+  }
   const m = html.match(/<script[^>]*id=["']qa-truth["'][^>]*>([\s\S]*?)<\/script>/);
   if (!m) {
     gateAHardFail = true;
@@ -220,10 +281,6 @@ const needBrowser = runGate('B') || runGate('C') || runGate('D') || runGate('F')
    「生成物 / 报告 / 取证目录」—— 它们不参与渲染,复制它们只会让快照变大并把
    本轮自己写的截图也算进比对。node_modules 已在前置门无条件拒过,不可能存在。
    失败即 fail-closed:拿不到不可变观察对象就不许继续(不静默退回原地加载)。 */
-const SNAPSHOT_EXCLUDE = new Set([
-  'report.json', 'report-pixel.json', 'report-assets.json',
-  'verify-artifacts', 'pixel-artifacts', 'node_modules', '.git',
-]);
 let snapshotDir = null;
 function makeObservationSnapshot() {
   const dir = mkdtempSync(join(tmpdir(), 'qa-hifi-snapshot-'));
@@ -232,27 +289,39 @@ function makeObservationSnapshot() {
     dereference: true,
     filter: (src) => {
       if (resolve(src) === resolve(demoDir)) return true;
-      const rel = resolve(src).slice(resolve(demoDir).length + 1).split(/[\\/]/);
-      return !rel.some((seg) => SNAPSHOT_EXCLUDE.has(seg));
+      return !isExemptRel(resolve(src).slice(resolve(demoDir).length + 1));
     },
   });
   return dir;
 }
-/** 快照 ⟷ 磁盘的逐字节比对(分界线之后跑):不等 = 观察对象在验收期间被换过。 */
-function snapshotDrift() {
-  const drift = [];
+/** 目录整树的相对路径集合(文件,不含目录本身);豁免目录不进入遍历(省时,也不产生豁免项)。 */
+function listFilesRel(root) {
+  const out = [];
   const walk = (rel) => {
-    const snapAbs = rel ? join(snapshotDir, rel) : snapshotDir;
-    for (const name of readdirSync(snapAbs)) {
+    for (const name of readdirSync(rel ? join(root, rel) : root)) {
       const childRel = rel ? `${rel}/${name}` : name;
-      const sAbs = join(snapshotDir, childRel);
-      const dAbs = join(demoDir, childRel);
-      if (statSync(sAbs).isDirectory()) { walk(childRel); continue; }
-      if (!existsSync(dAbs)) { drift.push(`${childRel}(验收期间被删除)`); continue; }
-      if (hashFile(sAbs) !== hashFile(dAbs)) drift.push(`${childRel}(字节被改写)`);
+      if (statSync(join(root, childRel)).isDirectory()) {
+        if (!isExemptRel(`${childRel}/x`)) walk(childRel);   // 豁免目录整棵跳过
+      } else out.push(childRel);
     }
   };
   walk('');
+  return out;
+}
+/** 快照 ⟷ 磁盘的**双向**逐字节比对(分界线之后跑):不等 = 观察对象与交付对象已经不是一份。 */
+function snapshotDrift() {
+  const drift = [];
+  // ① snapshot → disk:删除 / 字节改写
+  for (const rel of listFilesRel(snapshotDir)) {
+    const dAbs = join(demoDir, rel);
+    if (!existsSync(dAbs)) { drift.push(`${rel}(验收期间被删除)`); continue; }
+    if (hashFile(join(snapshotDir, rel)) !== hashFile(dAbs)) drift.push(`${rel}(字节被改写)`);
+  }
+  // ② disk → snapshot:运行期新增的页面可达文件(旧版单向遍历完全看不见这一类)
+  for (const rel of listFilesRel(demoDir)) {
+    if (isExemptRel(rel)) continue;                       // 工具自己写的报告 / 取证目录
+    if (!existsSync(join(snapshotDir, rel))) drift.push(`${rel}(验收期间新增)`);
+  }
   return drift;
 }
 let safeServer;
@@ -845,6 +914,22 @@ try {
     /* I-OBSERVE 的收口比对:快照(观察对象)与磁盘逐字节比对。比单纯的 hash-vs-hash 更强 ——
        快照住在 demo 之外,demo 侧代码碰不到它,所以「改了又恢复」在这里同样无处可藏的前提是
        改动发生在快照建立之后且未复原;真正的保证仍来自「观察对象一开始就固定了」。 */
+    /* r8 条目 A ②(运行期兜底):页面在观察期间实际请求过豁免路径 = 它依赖 snapshot 里没有的
+       字节。静态扫描看不见动态构造的 URL,这里看得见 —— 请求打到服务的是 snapshot,
+       所以命中的往往是一次 404,而交付原地却能取到真文件。 */
+    const exemptHits = [...new Set((safeServer?.requestedPaths() ?? [])
+      .filter((r) => isExemptRel(r.path))
+      .map((r) => `${r.path}(HTTP ${r.status})`))];
+    gateA.exemptPathRequests = exemptHits.length ? exemptHits.slice(0, 10) : 'none';
+    if (exemptHits.length) {
+      gateA.pass = false;
+      gateA.detail = [
+        gateA.detail,
+        `页面在观察期间请求了观察豁免路径(${exemptHits.slice(0, 5).join('、')})——`
+        + '这些路径不在不可变 snapshot 里,验证时取不到、交付原地却能取到:被验证的页面与交付的页面不同。'
+        + '\n修法:页面需要的资源一律放进 assets/ 等普通目录。',
+      ].filter(Boolean).join('\n');
+    }
     const drift = snapshotDrift();
     gateA.snapshotDrift = drift.length ? drift.slice(0, 10) : 'none';
     if (drift.length) {
