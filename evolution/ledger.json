@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "fingerprint": "repo-root-depth-assumption",
+      "tier": "auto",
+      "title": "extract.mjs 用目录深度推 repoRoot,demo 搬家即断",
+      "detail": "2026-07-29 login-all-hifi:demo 从 _tmp/ 迁 docs/design-previews/ 后 repoRoot/provenance 前缀全断,一天连修 3 个 bug",
+      "proposal": "extract-helpers.findRepoRoot() 走 git rev-parse;init 把 helpers 拷进 demo 自包含",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:28.759Z",
+      "lastSeen": "2026-07-30T06:33:28.759Z"
+    },
+    {
+      "fingerprint": "verify-no-incremental-mode",
+      "tier": "auto",
+      "title": "verify 只能全量重跑,大矩阵下修一处也要等全套,曾直接超时",
+      "detail": "2026-07-29 门 A-F 全量运行超时阻塞整轮验收(obs 16320)",
+      "proposal": "--gate/--case/--state 增量过滤;partial 报告标记并被 pr-block 拒收",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:28.791Z",
+      "lastSeen": "2026-07-30T06:33:28.791Z"
+    },
+    {
+      "fingerprint": "unregistered-out-of-band-gates",
+      "tier": "auto",
+      "title": "demo 自建体外 gate 脚本游离防伪链,跑没跑 pr-block 不知道",
+      "detail": "3 个真实 demo 自建 overlap-gate/interaction-gate/render 脚本,不进 report 与 hash 链",
+      "proposal": "spec.customGates 注册 → verify 门 X 统一执行,脚本 hash 计入 inputHashes",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:28.845Z",
+      "lastSeen": "2026-07-30T06:33:28.845Z"
+    },
+    {
+      "fingerprint": "demo-contract-reimplemented",
+      "tier": "auto",
+      "title": "__qa 合约与 chrome 工具区每个 demo 重新实现,写法漂移",
+      "detail": "10 个 demo 写出 10 种偏好切换器,replay.clickPref 被迫猜 7 种 selector",
+      "proposal": "templates/qa-chrome.js 标准运行时 + init.mjs 脚手架内联",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:28.889Z",
+      "lastSeen": "2026-07-30T06:33:28.889Z"
+    },
+    {
+      "fingerprint": "mobile-case-desktop-viewport",
+      "tier": "auto",
+      "title": "移动端 case 在 1440×960 桌面视口下验收,截断/适配结论不成立",
+      "detail": null,
+      "proposal": "verify.cases[].viewport{w,h,dpr},verify 为该 case 换页",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:28.937Z",
+      "lastSeen": "2026-07-30T06:33:28.937Z"
+    },
+    {
+      "fingerprint": "baseline-capture-manual-toil",
+      "tier": "auto",
+      "title": "门 E 基准图采集全手工,导致门 E 长期零使用",
+      "detail": null,
+      "proposal": "capture-baseline.mjs:--url 真沙盒直采 / --from-png 导入(尺寸×DPR 校验)",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:29.000Z",
+      "lastSeen": "2026-07-30T06:33:29.000Z"
+    },
+    {
+      "fingerprint": "verify-failure-no-artifact",
+      "tier": "auto",
+      "title": "验收失败只有 300 字文字,复现现场要人肉开 --headed",
+      "detail": null,
+      "proposal": "失败自动截图 verify-artifacts/,failure 条目带 screenshot",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:29.053Z",
+      "lastSeen": "2026-07-30T06:33:29.053Z"
+    },
+    {
+      "fingerprint": "drift-check-per-demo-manual",
+      "tier": "auto",
+      "title": "漂移检查只能逐 demo 手跑,demo 一多必然漏检",
+      "detail": "10 个 demo 要手跑 10 次 --check;预检未挂,产品常量一改全部静默过期",
+      "proposal": "truth.mjs --check --all <root> 批量 + 挂进 cindy-pr-preflight",
+      "status": "landed",
+      "commit": "b173ced",
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T06:33:29.107Z",
+      "lastSeen": "2026-07-30T06:33:29.107Z"
+    }
+  ]
+}
