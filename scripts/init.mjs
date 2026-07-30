@@ -13,9 +13,9 @@
 //   index.html          demo-shell 模板 + 内联标准 qa-chrome 运行时(__qa 合约的唯一标准实现)
 //
 // 额外生成(--mode component,真组件直渲;界面不手写,esbuild 打真实产品组件):
-//   spec.json           多一个 component 段(entry/shims/packageRoots/themeVars/fixtures/driver)
+//   spec.json           多一个 component 段(mode/entry/sources/shims/packageRoots/themeVars/fixtures)
 //   build.mjs           组件构建器(esbuild bundle + 图片落 assets/ + 可选 tailwind CSS)
-//   src/bootstrap.tsx   装配入口:import 真组件,经 window.__qaDemo.inject(driver) 交给 adapter
+//   src/bootstrap.tsx   装配入口:import 真组件,Object.assign(window.__qaDemo, {states,mount,inject,onPrefs})
 //   shims/              替身层骨架(README 硬规 + _template.ts 空骨架)
 //   index.html          组件壳:内联 adapter 标记段 + <script src="assets/component.bundle.js">
 //
@@ -38,8 +38,12 @@ if (!dir) failJson('缺 --dir <demo-dir>');
 const updateChrome = args.includes('--update-chrome');
 const updateAdapter = args.includes('--update-adapter');
 
-const chromeJs = readFileSync(join(SKILL_ROOT, 'templates/qa-chrome.js'), 'utf8');
-const adapterJs = readFileSync(join(SKILL_ROOT, 'templates/qa-component-adapter.js'), 'utf8');
+/* 内联进 <script> 的代码里出现裸的 `</script` 会被 HTML 分词器提前截断脚本
+   (2026-07-30 集成实测:adapter 头注释里的一处结束标签让整段 adapter 报
+   SyntaxError,页面只剩 chrome 抛「renderApp 必填」)。统一在内联时转义。 */
+const inlineSafe = (code) => code.replaceAll('</script', '<\\/script');
+const chromeJs = inlineSafe(readFileSync(join(SKILL_ROOT, 'templates/qa-chrome.js'), 'utf8'));
+const adapterJs = inlineSafe(readFileSync(join(SKILL_ROOT, 'templates/qa-component-adapter.js'), 'utf8'));
 
 /** 只替换 index.html 里某个标记段(chrome / adapter 共用一套语义)。 */
 function replaceMarkedBlock(marker, code, flag) {
@@ -104,12 +108,12 @@ const spec = {
   verify: {
     cases: isComponent
       ? [
-          { id: 'desktop-cn-light', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' }, via: [] },
-          { id: 'desktop-cn-dark', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'dark', lang: 'zh-CN' }, via: [] },
+          { id: 'desktop-cn-light', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' } },
+          { id: 'desktop-cn-dark', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'dark', lang: 'zh-CN' } },
         ]
       : [
-          { id: 'desktop-cn-light', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' }, via: [] },
-          { id: 'mobile-cn-dark', prefs: { plat: 'mobile', region: 'cn', os: 'mac', mode: 'dark', lang: 'zh-CN' }, via: [], viewport: { w: 390, h: 844, dpr: 3 } },
+          { id: 'desktop-cn-light', prefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' } },
+          { id: 'mobile-cn-dark', prefs: { plat: 'mobile', region: 'cn', os: 'mac', mode: 'dark', lang: 'zh-CN' }, viewport: { w: 390, h: 844, dpr: 3 } },
         ],
     noClip: ['.frame'],
   },
@@ -119,8 +123,13 @@ const spec = {
 // component 段:组件模式的全部构建/驱动配置(build.mjs 与 adapter 都只读这里)
 if (isComponent) {
   spec.component = {
+    // 组件模式标记(schema 硬校验;adapter 也校验 __qaDemo.mode)
+    mode: 'component',
     // 真组件入口(相对 repoRoot):供人核对 + 门 A 把组件源文件 hash 计入防伪链
     entry,
+    // 代码层防伪链:要锁住的产品源文件/glob(相对 repoRoot)。默认只锁 entry,
+    // 作者应把组件树里真正参与渲染的目录加进来(如 '<组件目录>/**/*.tsx')。
+    sources: [entry],
     bootstrap: 'src/bootstrap.tsx',
     bundle: 'assets/component.bundle.js',
     assetsDir: 'assets',
@@ -134,30 +143,32 @@ if (isComponent) {
     ],
     // 可选:产品 tailwind 编译(不配置则 assets/component.css 是占位空文件)
     css: null,
-    // 主题桥:色值 token 由 extract.mjs 提到 truth.<truthPath>,bootstrap 运行时应用
+    // 主题桥:色值 token 由 extract.mjs 提到 truth.<truthPath>,adapter 运行时应用
+    // (adapter 当前固定读 truth.themeVars,改这里的 truthPath 也要同步 adapter)
     themeVars: { truthPath: 'themeVars' },
     // 只在服务端响应里存在的数据:如实声明为 fixture,不许塞进 truth 冒充源码真值
     fixtures: [
       // { "id": "providers", "why": "登录方式配置来自服务端,源码里没有", "shape": "ProviderConfig" }
     ],
-    // driver 合约:bundle 经 window.__qaDemo.inject(driver) 交给 adapter
-    driver: {
-      // 只能经真实交互(via 链路)到达的状态 id——组件局部 useState 的子视图必须列这里
-      viaOnlyStates: [],
-    },
   };
+  // 状态怎么被驱动:写在 states[].driver('inject' = adapter 调 __qaDemo.inject(id) 直达;
+  // 'via' = 组件局部 useState,只能真实交互到达)。组件模式默认给 entry 标 inject。
+  spec.states = [{ id: 'entry', driver: 'inject', via: [{ expect: 'entry' }] }];
 }
 writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2) + '\n');
 
 // 组件模式额外的 extract TODO:主题桥色值必须从产品 token 源提取(带 provenance),
 // 不许在 bootstrap 里手写色值——那等于把「手抄漂移」搬进组件模式
 const THEME_VARS_TODO = `// TODO(主题桥,组件模式必做):把产品 token 源里的色值提成 truth.themeVars。
-//   要求:light/dark 两份 CSS 变量串(\`--id:value;...\`),值直取产品源码(如 themes/colors.ts
-//   的 registerColor 全表),并用 makeLeaf 带上 provenance;运行时由 src/bootstrap.tsx 的
-//   applyTheme 复刻产品 applyTheme 语义(重写 style#theme-vars + 切 html.dark)。
+//   用 extractThemeVars()——它逐个 token 产出带 provenance 的叶子(token 优先形状
+//   { '<token>': { light: <leaf>, dark: <leaf> } }),正是 adapter 认的形状之一;
+//   不要手写色值,也不要自己拼 CSS 变量串(串起来就没有逐 token provenance 了)。
+//   运行时由内联 adapter 复刻产品 applyTheme 语义(重写 style#theme-vars + 切 html.dark),
+//   bootstrap 不碰主题。
 //   提取数量要有下界断言(如 < 50 个 token 直接抛错),防正则改版后静默提空。
-// truth.themeVars = { light: makeLeaf(lightVars, tokenSrc, { locator: 'registerColor 全表 light' }),
-//                     dark:  makeLeaf(darkVars,  tokenSrc, { locator: 'registerColor 全表 dark' }) };`;
+// const themeVars = extractThemeVars(join(repoRoot, '<产品 colors.ts>'), { prefix: undefined });
+// if (Object.keys(themeVars).length < 50) throw new Error('themeVars 提取异常(< 50 token)');
+// truth.themeVars = themeVars;`;
 
 // extract.mjs 样板:repoRoot 走 git(2026-07-29 三连 bug 的固化修正),provenance 走工厂
 const extractSrc = `#!/usr/bin/env node
@@ -219,10 +230,10 @@ console.log(JSON.stringify({
   next: isComponent
     ? [
         '0. coupling 侦察:确认组件 render 期不碰 IPC/网络/原生能力,列出必须 shim 的依赖',
-        '1. 填 spec.json component 段(rendererRoot/packageRoots/shims/css),写 shims/*',
-        '2. 写 src/bootstrap.tsx(import 真组件 + driver 注入),node build.mjs 出 bundle',
-        '3. 写 extract.mjs(含 themeVars 主题桥),跑 truth.mjs --demo <dir> --embed',
-        '4. 填 spec.states 与 index.html __qaDemo.states(两边一致),node scripts/states.mjs && verify.mjs',
+        '1. 填 spec.json component 段(sources/rendererRoot/packageRoots/shims/css),写 shims/*',
+        '2. 写 src/bootstrap.tsx(import 真组件,Object.assign 出 states/mount/inject),node build.mjs 出 bundle',
+        '3. 写 extract.mjs(含 extractThemeVars 主题桥),跑 truth.mjs --demo <dir> --embed',
+        '4. spec.states[].driver 与 bootstrap 的 __qaDemo.states 键集一致,node scripts/states.mjs && verify.mjs',
       ]
     : [
         '1. 写 extract.mjs(P1 真值提取),跑 truth.mjs --demo <dir> --embed',

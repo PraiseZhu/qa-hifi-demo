@@ -59,7 +59,9 @@ test('spec.component 骨架字段齐全,entry 原样写入,平台收窄为 deskt
   const spec = JSON.parse(readFileSync(join(dir, 'spec.json'), 'utf8'));
   const comp = spec.component;
   assert.ok(comp, '缺 component 段');
+  assert.equal(comp.mode, 'component', 'schema 硬要求 component.mode');
   assert.equal(comp.entry, ENTRY);
+  assert.deepEqual(comp.sources, [ENTRY], '防伪链默认锁 entry(作者再扩)');
   assert.equal(comp.bootstrap, 'src/bootstrap.tsx');
   assert.equal(comp.bundle, 'assets/component.bundle.js');
   assert.equal(comp.assetsDir, 'assets');
@@ -68,11 +70,24 @@ test('spec.component 骨架字段齐全,entry 原样写入,平台收窄为 deskt
   assert.deepEqual(comp.fixtures, []);
   assert.equal(comp.css, null);
   assert.equal(comp.themeVars.truthPath, 'themeVars');
-  assert.deepEqual(comp.driver.viaOnlyStates, []);
+  // driver 段已下线:状态驱动方式的单一真相源是 states[].driver
+  assert.equal('driver' in comp, false, 'component.driver 应已移除(与 states[].driver 重复)');
+  assert.deepEqual(spec.states, [{ id: 'entry', driver: 'inject', via: [{ expect: 'entry' }] }]);
   // RN 不在方案范围:matrix 只留 desktop,verify cases 也不出现 mobile
   assert.deepEqual(spec.matrix.platforms, ['desktop']);
   assert.deepEqual(spec.verify.cases.map((c) => c.prefs.plat), ['desktop', 'desktop']);
   assert.deepEqual(spec.verify.cases.map((c) => c.prefs.mode), ['light', 'dark']);
+});
+
+test('生成的 spec.json 直接过 validateSpec(两种模式;脚手架不许一出生就非法)', async () => {
+  const { validateSpec } = await import(join(ROOT, 'scripts/lib/schema.mjs'));
+  const { dir } = initComponent('schema');
+  const compSpec = JSON.parse(readFileSync(join(dir, 'spec.json'), 'utf8'));
+  assert.deepEqual(validateSpec(compSpec), [], '组件模式脚手架 spec 不合法');
+
+  const classicDir = join(tmpDir('schema-classic'), 'demo');
+  run(INIT, ['--dir', classicDir, '--name', 'classic-demo']);
+  assert.deepEqual(validateSpec(JSON.parse(readFileSync(join(classicDir, 'spec.json'), 'utf8'))), []);
 });
 
 test('组件壳 index.html:adapter 与 chrome 两个标记段都在位,且引用 bundle/css', () => {
@@ -87,20 +102,49 @@ test('组件壳 index.html:adapter 与 chrome 两个标记段都在位,且引用
   assert.ok(!html.includes('{{NAME}}') && !html.includes('{{PR}}'));
   assert.ok(html.includes('src="assets/component.bundle.js"'), '缺 bundle script 引用');
   assert.ok(html.includes('href="assets/component.css"'), '缺 component.css 引用');
-  // adapter 段先于 bundle 加载(inject 必须在 bundle 执行前定义好)
-  assert.ok(html.indexOf('QA_COMPONENT_ADAPTER_END') < html.indexOf('src="assets/component.bundle.js"'));
+  // 内联顺序硬性:truth → 基础配置 → bundle → adapter → chrome
+  // (adapter 要读 bundle 装配好的 __qaDemo.mount/states,必须在 bundle 之后)
+  const iTruth = html.indexOf('id="qa-truth"');
+  const iBase = html.indexOf('window.__qaDemo');
+  const iBundle = html.indexOf('src="assets/component.bundle.js"');
+  const iAdapter = html.indexOf('QA_COMPONENT_ADAPTER_BEGIN');
+  const iChrome = html.indexOf('QA_CHROME_BEGIN');
+  assert.ok(iTruth < iBase && iBase < iBundle && iBundle < iAdapter && iAdapter < iChrome,
+    `内联顺序错:truth=${iTruth} base=${iBase} bundle=${iBundle} adapter=${iAdapter} chrome=${iChrome}`);
+  assert.ok(/mode:\s*'component'/.test(html.slice(iBase, iBundle)), '基础配置段缺 mode: component');
   // 组件模式不手写 renderApp
   assert.ok(!/renderApp\s*\(ctx\)\s*\{/.test(html.slice(0, html.indexOf('QA_COMPONENT_ADAPTER_BEGIN'))));
 });
 
-test('bootstrap 模板含 window.__qaDemo.inject 接线点与 driver 四件接口', () => {
+test('内联段不含裸 </script(否则 HTML 分词器把脚本截断,页面死在半截 adapter)', () => {
+  const { dir } = initComponent('inline-safe');
+  const html = readFileSync(join(dir, 'index.html'), 'utf8');
+  const inline = html.split('<script src=');
+  // 每个内联块里都不许出现裸的结束标签;模板里的示例结束标签必须被转义成 <\/script
+  const adapterBlock = html.slice(html.indexOf('QA_COMPONENT_ADAPTER_BEGIN'), html.indexOf('QA_COMPONENT_ADAPTER_END'));
+  assert.ok(!adapterBlock.includes('</script'), 'adapter 内联段出现裸 </script');
+  const chromeBlock = html.slice(html.indexOf('QA_CHROME_BEGIN'), html.indexOf('QA_CHROME_END'));
+  assert.ok(!chromeBlock.includes('</script'), 'chrome 内联段出现裸 </script');
+  assert.ok(inline.length >= 2, 'index.html 应引用外部 bundle');
+});
+
+test('verify.cases 不带 via(via:[] 会跳过偏好点击,非默认 case 必然 prefs mismatch)', () => {
+  const { dir } = initComponent('cases-no-via');
+  const spec = JSON.parse(readFileSync(join(dir, 'spec.json'), 'utf8'));
+  for (const c of spec.verify.cases) assert.equal('via' in c, false, `case ${c.id} 不该带 via`);
+});
+
+test('bootstrap 模板按 adapter 合约装配 __qaDemo(states/mount/inject/onPrefs)', () => {
   const { dir } = initComponent('bootstrap');
   const src = readFileSync(join(dir, 'src/bootstrap.tsx'), 'utf8');
-  assert.ok(src.includes('window.__qaDemo.inject(driver)'), '缺 inject 接线点');
-  for (const fn of ['mount(', 'update(', 'goto(', 'setLang(']) assert.ok(src.includes(fn), `driver 缺 ${fn}`);
+  assert.ok(src.includes('Object.assign(window.__qaDemo'), '缺 __qaDemo 装配接线点');
+  for (const fn of ['states:', 'mount(ctx', 'inject(id', 'onPrefs(prefs']) assert.ok(src.includes(fn), `合约缺 ${fn}`);
+  // adapter 接管主题与渲染:bootstrap 不许自带 renderApp / applyTheme(否则两份实现)
+  assert.ok(!src.includes('renderApp'), 'bootstrap 不该出现 renderApp(adapter 合成)');
+  assert.ok(!/function applyTheme|applyTheme\(/.test(src), 'bootstrap 不该做主题桥(adapter 接管)');
+  assert.ok(src.includes('ctx.root'), 'mount 应挂到 adapter 给的 ctx.root');
   assert.ok(src.includes('comp-demo'), '{{NAME}} 未替换');
   assert.ok(!src.includes('{{NAME}}'));
-  assert.ok(src.includes('themeVars'), '缺主题桥接线');
 });
 
 test('extract.mjs 组件模式带 themeVars TODO 段;经典模式不带', () => {
@@ -108,6 +152,7 @@ test('extract.mjs 组件模式带 themeVars TODO 段;经典模式不带', () => 
   const comp = readFileSync(join(dir, 'extract.mjs'), 'utf8');
   assert.ok(comp.includes('TODO(主题桥,组件模式必做)'), '缺 themeVars TODO 段');
   assert.ok(comp.includes('truth.themeVars'));
+  assert.ok(comp.includes('extractThemeVars'), 'themeVars TODO 应指向 extractThemeVars(不许手拼变量串)');
 
   const classicDir = join(tmpDir('extract-classic'), 'demo');
   run(INIT, ['--dir', classicDir, '--name', 'classic-demo']);

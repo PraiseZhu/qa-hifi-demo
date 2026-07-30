@@ -195,3 +195,56 @@ truth 结构(每个模式各一个标准叶子,直接过 `validateTruth`):
 - token 顺序 = 源码注册顺序(可复现,门 A 重跑 extract 不漂移);
 - `bindings.truth` 引用写 `themeVars.<token>.light` / `themeVars.<token>.dark`(token 名含连字符不含点,
   与点分路径不冲突)。
+
+## spec.component(组件模式声明,2026-07-30 起)
+
+只有真组件直渲 demo 才有这一段;经典(手写 HTML 复刻)demo 一律不写。
+
+```jsonc
+"component": {
+  "mode": "component",                       // 必填,固定值
+  "entry": "apps/desktop/src/renderer/components/login/LoginPage.tsx",  // 相对 repoRoot
+  "sources": [                               // 必填非空:代码层防伪链锁定的源文件/glob
+    "apps/desktop/src/renderer/components/login/**/*.tsx",
+    "packages/auth-client/src/types.ts"
+  ],
+  "bundle": "assets/component.bundle.js",    // demo 内构建产物(hash 入链)
+  "bootstrap": "src/bootstrap.tsx",          // demo 内装配入口(esbuild entryPoint)
+  "assetsDir": "assets",
+  "rendererRoot": "apps/desktop/src/renderer",  // '@/' 别名基准;不用别名写 null
+  "packageRoots": { "@cindy/auth-client": "packages/auth-client/src" },
+  "shims": [
+    { "spec": "@/hooks/useLogin", "file": "shims/useLogin.ts", "why": "render 期走 IPC,浏览器里无处可挂" }
+  ],
+  "fixtures": [
+    { "id": "providers", "why": "登录方式配置来自服务端,源码里没有字面量", "shape": "ProviderConfig" }
+  ],
+  "themeVars": { "truthPath": "themeVars" },
+  "css": { "tailwindConfig": "apps/desktop/tailwind.config.ts", "content": ["apps/desktop/src/renderer/components/login/**/*.tsx"] },
+  "target": "chrome120"                      // 可选,esbuild target
+}
+```
+
+约定与边界:
+
+- `entry` / `sources[]` / `rendererRoot` / `packageRoots` / `css.tailwindConfig` 相对 **repoRoot**;
+  `bundle` / `bootstrap` / `assetsDir` / `shims[].file` 相对 **demo 目录**。一律禁 `..`、绝对路径、反斜杠;
+- `sources` 为空 = FAIL:声明了组件模式就必须锁源,否则改产品组件而 demo 不重构建,旧 report 照样过;
+- `shims[].why` / `fixtures[].why` 必填——写不出理由的替身不该存在(替身是保真度让步,必须留痕);
+- **没有 `component.driver`**:状态怎么被驱动只写 `states[].driver`(`"inject"` / `"via"`)。
+  两处声明必然漂移,单一真相源在 `states[]`(2026-07-30 集成调和;旧 `component.driver` 直接报错);
+- `css` 为 `null` 时 build 仍写出空 `assets/component.css`,保证 index.html 的 `<link>` 不 404。
+
+### states[].driver(组件模式)
+
+```jsonc
+"states": [
+  { "id": "entry",   "driver": "inject", "via": [{ "expect": "entry" }] },
+  { "id": "consent", "driver": "via",    "via": [ { "click": "..." }, { "expect": "consent" } ] }
+]
+```
+
+- `"inject"`:adapter 可调 `__qaDemo.inject(id)` 直达(推 reducer / 受控 store);可进「状态补齐」tab;
+- `"via"`:组件局部 `useState` 的子视图,外部注入不到——**必须同时声明 via 链路**(schema 硬校验),
+  adapter 对它的 `__qa.goto` 显式 throw,且不许出现在 `tabStates` 里;
+- 复刻模式不写该字段,语义不变。
