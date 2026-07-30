@@ -342,7 +342,9 @@ export async function importTsModule(tsFile, { repoRoot } = {}) {
   const abs = resolve(tsFile);
   if (!existsSync(abs)) throw new Error(`importTsModule: 文件不存在:${abs}`);
   const root = repoRoot ?? findRepoRoot(dirname(abs));
-  const esbuildPath = resolveFrom('esbuild', [root, process.cwd()]);
+  // 候选链不放 process.cwd():cwd 可能是 demo 目录(不可信侧),
+  // 命中 <demo>/node_modules/esbuild 就是任意代码执行(审核 r4 CRITICAL)。
+  const esbuildPath = resolveFrom('esbuild', [process.env.QA_HIFI_MODULE_ROOT, root]);
   const esbuildMod = await import(pathToFileURL(esbuildPath).href);
   const esbuild = esbuildMod.default?.build ? esbuildMod.default : esbuildMod;
   const result = await esbuild.build({

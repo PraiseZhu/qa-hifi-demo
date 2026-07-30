@@ -88,7 +88,9 @@ async function loadTs() {
   try {
     // 显式取 lib/typescript.js 经典入口:TS7+ 原生重写版 exports['.'] 指向 version.cjs,
     // 没有 Compiler API——那种环境直接拒转,不在模块形态上猜
-    const pkgPath = resolveFrom('typescript/package.json', [repoRoot, demoDir, skillRoot]);
+    // 候选链不放 demoDir:随后要 import 这个包,命中 <demo>/node_modules/typescript
+    // 就是 demo 侧任意代码执行(与审核 r4 CRITICAL 同形)。
+    const pkgPath = resolveFrom('typescript/package.json', [process.env.QA_HIFI_MODULE_ROOT, repoRoot, skillRoot]);
     const entry = join(dirname(pkgPath), 'lib/typescript.js');
     if (!existsSync(entry)) {
       throw new Error(`typescript 包内无 lib/typescript.js(TS7+ 原生版无 Compiler API,需要 5.x)`);

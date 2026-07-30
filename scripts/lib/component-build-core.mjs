@@ -142,8 +142,15 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     },
   };
 
-  /* ── esbuild 从**产品仓**解析(demo 自身不装依赖) ── */
-  const esbuildPath = resolveFrom('esbuild', [process.env.QA_HIFI_MODULE_ROOT, repoRoot, process.cwd()]);
+  /* ── esbuild 从**产品仓**解析(demo 自身不装依赖) ──
+     候选链只许放**不受单个 demo 目录内容左右**的目录(审核 r4 CRITICAL):
+     QA_HIFI_MODULE_ROOT 由运行者显式设置,repoRoot 由 git rev-parse --show-toplevel 得到。
+     r3 曾把 process.cwd() 兜在最后 —— 而复算路径(recheckComponentInputs)正是把子进程
+     cwd 设成 demoDir 的,于是 `<demo>/node_modules/esbuild/index.js` 成了默认入口下的
+     任意代码执行:CJS 顶层代码在 import 时同步跑,且 node_modules 既不入哈希链、
+     也不在 checkDemoBuilderIntegrity 的具名文件表里 —— 全绿地被执行。
+     结论:**解析候选里绝不允许出现 cwd / demoDir 这类不可信侧路径**。 */
+  const esbuildPath = resolveFrom('esbuild', [process.env.QA_HIFI_MODULE_ROOT, repoRoot]);
   const esbuildMod = await import(pathToFileURL(esbuildPath).href);
   const esbuild = esbuildMod.default?.build ? esbuildMod.default : esbuildMod;
 
@@ -205,12 +212,30 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
     const L = [];
     L.push(`import * as __qaOrig from ${JSON.stringify(ENTRY_ORIG_SPEC)};`);
     L.push(`var __qaTarget = ${JSON.stringify(targetExport)};`);
+    /* ── 哨兵证据必须是**封印的只读量**(审核 r4 追加 #1c) ──
+       r3 把证据写在 globalThis.__QA_ENTRY_RENDERED__ / __QA_ENTRY_TARGET_RENDERED__ /
+       __QA_ENTRY_SHAPE__ 这三个公开可写的字段上,而 bootstrap 本就是允许作者编辑、
+       且已入 hash 链的输入 —— 于是「只 `globalThis.keep = Claimed` 持引用、从不调用,
+       再把两个布尔量直接写 true + 手搓 UI」能拿到 proved 与「真组件直渲」。
+       修法:计数/置位全部留在本模块闭包里(bundle 内的模块作用域,页面脚本拿不到),
+       对外只暴露一个 non-writable/non-configurable 的全局,其上只有 get-only 的
+       snapshot 访问器。demo 侧写旧字段不再有任何作用;想顶替这个全局只有两种下场:
+       抢先定义成可配置的 → 被我们覆盖;抢先定义成不可配置的 → 下面的 defineProperty
+       直接抛错、bundle 初始化失败、门 B 红(不 try/catch,就是要 fail-closed)。 */
+    L.push('var __qaRendered = false, __qaTargetRendered = false;');
     L.push('var __qaShape = { total: 0, wrappable: 0, sentinel: true, target: __qaTarget, targetWrappable: 0 };');
-    L.push('globalThis.__QA_ENTRY_SHAPE__ = __qaShape;');
     L.push('var __qaMark = function (isTarget) {');
-    L.push('  globalThis.__QA_ENTRY_RENDERED__ = true;');
-    L.push('  if (isTarget) globalThis.__QA_ENTRY_TARGET_RENDERED__ = true;');
+    L.push('  __qaRendered = true;');
+    L.push('  if (isTarget) __qaTargetRendered = true;');
     L.push('};');
+    L.push('var __qaSeal = {};');
+    L.push('Object.defineProperty(__qaSeal, "snapshot", { enumerable: false, configurable: false, get: function () {');
+    L.push('  return Object.freeze({ rendered: __qaRendered, targetRendered: __qaTargetRendered,');
+    L.push('    shape: Object.freeze({ total: __qaShape.total, wrappable: __qaShape.wrappable,');
+    L.push('      targetWrappable: __qaShape.targetWrappable, target: __qaShape.target, sentinel: true }) });');
+    L.push('} });');
+    L.push('Object.freeze(__qaSeal);');
+    L.push('Object.defineProperty(globalThis, "__QA_ENTRY_SENTINEL__", { value: __qaSeal, writable: false, configurable: false, enumerable: false });');
     L.push('var __qaFn = function (f, isTarget) { return new Proxy(f, {');
     L.push('  apply: function (t, th, a) { __qaMark(isTarget); return Reflect.apply(t, th, a); },');
     L.push('  construct: function (t, a, nt) { __qaMark(isTarget); return Reflect.construct(t, a, nt); },');
@@ -319,6 +344,21 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
   /** tailwind content:声明了就必须能展开成实际文件并逐一入链(审核 #2c-b)。 */
   function tailwindContentFiles() {
     const list = Array.isArray(comp.css?.content) ? comp.css.content : [];
+    /* ── css 非 null 时 content 必填(审核 r4 追加 #2c-b,方案 A) ──
+       r3 允许 `css: { tailwindConfig }` 不带 content:那时 build 不传 --content,
+       Tailwind 按 **config.content** 隐式扫描,而清单只记 tailwind.config.js 本身,
+       config.content 命中的样式源文件全不入链 —— 改它们 hash 不变、旧 CSS 照过门。
+       现在:配了 css 就必须显式声明 content(非空),build 也始终用 --content 覆盖 config,
+       隐式扫描这条路彻底关掉。 */
+    if (comp.css && (!Array.isArray(comp.css.content) || comp.css.content.length === 0))
+      fail(
+        'component.css 已配置但 component.css.content 缺失/为空——组件模式要求**显式**声明 tailwind content。'
+        + '\n原因:不显式声明时 Tailwind 会按 tailwind.config.js 里的 content 隐式扫描,而那些被扫到的'
+        + '样式源文件不会进 component.inputs.json 防伪链;改样式源文件 hash 不变,旧 CSS + 旧 report 照过验收。'
+        + '\n修法:把 config 里 content 的等价 glob 抄进 component.css.content(仓内相对,只支持 * / ** / ?);'
+        + '真不需要 tailwind 就把 component.css 设为 null。',
+        2,
+      );
     const out = new Set();
     for (const pattern of list) {
       if (typeof pattern !== 'string' || !pattern.trim())

@@ -166,8 +166,49 @@ const CANONICAL_BUILD_FILES = {
  * demo 里的构建期文件必须逐字节等于 skill canonical——不等就是自定义构建器。
  * 返回 problems(空 = 全等)。
  */
+/**
+ * demo 目录(含任意子目录)里出现的 node_modules —— 返回相对路径列表(空 = 干净)。
+ * 只找目录名,不下钻进 node_modules 内部(命中即停,别把整棵依赖树走一遍)。
+ */
+function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
+  const hits = [];
+  const walk = (dir, rel, depth) => {
+    if (hits.length >= limit || depth > 8) return;
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.isSymbolicLink()) {
+        // symlink 到依赖目录同样能被 module resolution 命中,一并算
+        if (e.isSymbolicLink() && e.name === 'node_modules') hits.push(rel ? `${rel}/${e.name}` : e.name);
+        continue;
+      }
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.name === 'node_modules') { hits.push(childRel); continue; }
+      if (e.name === '.git') continue;
+      walk(join(dir, e.name), childRel, depth + 1);
+    }
+  };
+  walk(demoDir, '', 0);
+  return hits;
+}
+
 export function checkDemoBuilderIntegrity(demoDir) {
   const problems = [];
+  /* ── fail-closed:demo 自身不装依赖(审核 r4 CRITICAL 的等价变体封堵) ──
+     构建期文件的具名 hash 表只钉死 4 个文件,node_modules 既不入哈希链也不在表里。
+     而模块解析是另一条能把 demo 侧代码送进本进程的侧路:只要某个候选目录解析到
+     `<demo>/node_modules/<pkg>`,随后的 import 就会同步执行它的顶层代码。
+     解析候选已经去掉了 cwd/demoDir,这里再加一道结构性拒收:demo 目录及其任意
+     子目录只要存在 node_modules,一律不合规,不做复算比对。 */
+  const nodeModules = findDemoNodeModules(demoDir);
+  if (nodeModules.length)
+    problems.push(
+      `demo 目录不应自带 node_modules,检测到依赖目录,拒绝——demo 自身不装依赖:${nodeModules.join(', ')}`
+      + '\n组件模式的构建期依赖(esbuild 等)只从产品仓或 QA_HIFI_MODULE_ROOT 解析;'
+      + 'demo 侧的依赖目录既不进哈希链、也不在构建期文件对照表里,是把 demo 代码送进校验进程的侧路。'
+      + '\n修法:删掉 demo 里的 node_modules(以及 package.json 里多余的 dependencies),'
+      + '需要宿主依赖时设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓。',
+    );
   for (const name of DEMO_BUILD_FILES) {
     const demoFile = join(demoDir, name);
     const canonical = CANONICAL_BUILD_FILES[name];

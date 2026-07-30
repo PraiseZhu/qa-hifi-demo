@@ -213,13 +213,33 @@ try {
     const assertSentinel = async (p) => {
       if (!sentinelExpected || sentinelChecked) return;
       sentinelChecked = true;
-      const st = await p.evaluate(() => ({
-        rendered: globalThis.__QA_ENTRY_RENDERED__ === true,
-        targetRendered: globalThis.__QA_ENTRY_TARGET_RENDERED__ === true,
-        shape: globalThis.__QA_ENTRY_SHAPE__ ?? null,
-      }));
+      // 只认封印形态的证据(r4 追加 #1c):证据存在 bundle 模块闭包里,页面侧只能读
+      // 一个 non-writable/non-configurable 全局上的 get-only snapshot。
+      // demo 侧写任何可写全局都影响不了它;形态不对 = 有人顶替了哨兵,当造假处理。
+      const raw = await p.evaluate(() => {
+        const d = Object.getOwnPropertyDescriptor(globalThis, '__QA_ENTRY_SENTINEL__');
+        if (!d) return { present: false };
+        const sd = d.value && typeof d.value === 'object' ? Object.getOwnPropertyDescriptor(d.value, 'snapshot') : null;
+        let snap = null;
+        try { snap = d.value?.snapshot ?? null; } catch { snap = null; }
+        return {
+          present: true,
+          sealed: d.writable === false && d.configurable === false,
+          accessorOk: !!sd && typeof sd.get === 'function' && sd.set === undefined && sd.configurable === false,
+          frozen: !!d.value && Object.isFrozen(d.value),
+          snap,
+        };
+      });
+      const st = { rendered: raw.snap?.rendered === true, targetRendered: raw.snap?.targetRendered === true, shape: raw.snap?.shape ?? null };
       if (!st.shape?.sentinel)
         throw new Error('运行期哨兵未在页面里出现——assets/component.bundle.js 不是当前 build.mjs 产出的(手改过 bundle?),重跑 node build.mjs');
+      if (!(raw.sealed && raw.accessorOk && raw.frozen))
+        throw new Error(
+          '运行期哨兵证据不是封印形态——globalThis.__QA_ENTRY_SENTINEL__ 被页面侧顶替/改写了'
+          + `(封印:${raw.sealed} 只读访问器:${raw.accessorOk} 冻结:${raw.frozen})。`
+          + '\n哨兵证据只能由 build 产出的 bundle 自己写;bootstrap/index.html 里手动构造这个全局一律按造假处理。'
+          + '\n修法:删掉 demo 侧对 __QA_ENTRY_* 的任何赋值/定义,重跑 node build.mjs。',
+        );
       if (sentinelState === 'targeted') {
         if (st.targetRendered) { entryRenderProof = 'proved'; return; }
         // 目标导出存在(build 已校验)但形态套不上探针(常量/纯数据):不判造假,诚实降级

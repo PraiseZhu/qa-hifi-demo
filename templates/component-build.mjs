@@ -59,8 +59,12 @@ if (comp.css?.tailwindConfig) {
   writeFileSync(inputCss, comp.css.input ?? '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n');
   const bin = join(repoRoot, 'node_modules', '.bin', 'tailwindcss');
   if (!existsSync(bin)) fail(`component.css.tailwindConfig 已配置,但产品仓没有 tailwindcss CLI:${bin}`);
-  const args = ['-c', R(comp.css.tailwindConfig), '-i', inputCss, '-o', cssOut];
-  if (Array.isArray(comp.css.content) && comp.css.content.length) args.push('--content', comp.css.content.join(','));
+  // --content 始终显式传(r4 追加 #2c-b):不传时 Tailwind 按 config.content 隐式扫描,
+  // 那些文件不入 component.inputs.json 防伪链。content 非空由构建核心 fail-closed 保证,
+  // 这里再兜一道:真为空就拒,绝不退回隐式扫描。
+  if (!Array.isArray(comp.css.content) || comp.css.content.length === 0)
+    fail('component.css.content 必须是非空数组(组件模式要求显式声明 tailwind content;不显式声明则样式源文件不入防伪链)');
+  const args = ['-c', R(comp.css.tailwindConfig), '-i', inputCss, '-o', cssOut, '--content', comp.css.content.join(',')];
   execFileSync(bin, args, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'inherit'] });
   rmSync(inputCss, { force: true });
   cssBytes = readFileSync(cssOut).length;
