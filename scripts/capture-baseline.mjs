@@ -57,8 +57,23 @@ try {
 const specProblems = validateSpec(spec);
 if (specProblems.length) failProblems(specProblems.map((p) => `spec: ${p}`));
 
-const entry = (spec.baselines ?? []).find((b) => b.key === key);
-if (!entry) failJson(`key "${key}" 未在 spec.baselines 声明——先声明(带 via/frameSel/mask)再采集`, 2);
+const platformArg = argOf('--platform');
+// 复合键查找(review finding #4):schema 允许同 key 跨 platform,只按 key 找会把
+// android 截图静默写进 ios 目录。多条命中且未传 --platform → fail-closed 列候选;
+// 单命中保持旧 CLI 兼容(无需 --platform)。
+const matches = (spec.baselines ?? []).filter((b) => b.key === key);
+let entry;
+if (platformArg) {
+  entry = matches.find((b) => (b.platform ?? '') === platformArg);
+  if (!entry)
+    failJson(`key "${key}" + platform "${platformArg}" 未在 spec.baselines 声明(候选:${matches.map((b) => b.platform ?? '(无platform)').join(', ') || '无'})`, 2);
+} else if (matches.length === 0) {
+  failJson(`key "${key}" 未在 spec.baselines 声明——先声明(带 via/frameSel/mask/platform)再采集`, 2);
+} else if (matches.length > 1) {
+  failJson(`key "${key}" 在 spec.baselines 有 ${matches.length} 条(${matches.map((b) => b.platform ?? '(无platform)').join(', ')})——必须加 --platform 指定,防截图静默写错端目录`, 2);
+} else {
+  entry = matches[0];
+}
 const dpr = Number(spec.baselineDpr ?? 2);
 const frameSel = entry.frameSel ?? spec.baselineFrameSel ?? '.frame';
 // 分端输出:声明 platform → baselines/<platform>/<key>.png;未声明 → 旧式平铺(兼容)
@@ -91,6 +106,15 @@ try {
       note: '来源要如实:这是你指定实例的截图;下一步跑 pixel-compare.mjs 比对',
     }, null, 2));
   } else if (electronAppArg) {
+    // 宿主一致性(review finding #4):electron-mac 只能在 macOS 采、electron-win 只能在
+    // Windows 采——跨宿主采集的基准必然带系统字体噪声,直接拒绝;
+    // --electron-app 产出的是 Electron 桌面壳渲染,也不得写进 ios/android/web 目录。
+    if (entry.platform === 'electron-mac' && process.platform !== 'darwin')
+      failJson(`entry platform 是 electron-mac,但当前宿主是 ${process.platform}——跨宿主采集的基准必然带字体噪声,拒绝`, 2);
+    if (entry.platform === 'electron-win' && process.platform !== 'win32')
+      failJson(`entry platform 是 electron-win,但当前宿主是 ${process.platform}——跨宿主采集的基准必然带字体噪声,拒绝`, 2);
+    if (entry.platform && !entry.platform.startsWith('electron-'))
+      failJson(`--electron-app 采集的是 Electron 桌面壳截图,不能写进 platform:"${entry.platform}" 基准(web 用 --url,移动端用 capture-mobile.mjs)`, 2);
     // Electron 真壳采集:playwright _electron 起真实 app,截第一个窗口的帧元素。
     // 与 --url 的差异:渲染环境是产品真实 Electron(真实 Chrome 版本/窗口配置/注入样式),
     // 不再是 dev 实例的裸 Chromium——门 E 桌面端采集侧升级(gate-e-v2)。

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compareImages, loadPngApi, readPng } from '../lib/png-compare.mjs';
-import { buildBaselineManifest } from '../lib/fs-utils.mjs';
+import { buildBaselineManifest, hashFile, safeJsonForScript } from '../lib/fs-utils.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const PIXEL = join(ROOT, 'scripts/pixel-compare.mjs');
@@ -35,6 +35,8 @@ function tmpDemo(name = 'g2') {
 // 最小合法 spec + 最小自证 HTML(契约与旧 fixture 一致:__qa 五要素 + goto(unknown) 必抛)
 function writePixelDemo({ name = 'g2', baselines, baselineDpr = 2, pixelmatchThreshold } = {}) {
   const dir = tmpDemo(name);
+  const source = join(dir, 'source.txt');
+  writeFileSync(source, 'source-v1'); // provenance.source 必须是真实存在的文件(门 A 校验)
   const spec = {
     meta: { name, summary: { what: 'what', how: 'how', accept: 'accept' } },
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
@@ -48,13 +50,16 @@ function writePixelDemo({ name = 'g2', baselines, baselineDpr = 2, pixelmatchThr
     ...(pixelmatchThreshold !== undefined ? { pixelmatchThreshold } : {}),
     ...(baselines ? { baselines } : {}),
   };
-  const truth = { colors: { text: { value: '#ff0000', provenance: { source: 'fixture', locator: 'fixture', hash: '0'.repeat(64) } } } };
+  const truth = { colors: { text: { value: '#ff0000', provenance: { source: 'source.txt', locator: 'fixture', hash: hashFile(source) } } } };
   writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
   writeFileSync(join(dir, 'truth.json'), JSON.stringify(truth, null, 2));
+  // 门 A extractor-drift 检查需要 extract.mjs;echo 同一 truth 即过(与旧 fixture 同手法)
+  writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   writeFileSync(join(dir, 'index.html'), `<!doctype html><html><head><style>
     .box{color:#ff0000}
     #frame{width:16px;height:16px;background:#f00}
   </style></head><body>
+  <script id="qa-truth" type="application/json">${safeJsonForScript(truth)}</script>
   <div class="box">x</div><div id="frame" class="frame"></div>
   <script>
   const S={step:'id',prefs:{plat:'desk',region:'cn',os:'ios',mode:'light',lang:'zh-CN'}};
@@ -204,6 +209,42 @@ test('mask 护栏(面积上限/未遮罩下限)在 odiff 路径同样先于引�
   });
   assert.equal(res.status, 'ERROR');
   assert.match(res.detail, /mask 面积|超上限/);
+});
+
+// review finding #1:odiff ignoreRegions 是包含式终点,mask 右/下缘不得多遮 1px
+test('mask 边界:差异落 mask 最后一列/行 vs 紧邻第一列/行,odiff 与 pixelmatch 判定一致', async () => {
+  const { PNG, pixelmatch, odiff } = await pngApi();
+  const W = 4, H = 4;
+  const base = solidPng(PNG, W, H, [10, 10, 10]);
+  const withDiffAt = (x, y) => {
+    const p = solidPng(PNG, W, H, [10, 10, 10]);
+    const i = (y * W + x) * 4;
+    p.data[i] = 200; p.data[i + 1] = 200; p.data[i + 2] = 200;
+    return p;
+  };
+  const baseRaw = PNG.sync.write(base);
+  const masks = [[1, 1, 2, 2]]; // 遮 (1,1)(2,1)(1,2)(2,2):最后一列 x=2、最后一行 y=2
+  const cases = [
+    ['mask 内最后一列+最后一行(2,2)', 2, 2, 0],
+    ['紧邻 mask 右缘第一列(3,2)', 3, 2, 1],
+    ['紧邻 mask 下缘第一行(2,3)', 2, 3, 1],
+    ['紧邻 mask 右缘+下缘角(3,3)', 3, 3, 1],
+  ];
+  for (const [label, dx, dy, expectBad] of cases) {
+    const actRaw = PNG.sync.write(withDiffAt(dx, dy));
+    for (const engine of ['odiff', 'pixelmatch']) {
+      const res = await compareImages({
+        PNG, pixelmatch, odiff, engine,
+        baselineRaw: baseRaw, actualRaw: actRaw,
+        cssSize: { width: W, height: H }, masks,
+        threshold: 0.1, maxMaskRatio: 0.5, minUnmaskedRatio: 0.5,
+      });
+      assert.equal(res.status, 'OK', `${engine} ${label}: ${res.detail}`);
+      assert.equal(res.masked, 4, `${engine} ${label}: masked 应为 4`);
+      assert.equal(res.total, 12, `${engine} ${label}: total 应为 12`);
+      assert.equal(res.bad, expectBad, `${engine} ${label}: bad 应为 ${expectBad}(mask 边缘多遮/少遮 1px 会让此值翻转)`);
+    }
+  }
 });
 
 // ============ ② 分端基准(platform) ============
@@ -400,4 +441,149 @@ test('capture-mobile: --crop-top 裁掉状态栏后取到的必须是目标区�
   // 中心像素必须是红色(裁到的是下半),不是绿色——证明裁切方向正确
   const i = (16 * 32 + 16) * 4;
   assert.ok(png.data[i] > 200 && png.data[i + 1] < 60, `裁切结果颜色异常:(${png.data[i]},${png.data[i + 1]},${png.data[i + 2]})`);
+});
+
+// ============ ⑤ report-pixel 防伪对应校验(review finding #2) ============
+
+const VERIFY = join(ROOT, 'scripts/verify.mjs');
+const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
+
+function realReports(demoDir, env) {
+  const v = run(VERIFY, ['--demo', demoDir], { env, timeout: 150000 });
+  assert.equal(v.status, 0, `verify 必须先绿:${v.stdout}${v.stderr}`);
+  const p = run(PIXEL, ['--demo', demoDir], { env, timeout: 150000 });
+  assert.equal(p.status, 0, `pixel-compare 必须先绿:${p.stdout}${p.stderr}`);
+  return JSON.parse(readFileSync(join(demoDir, 'report-pixel.json'), 'utf8'));
+}
+
+function writeDemoWithBaselines(name, entries) {
+  return (async () => {
+    const { PNG } = await pngApi();
+    const dir = writePixelDemo({ name, baselines: entries.map((e) => ({ frameSel: '#frame', ...e })) });
+    const png = PNG.sync.write(solidPng(PNG, 32, 32, [255, 0, 0]));
+    for (const e of entries) {
+      const sub = e.platform ? join(dir, 'baselines', e.platform) : join(dir, 'baselines');
+      mkdirSync(sub, { recursive: true });
+      writeFileSync(join(sub, `${e.key}.png`), png);
+    }
+    return dir;
+  })();
+}
+
+test('finding #2: 手写 ok:true + 空 results + 当前 hash → 拒绝(审核人复现样本)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-empty', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  // 审核人复现样本:declared 对、compared 0、results 空、inputHashes 用真的
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify({
+    ok: true, skipped: false, toolVersion: real.toolVersion,
+    declared: 1, compared: 0, results: [], inputHashes: real.inputHashes,
+  }, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2, `伪造样本居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /results|漏端|缺 results/);
+});
+
+test('finding #2: 漏一端结果(ios 条目被摘掉)→ 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-missing', [{ key: 'one', platform: 'web' }, { key: 'one', platform: 'ios' }]);
+  const real = realReports(dir, env);
+  real.results = real.results.filter((r) => r.platform === 'web');
+  real.compared = real.results.length;
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /缺 spec 声明|数量.*不一致|ios\/one/);
+});
+
+test('finding #2: 复合 key 重复(同一条目出现两次)→ 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-dup', [{ key: 'one', platform: 'web' }, { key: 'one', platform: 'ios' }]);
+  const real = realReports(dir, env);
+  real.results = [real.results[0], real.results[0]]; // web 两条、ios 被顶掉
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /重复/);
+});
+
+test('finding #2: 伪造计数(diffRatio 与 bad/total 不符)→ 拒绝', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-count', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  real.results[0].diffRatio = 0.5; // bad=0 却报 50% diff——手写痕迹
+  writeFileSync(join(dir, 'report-pixel.json'), JSON.stringify(real, null, 2) + '\n');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 2);
+  assert.match(pr.stdout + pr.stderr, /diffRatio|不一致/);
+});
+
+test('finding #2 阳性对照:真实报告(带 engine 字段)照常放行,防过紧误伤', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const dir = await writeDemoWithBaselines('forge-none', [{ key: 'one', platform: 'web' }]);
+  const real = realReports(dir, env);
+  assert.equal(real.results[0].engine, 'odiff', 'pixel-compare 应把 engine 写进 results');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://workers.xd.team'], { env });
+  assert.equal(pr.status, 0, `真实报告被误伤:${pr.stdout}${pr.stderr}`);
+});
+
+// ============ ⑥ 采集器复合键查找(review finding #4) ============
+
+test('finding #4: 同 key 双端,capture-baseline 不传 --platform 拒绝并列候选;传 android 正确落位', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const { PNG } = await pngApi();
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const entries = [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'android' }];
+  const shot = join(tmpDemo('import-dual'), 'shot.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 32, 32, [255, 0, 0])));
+
+  const d1 = writePixelDemo({ name: 'dual-noplat', baselines: entries.map((e) => ({ frameSel: '#frame', ...e })) });
+  const r1 = run(CAPTURE, ['--demo', d1, '--key', 'one', '--from-png', shot], { env, timeout: 90000 });
+  assert.equal(r1.status, 2);
+  assert.match(r1.stdout, /必须加 --platform|ios.*android|android.*ios/);
+  assert.ok(!existsSync(join(d1, 'baselines/ios/one.png')) && !existsSync(join(d1, 'baselines/android/one.png')), '拒绝时不得落任何一端');
+
+  const d2 = writePixelDemo({ name: 'dual-plat', baselines: entries.map((e) => ({ frameSel: '#frame', ...e })) });
+  const r2 = run(CAPTURE, ['--demo', d2, '--key', 'one', '--platform', 'android', '--from-png', shot], { env, timeout: 90000 });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  assert.equal(JSON.parse(r2.stdout).out, 'baselines/android/one.png');
+  assert.ok(existsSync(join(d2, 'baselines/android/one.png')));
+  assert.ok(!existsSync(join(d2, 'baselines/ios/one.png')), '指定 android 不得碰 ios 目录');
+});
+
+test('finding #4: capture-mobile 同 key 双端同样 fail-closed;--platform ios 正确落位', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const { PNG } = await pngApi();
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const entries = [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'android' }];
+  const shot = join(tmpDemo('mobile-dual'), 'shot3x.png');
+  writeFileSync(shot, PNG.sync.write(solidPng(PNG, 48, 48, [255, 0, 0])));
+
+  const d1 = writePixelDemo({ name: 'mdual-noplat', baselines: entries.map((e) => ({ frameSel: '#frame', ...e })) });
+  const r1 = run(CAPTURE_MOBILE, ['--demo', d1, '--key', 'one', '--png', shot, '--device-dpr', '3'], { env, timeout: 90000 });
+  assert.equal(r1.status, 2);
+  assert.match(r1.stdout, /必须加 --platform/);
+
+  const d2 = writePixelDemo({ name: 'mdual-plat', baselines: entries.map((e) => ({ frameSel: '#frame', ...e })) });
+  const r2 = run(CAPTURE_MOBILE, ['--demo', d2, '--key', 'one', '--platform', 'ios', '--png', shot, '--device-dpr', '3'], { env, timeout: 90000 });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  assert.equal(JSON.parse(r2.stdout).out, 'baselines/ios/one.png');
+  assert.ok(existsSync(join(d2, 'baselines/ios/one.png')));
+});
+
+test('finding #4: --electron-app 采集 electron-win 条目在非 Windows 宿主直接拒绝(不启动 app)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  if (process.platform === 'win32') return t.skip('本用例只在非 Windows 宿主有意义');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const demo = writePixelDemo({ name: 'electron-wronghost', baselines: [{ key: 'e', platform: 'electron-win', frameSel: '.frame' }] });
+  const bogusApp = tmpDemo('bogus-app'); // 宿主校验应先于 app 解析/启动
+  const res = run(CAPTURE, ['--demo', demo, '--key', 'e', '--electron-app', bogusApp], { env, timeout: 60000 });
+  assert.equal(res.status, 2);
+  assert.match(res.stdout, /electron-win|宿主|拒绝/);
+  assert.ok(!existsSync(join(demo, 'baselines/electron-win/e.png')), '拒绝时不得落盘');
 });
