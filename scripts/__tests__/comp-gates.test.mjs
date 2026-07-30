@@ -55,9 +55,9 @@ function baseHtml(truth) {
  * 造一个「demo 位于产品仓内」的 fixture:<repo>/.git + <repo>/src/*.tsx + <repo>/qa-demo/。
  * component=false 时不写 spec.component(回归用:非组件模式旧 demo)。
  */
-function makeRepoDemo({ name = 'comp', component = true, sources = ['src/**/*.tsx'], bindings = [] } = {}) {
+function makeRepoDemo({ name = 'comp', component = true, sources = ['src/**/*.tsx'], bindings = [], noGit = false } = {}) {
   const repo = mkdtempSync(join(tmpdir(), `qa-hifi-comp-${name}-`));
-  execFileSync('git', ['init', '-q'], { cwd: repo });
+  if (!noGit) execFileSync('git', ['init', '-q'], { cwd: repo });
   mkdirSync(join(repo, 'src/components'), { recursive: true });
   writeFileSync(join(repo, 'src/Entry.tsx'), 'export const Entry = () => null;\n');
   writeFileSync(join(repo, 'src/components/Button.tsx'), 'export const Button = () => null;\n');
@@ -253,4 +253,55 @@ test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) 
   assert.equal(pr.status, 0, `${pr.stdout}${pr.stderr}`);
   assert.ok(!pr.stdout.includes('真组件直渲'), '非组件模式不该出现组件声明行');
   assert.match(pr.stdout, /还原承诺仅到数据层/);
+});
+
+// ============ ⑤ fail-closed:防伪链没锁住任何东西 = 阻断(lead 裁决) ============
+// 攻击面:作者写个匹配不到的 glob / 源文件被删 / demo 不在 git 仓内 —— 这些情况下
+// componentSources 记的是 NO_MATCH/MISSING/UNRESOLVED,verify 仍绿、hash 也「一致」,
+// 旧 report 照样过 pr-block。fail-closed 要求 pr-block 一律拒并说清怎么修。
+
+function verifyThenPrBlock(dir, env) {
+  const v = run(VERIFY, ['--demo', dir], { env });
+  assert.equal(v.status, 0, `verify 必须先绿(fail-closed 只在 pr-block 侧):${v.stdout}${v.stderr}`);
+  return run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
+}
+
+test('fail-closed: glob 零命中(NO_MATCH)→ pr-block 拒并提示修 sources', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { dir } = makeRepoDemo({ name: 'fc-nomatch', sources: ['src/**/*.nope'] });
+  const pr = verifyThenPrBlock(dir, env);
+  assert.equal(pr.status, 2, `零命中 glob 居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /NO_MATCH/);
+  assert.match(pr.stdout + pr.stderr, /glob 零命中/);
+});
+
+test('fail-closed: 源文件缺失(MISSING)→ pr-block 拒并提示查路径', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { dir } = makeRepoDemo({ name: 'fc-missing', sources: ['src/components/Button.tsx', 'src/deleted.tsx'] });
+  const pr = verifyThenPrBlock(dir, env);
+  assert.equal(pr.status, 2, `缺源文件居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /MISSING/);
+  assert.match(pr.stdout + pr.stderr, /src\/deleted\.tsx/);
+});
+
+test('fail-closed: demo 不在 git 仓内(UNRESOLVED)→ pr-block 拒并要求 demo 落在产品仓内', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { dir } = makeRepoDemo({ name: 'fc-nogit', noGit: true });
+  const pr = verifyThenPrBlock(dir, env);
+  assert.equal(pr.status, 2, `demo 不在仓内居然放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout + pr.stderr, /UNRESOLVED/);
+  assert.match(pr.stdout + pr.stderr, /必须位于产品 git 仓内/);
+});
+
+test('fail-closed 阳性对照: 源文件与 bundle 全部真 hash → 照常放行(不误伤)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+  const { dir } = makeRepoDemo({ name: 'fc-healthy' });
+  const pr = verifyThenPrBlock(dir, env);
+  assert.equal(pr.status, 0, `健康组件 demo 被误伤:${pr.stdout}${pr.stderr}`);
+  assert.ok(!/防伪链未锁住/.test(pr.stdout + pr.stderr), 'fail-closed 误报');
+  assert.match(pr.stdout, /真组件直渲/);
 });
