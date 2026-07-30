@@ -501,3 +501,28 @@ test('条目 2 版本联动(不 skip): tailwindcss/fast-glob/micromatch 版本�
     );
   }
 });
+
+// ============================================================================
+// 文档校准
+// ============================================================================
+
+test('文档契约(不 skip): SKILL.md 必须写明执行时序原则、S ⊆ E = L、破坏性迁移与残余风险', () => {
+  const doc = readFileSync(join(ROOT, 'SKILL.md'), 'utf8');
+  // 条目 1:时序原则 + 残余风险(不许只写「已修复」)
+  assert.match(doc, /### 执行时序原则/, '必须有独立的执行时序原则小节');
+  assert.match(doc, /canonical runner 自己不能在核心观察之前执行被审方的代码/);
+  assert.match(doc, /detached/, '必须点名 detached 子进程这条攻击形态');
+  assert.match(doc, /纵深，不是主防线/, '事后 hash 的定位必须如实(不能被写成主防线)');
+  assert.match(doc, /残余风险/);
+  assert.match(doc, /OS 级 sandbox/, '未做 OS sandbox 这条降级必须写明');
+  assert.match(doc, /Node `vm` 不是安全/, '不许把 vm 说成隔离手段');
+  // 条目 2:破坏性变更 + 不变式 + 迁移路径
+  assert.match(doc, /破坏性变更（r7 条目 2）/);
+  assert.match(doc, /--suggest-content/, '迁移方式(生成器)必须写在文档里');
+  assert.match(doc, /S ⊆ E = L/, '不变式必须写进文档');
+  assert.match(doc, /参数结构/, '必须说明不变式靠参数结构保证,而不是事后猜测');
+  assert.ok(!/受限 glob\*\*——r5 起改成\*\*白名单式字符扫描/.test(doc), 'content 段仍在按 glob 描述,与 r7 实现不符');
+  // 门级全表两处次序说明
+  assert.match(doc, /但排在所有浏览器门之后/, '门 A 行必须写明 extractor 的新次序');
+  assert.match(doc, /且排在可信 verify 之前/, '门 E 行必须写明可信重跑的新次序');
+});
