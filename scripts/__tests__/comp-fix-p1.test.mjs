@@ -27,6 +27,12 @@ import {
 } from '../lib/extract-helpers.mjs';
 import { hashFile, safeJsonForScript, TOOL_VERSION } from '../lib/fs-utils.mjs';
 
+const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+/* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
+   必须显式 skip 并说明缺什么 —— 原先它们直接 fail,把「宿主缺依赖」伪装成「实现有 bug」。
+   skill 自身故意不 vendor esbuild/playwright(重依赖 + 浏览器二进制),它们由产品仓提供;
+   canonical 测试命令一直带 QA_HIFI_MODULE_ROOT,两个真实产品仓下这些用例全部实跑。 */
+const NEEDS_PRODUCT_REPO = '需要产品仓提供 esbuild/playwright:设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓(skill 自身不 vendor 这两个重依赖)';
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
 const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
@@ -314,7 +320,8 @@ const runPrBlock = (dir) => spawnSync(process.execPath, [PR_BLOCK, '--demo', dir
 const runManifest = (dir, extra = []) =>
   spawnSync(process.execPath, [ASSETS_MANIFEST, '--demo', dir, ...extra], { encoding: 'utf8', timeout: 60000, cwd: ROOT });
 
-test('#5 审核复现样本:有 assets/ 但没跑闸门 → pr-block 必须拒(旧实现直接出块)', () => {
+test('#5 审核复现样本:有 assets/ 但没跑闸门 → pr-block 必须拒(旧实现直接出块)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeAssetDemo({ name: 'as-norun', assetBytes: 1024 });
   const ok = runVerify(dir);
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
@@ -338,7 +345,8 @@ test('#5 审核复现样本:有 assets/ 但没跑闸门 → pr-block 必须拒(�
   assert.doesNotMatch(after.stdout, /抬闸理由/);
 });
 
-test('#5 抬闸无理由 → 闸门自己拒;有理由 → 过且附贴块印出理由', () => {
+test('#5 抬闸无理由 → 闸门自己拒;有理由 → 过且附贴块印出理由', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeAssetDemo({ name: 'as-override', assetBytes: 1024 });
   assert.equal(runVerify(dir).status, 0);
   // 超默认阀:不抬闸 = ok:false,pr-block 拒
@@ -371,7 +379,8 @@ test('#5 抬闸无理由 → 闸门自己拒;有理由 → 过且附贴块印出
   assert.ok(res.stdout.includes(reason), '抬闸理由必须原样印在附贴块上');
 });
 
-test('#5 篡改 assets 后旧 report-assets 失效 → pr-block 拒(换图不重跑闸门)', () => {
+test('#5 篡改 assets 后旧 report-assets 失效 → pr-block 拒(换图不重跑闸门)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeAssetDemo({ name: 'as-tamper', assetBytes: 1024 });
   assert.equal(runVerify(dir).status, 0);
   assert.equal(runManifest(dir).status, 0);
@@ -388,7 +397,8 @@ test('#5 篡改 assets 后旧 report-assets 失效 → pr-block 拒(换图不重
   assert.match(runPrBlock(dir).stdout, /assets hash 与当前 assets\/ 不一致/);
 });
 
-test('#5 没有 assets/ 的 demo 不受影响(旧 demo 不被新门拦下)', () => {
+test('#5 没有 assets/ 的 demo 不受影响(旧 demo 不被新门拦下)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeAssetDemo({ name: 'as-none', assetBytes: null });
   assert.equal(runVerify(dir).status, 0);
   const res = runPrBlock(dir);

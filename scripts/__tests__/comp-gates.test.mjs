@@ -17,6 +17,11 @@ const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const VERIFY = join(ROOT, 'scripts/verify.mjs');
 const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+/* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
+   必须显式 skip 并说明缺什么 —— 原先它们直接 fail,把「宿主缺依赖」伪装成「实现有 bug」。
+   skill 自身故意不 vendor esbuild/playwright(重依赖 + 浏览器二进制),它们由产品仓提供;
+   canonical 测试命令一直带 QA_HIFI_MODULE_ROOT,两个真实产品仓下这些用例全部实跑。 */
+const NEEDS_PRODUCT_REPO = '需要产品仓提供 esbuild/playwright:设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓(skill 自身不 vendor 这两个重依赖)';
 
 const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
 
@@ -169,7 +174,8 @@ function specWithComponent(patch) {
   return spec;
 }
 
-test('schema: sources 可选(空/缺失均合法),非数组仍拒', () => {
+test('schema: sources 可选(空/缺失均合法),非数组仍拒', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // 锁源不再靠自报 sources:真相源是 build.mjs 生成的 component.inputs.json
   for (const patch of [{ sources: [] }, { sources: undefined }]) {
     const spec = specWithComponent(patch);
@@ -179,29 +185,34 @@ test('schema: sources 可选(空/缺失均合法),非数组仍拒', () => {
   assert.ok(validateSpec(specWithComponent({ sources: 'src/a.ts' })).some((p) => /component\.sources 必须是数组/.test(p)));
 });
 
-test('schema: component 合法声明通过', () => {
+test('schema: component 合法声明通过', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   assert.deepEqual(validateSpec(specWithComponent({})).filter((p) => p.includes('component')), []);
 });
 
-test('schema: mode 必须是 "component"', () => {
+test('schema: mode 必须是 "component"', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const problems = validateSpec(specWithComponent({ mode: 'chrome' }));
   assert.ok(problems.some((p) => /component\.mode 必须是/.test(p)));
 });
 
-test('schema: bundle 限 demo 内相对路径(.. / 绝对路径 / 反斜杠全拒)', () => {
+test('schema: bundle 限 demo 内相对路径(.. / 绝对路径 / 反斜杠全拒)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   for (const bundle of ['../../etc/passwd', '/etc/passwd', 'assets\\bundle.js', '', 42]) {
     const problems = validateSpec(specWithComponent({ bundle }));
     assert.ok(problems.some((p) => /component\.bundle/.test(p)), `bundle=${JSON.stringify(bundle)} 居然放行`);
   }
 });
 
-test('schema: entry / sources 同样禁 ".." 与绝对路径', () => {
+test('schema: entry / sources 同样禁 ".." 与绝对路径', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   assert.ok(validateSpec(specWithComponent({ entry: '../outside.tsx' })).some((p) => /component\.entry/.test(p)));
   assert.ok(validateSpec(specWithComponent({ sources: ['/abs/**/*.ts'] })).some((p) => /component\.sources\[0\]/.test(p)));
   assert.ok(validateSpec(specWithComponent({ sources: ['src/../../x.ts'] })).some((p) => /component\.sources\[0\]/.test(p)));
 });
 
-test('schema: component 不认识的字段直接拒(防拼错静默失效)', () => {
+test('schema: component 不认识的字段直接拒(防拼错静默失效)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const problems = validateSpec(specWithComponent({ soruces: ['src/a.ts'] }));
   assert.ok(problems.some((p) => /component\.soruces 不是支持的字段/.test(p)));
 });
@@ -214,7 +225,8 @@ test('schema: 非组件模式 spec 不受影响(回归)', () => {
 
 // ============ ② buildInputHashes:componentSources 段 ============
 
-test('glob 展开:** 跨目录、只命中声明后缀、跳过 node_modules/.git', () => {
+test('glob 展开:** 跨目录、只命中声明后缀、跳过 node_modules/.git', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { repo } = makeRepoDemo({ name: 'glob' });
   mkdirSync(join(repo, 'node_modules/pkg'), { recursive: true });
   writeFileSync(join(repo, 'node_modules/pkg/x.tsx'), 'x\n');
@@ -223,7 +235,8 @@ test('glob 展开:** 跨目录、只命中声明后缀、跳过 node_modules/.gi
   assert.deepEqual(expandRepoGlob(repo, 'src/Entry.tsx'), ['src/Entry.tsx']);
 });
 
-test('buildInputHashes: component 模式按 manifest 逐文件 sha256 + bundle/清单自身入链', () => {
+test('buildInputHashes: component 模式按 manifest 逐文件 sha256 + bundle/清单自身入链', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { repo, dir } = makeRepoDemo({ name: 'hash' });
   const h = buildInputHashes(dir, readSpec(dir));
   assert.ok(h.componentSources, 'component 模式必须有 componentSources 段');
@@ -236,14 +249,16 @@ test('buildInputHashes: component 模式按 manifest 逐文件 sha256 + bundle/�
   assert.equal(h.componentSources.sources['src/notes.md'], undefined);
 });
 
-test('buildInputHashes: 缺 manifest → manifest 记 NO_MANIFEST(fail-closed 新态)', () => {
+test('buildInputHashes: 缺 manifest → manifest 记 NO_MANIFEST(fail-closed 新态)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { dir } = makeRepoDemo({ name: 'hash-nomanifest', manifest: false });
   const h = buildInputHashes(dir, readSpec(dir));
   assert.equal(h.componentSources.manifest, 'NO_MANIFEST');
   assert.deepEqual(h.componentSources.sources, {});
 });
 
-test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', () => {
+test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { repo, dir } = makeRepoDemo({ name: 'hash-change' });
   const spec = readSpec(dir);
   const before = JSON.stringify(buildInputHashes(dir, spec));
@@ -254,7 +269,8 @@ test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', () => {
   assert.notEqual(JSON.stringify(buildInputHashes(dir, spec)), afterSrc, '改 bundle 产物后 hash 居然没变');
 });
 
-test('buildInputHashes: manifest 里的文件不在了记 MISSING、bundle 缺失记 MISSING、越狱路径记 INVALID_PATH', () => {
+test('buildInputHashes: manifest 里的文件不在了记 MISSING、bundle 缺失记 MISSING、越狱路径记 INVALID_PATH', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { dir } = makeRepoDemo({ name: 'hash-missing', productInputs: ['src/deleted.tsx', '../outside.tsx'] });
   const spec = readSpec(dir);
   spec.component.bundle = 'assets/nope.js';
@@ -272,7 +288,8 @@ test('buildInputHashes: 非组件模式不长出 componentSources(回归)', () =
   assert.deepEqual(Object.keys(h).sort(), ['assets', 'baselines', 'index.html', 'spec.json', 'truth.json']);
 });
 
-test('findGitRepoRoot: 定位到 demo 所在仓根', () => {
+test('findGitRepoRoot: 定位到 demo 所在仓根', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const { repo, dir } = makeRepoDemo({ name: 'reporoot' });
   // macOS tmpdir 是 /var → /private/var symlink,比较用 realpath 后的尾段
   assert.equal(findGitRepoRoot(dir).split('/').pop(), repo.split('/').pop());

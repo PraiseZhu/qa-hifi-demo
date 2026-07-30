@@ -21,7 +21,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,6 +107,7 @@ function makeFixture({ name, css, repoDeps = false, baselines, extraRepoFiles = 
                    ——r6 起 skill 把 tailwindcss 列为 devDependency,真 tailwind 分支
                    (CSS 编译 + content 扫描语义)因此能被真跑,不再只有源码契约。 */
   if (repoDeps === 'skill') symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'));
+  else if (repoDeps === 'no-tailwind') makeNoTailwindNodeModules(repo);
   else if (repoDeps) symlinkSync(join(MODULE_ROOT, 'node_modules'), join(repo, 'node_modules'));
 
   const dir = join(repo, 'qa-demo');
@@ -143,6 +144,38 @@ function makeFixture({ name, css, repoDeps = false, baselines, extraRepoFiles = 
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
   writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   return { repo, dir, spec };
+}
+
+/**
+ * 造一个「装了依赖、但**确定没有** tailwindcss CLI」的产品仓 node_modules(r7 条目 14)。
+ *
+ * 为什么要自建:原实现用 `repoDeps: true`(整份宿主 node_modules symlink)+ 假设"宿主产品仓
+ * 碰巧没装 tailwind"。这就是**环境依赖**:MivoCanvas 没装 → 绿;Project CINDY 装了 3.4.19
+ * → `--check-css` 正常成功、断言失败(lead 实测 278/280)。测试不许依赖宿主碰巧装了什么。
+ *
+ * 构造方式(确定性,与宿主装了什么无关):node_modules 是**真目录**,逐项 symlink 宿主的包,
+ * 但显式跳过 tailwindcss;`.bin` 也重建成真目录、逐项 symlink 但跳过 tailwindcss。
+ * 宿主根本没有 node_modules(不设 QA_HIFI_MODULE_ROOT)时就留一个只有空 `.bin` 的目录 ——
+ * 「没有 CLI」这个前提同样成立。
+ */
+function makeNoTailwindNodeModules(repo) {
+  const dst = join(repo, 'node_modules');
+  mkdirSync(join(dst, '.bin'), { recursive: true });
+  const host = MODULE_ROOT ? join(MODULE_ROOT, 'node_modules') : null;
+  if (host && existsSync(host)) {
+    for (const name of readdirSync(host)) {
+      if (name === 'tailwindcss' || name === '.bin') continue;
+      try { symlinkSync(join(host, name), join(dst, name)); } catch {}
+    }
+    const hostBin = join(host, '.bin');
+    if (existsSync(hostBin)) {
+      for (const name of readdirSync(hostBin)) {
+        if (name === 'tailwindcss') continue;
+        try { symlinkSync(join(hostBin, name), join(dst, '.bin', name)); } catch {}
+      }
+    }
+  }
+  assert.ok(!existsSync(join(dst, '.bin/tailwindcss')), '隔离 fixture 构造失败:产品仓里仍有 tailwindcss CLI');
 }
 
 /** 出块前的三件事:build → verify → assets 闸门。全部要求 exit 0。 */
@@ -253,11 +286,12 @@ test('条目 1 复算确定性: 同一 demo 连跑两次 --check-css,sha256 必�
   assert.match(A.sha256, /^[0-9a-f]{64}$/);
 });
 
-test('条目 1 fail-closed: 配了 tailwind 但产品仓没有 tailwindcss CLI → 复算拒绝放行(不是静默跳过)', (t) => {
-  if (!MODULE_ROOT) return t.skip('需要宿主 node_modules 挂到产品仓才能构成「装了依赖但没 tailwind」');
+test('条目 1 fail-closed(r7 条目 14 起不 skip、不依赖宿主): 产品仓没有 tailwindcss CLI → 复算拒绝放行', (t) => {
+  /* 隔离 fixture 自己构造「没有 tailwindcss CLI 的产品仓」,与宿主装了什么无关。
+     --check-css 在 bin 存在性检查处就 fail-closed,不需要 esbuild,所以这段**任何环境都跑**。 */
   const { dir } = makeFixture({
     name: 'css-no-cli',
-    repoDeps: true,
+    repoDeps: 'no-tailwind',
     css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] },
   });
   const r = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
@@ -265,7 +299,9 @@ test('条目 1 fail-closed: 配了 tailwind 但产品仓没有 tailwindcss CLI �
   const out = `${r.stdout}${r.stderr}`;
   assert.match(out, /没有 tailwindcss CLI/);
   assert.match(out, /fail-closed|不得放行/);
-  // verify 侧同样不许放行(门 A 必须红,而不是把 cssRecheck 记成 n/a 混过去)
+  // verify 侧同样不许放行(门 A 必须红,而不是把 cssRecheck 记成 n/a 混过去)。
+  // 这一段要走完整门 A(含 esbuild 输入图复算),故仅在有产品仓依赖时跑。
+  if (!MODULE_ROOT) return;
   const v = run(VERIFY, ['--demo', dir], { env: env() });
   assert.notEqual(v.status, 0);
   assert.match(`${v.stdout}${v.stderr}`, /CSS 字节|tailwindcss CLI/);

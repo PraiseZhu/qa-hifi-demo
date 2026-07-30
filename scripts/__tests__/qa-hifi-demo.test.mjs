@@ -10,6 +10,12 @@ import { createSafeStaticServer } from '../lib/safe-server.mjs';
 import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
 import { comparePngs } from '../lib/png-compare.mjs';
 
+const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
+/* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
+   必须显式 skip 并说明缺什么 —— 原先它们直接 fail,把「宿主缺依赖」伪装成「实现有 bug」。
+   skill 自身故意不 vendor esbuild/playwright(重依赖 + 浏览器二进制),它们由产品仓提供;
+   canonical 测试命令一直带 QA_HIFI_MODULE_ROOT,两个真实产品仓下这些用例全部实跑。 */
+const NEEDS_PRODUCT_REPO = '需要产品仓提供 esbuild/playwright:设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓(skill 自身不 vendor 这两个重依赖)';
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const VERIFY = join(ROOT, 'scripts/verify.mjs');
 const PIXEL = join(ROOT, 'scripts/pixel-compare.mjs');
@@ -163,7 +169,8 @@ test('P0-2 no-op via without target assertion is rejected instead of self-certif
   assert.match(res.stdout, /最后一步必须是 expect/);
 });
 
-test('P0-3 declared matrix must be executed, not printed as coverage', () => {
+test('P0-3 declared matrix must be executed, not printed as coverage', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => {
       delete s.verify.cases;
@@ -177,7 +184,8 @@ test('P0-3 declared matrix must be executed, not printed as coverage', () => {
   assert.match(res.stdout, /plat=phone|无法通过 DOM 切换偏好/);
 });
 
-test('P0-4 noClip selector matching zero visible elements fails', () => {
+test('P0-4 noClip selector matching zero visible elements fails', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => { s.verify.noClip = ['.missing']; return s; },
     name: 'noclip-empty',
@@ -187,7 +195,8 @@ test('P0-4 noClip selector matching zero visible elements fails', () => {
   assert.match(res.stdout, /未命中可见元素/);
 });
 
-test('P0-5 input stability requires an observable tick witness', () => {
+test('P0-5 input stability requires an observable tick witness', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => {
       s.verify.inputs = [{ sel: '#code', text: '123456', tickMs: 100, tickWitness: '#tick', via: [] }];
@@ -200,7 +209,8 @@ test('P0-5 input stability requires an observable tick witness', () => {
   assert.match(res.stdout, /Timeout|tick|witness|#tick/);
 });
 
-test('P0-5 persistence cannot pass by prefs() self-comparison or reloads:0', () => {
+test('P0-5 persistence cannot pass by prefs() self-comparison or reloads:0', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => {
       s.verify.persistence = { via: [{ expect: 'id' }], expected: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, storageKey: 'missing-key', reloads: 1 };
@@ -213,7 +223,8 @@ test('P0-5 persistence cannot pass by prefs() self-comparison or reloads:0', () 
   assert.match(res.stdout, /localStorage 缺 key/);
 });
 
-test('P0-6 scaled length binding rejects non-finite scale instead of NaN-pass', () => {
+test('P0-6 scaled length binding rejects non-finite scale instead of NaN-pass', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateHtml: (html) => html.replace('scale:()=>1', "scale:()=>Number.NaN"),
     mutateSpec: (s) => { s.bindings[0].scaled = true; return s; },
@@ -224,7 +235,8 @@ test('P0-6 scaled length binding rejects non-finite scale instead of NaN-pass', 
   assert.match(res.stdout, /finite positive/);
 });
 
-test('P0-7 pixel full-mask is rejected', () => {
+test('P0-7 pixel full-mask is rejected', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => {
       s.baselines = [{ key: 'one', frameSel: '#frame', mask: [[0, 0, 16, 16]] }];
@@ -240,7 +252,8 @@ test('P0-7 pixel full-mask is rejected', () => {
   assert.match(res.stdout, /mask 面积|超上限/);
 });
 
-test('P0-7 missing declared baseline is a hard failure', () => {
+test('P0-7 missing declared baseline is a hard failure', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     mutateSpec: (s) => { s.baselines = [{ key: 'missing', frameSel: '#frame' }]; return s; },
     name: 'missing-baseline',
@@ -250,7 +263,8 @@ test('P0-7 missing declared baseline is a hard failure', () => {
   assert.match(res.stdout, /MISSING|缺少基准图/);
 });
 
-test('P0-8 pr-block rejects stale report hashes', () => {
+test('P0-8 pr-block rejects stale report hashes', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'stale-report' });
   const ok = run(VERIFY, ['--demo', dir]);
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
@@ -268,7 +282,8 @@ test('P1 strict schema exits cleanly on malformed state', () => {
   assert.equal(res.stderr, '');
 });
 
-test('P1 pr-block validates preview and experience URL domains', () => {
+test('P1 pr-block validates preview and experience URL domains', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'url-validate' });
   const ok = run(VERIFY, ['--demo', dir]);
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
@@ -323,7 +338,8 @@ test('P0-7(recheck) pixelmatch mask must not hide out-of-mask diffs', () => {
 
 // ============ 复审第二轮:本轮新修洞的对抗 fixture(旧绿新红) ============
 
-test('P0-A(recheck) declared baselines but no pixel report blocks pr-block', () => {
+test('P0-A(recheck) declared baselines but no pixel report blocks pr-block', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ mutateSpec: (s) => { s.baselines = [{ key: 'k1', via: [{ expect: 'id' }] }]; return s; }, name: 'baseline-noreport' });
   const v = run(VERIFY, ['--demo', dir]);
   assert.equal(v.status, 0, v.stdout + v.stderr); // verify 不管门 E
@@ -340,7 +356,8 @@ test('P0-B(recheck) baseline key path traversal is rejected by schema', () => {
   assert.match(v.stdout, /key 只允许|\.\./);
 });
 
-test('P0-C(recheck) gate F measures DOM, not page self-reported metrics', () => {
+test('P0-C(recheck) gate F measures DOM, not page self-reported metrics', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // probe 指向不存在的元素:旧代码信 __qa.metrics 自报(demo 的 metrics 可回显 oracle)→ 门 F 全绿(假绿);
   // 新代码 verifier 侧直接量 DOM(measureAdaptive)→ 元素不存在 → 红。新门 F 不再调 __qa.metrics。
   const dir = writeDemo({
@@ -380,7 +397,8 @@ test('P1(recheck) verify.cases prefs must belong to declared matrix', () => {
   assert.match(res.stdout, /不在 matrix/);
 });
 
-test('P0-6(recheck) gate D rejects context-relative length units (em/%)', () => {
+test('P0-6(recheck) gate D rejects context-relative length units (em/%)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     name: 'gated-em',
     // 把默认 width leaf 的 value 改成 '1em'(上下文相关单位),provenance 仍指向 demo 内 source.txt
@@ -392,7 +410,8 @@ test('P0-6(recheck) gate D rejects context-relative length units (em/%)', () => 
   assert.match(res.stdout, /上下文相关单位|非绝对/);
 });
 
-test('P0-2(recheck) hidden tab-only entry is not accepted as reachable', () => {
+test('P0-2(recheck) hidden tab-only entry is not accepted as reachable', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // tab-only 状态,但 tab 入口 display:none:旧合成 click 照点 → 门B 绿;新 actionability → 红
   const dir = writeDemo({
     name: 'hidden-tab',
@@ -415,7 +434,8 @@ test('P0-2(recheck) hidden tab-only entry is not accepted as reachable', () => {
   assert.match(res.stdout, /可交互|状态补齐 tab|隐藏/);
 });
 
-test('P0-3(recheck) opacity:0 pref entry cannot self-certify matrix switch', () => {
+test('P0-3(recheck) opacity:0 pref entry cannot self-certify matrix switch', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // matrix 含 phone,但 phone 切换入口 opacity:0:旧合成 click → 门B 绿;新 actionability → 红
   const dir = writeDemo({
     name: 'opacity-pref',
@@ -435,7 +455,8 @@ test('P0-3(recheck) opacity:0 pref entry cannot self-certify matrix switch', () 
   assert.match(res.stdout, /可交互 DOM 入口|plat=phone/);
 });
 
-test('P0-5(recheck) synchronous oninput fake tick is rejected (needs independent timer)', () => {
+test('P0-5(recheck) synchronous oninput fake tick is rejected (needs independent timer)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   // #tick 只由 #code 的 oninput 同步更新,无独立定时器:旧代码只看输入前后变化 → 绿;
   // 新代码先要求 witness 无输入时自主变化 → 伪 tick 不动 → 红
   const dir = writeDemo({
@@ -511,7 +532,8 @@ test('writeback refuses when source drifted from truth (stale truth)', () => {
   assert.match(res.stdout, /源码已变|先重跑 truth/);
 });
 
-test('pr-block --require-committed blocks untracked demo, passes committed one', () => {
+test('pr-block --require-committed blocks untracked demo, passes committed one', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'committed-gate' });
   const v = run(VERIFY, ['--demo', dir]);
   assert.equal(v.status, 0, v.stdout + v.stderr);
@@ -552,7 +574,8 @@ async function spawnLiveServer(htmlPath) {
   return { proc, base: `http://127.0.0.1:${port}/` };
 }
 
-test('pr-block --require-deployed verifies live HTML matches local (fresh pass, stale fail, missing fail)', async () => {
+test('pr-block --require-deployed verifies live HTML matches local (fresh pass, stale fail, missing fail)', async (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'deploy-gate' });
   const v = run(VERIFY, ['--demo', dir]);
   assert.equal(v.status, 0, v.stdout + v.stderr);
@@ -578,7 +601,8 @@ test('pr-block --require-deployed verifies live HTML matches local (fresh pass, 
   assert.match(nourl.stdout + nourl.stderr, /需要 --url|没部署/);
 });
 
-test('pr-block --url accepts workers.xd.team subdomains (real deploy hosts)', () => {
+test('pr-block --url accepts workers.xd.team subdomains (real deploy hosts)', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'subdomain-url' });
   const v = run(VERIFY, ['--demo', dir]);
   assert.equal(v.status, 0, v.stdout + v.stderr);
@@ -608,7 +632,8 @@ test('partial: --gate 过滤产出 partial 报告,pr-block 拒收', () => {
   assert.match(pr.stdout + pr.stderr, /partial|增量/);
 });
 
-test('partial: 全量重跑后 pr-block 恢复接受', () => {
+test('partial: 全量重跑后 pr-block 恢复接受', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'partial-then-full' });
   const p1 = run(VERIFY, ['--demo', dir, '--gate', 'A']);
   assert.equal(p1.status, 0, p1.stdout + p1.stderr);
@@ -625,7 +650,8 @@ test('partial: --case 未命中直接失败并列出可用 id', () => {
   assert.match(res.stdout, /没有命中任何 case|desk-cn-light/);
 });
 
-test('gateX: 自定义门失败 → verify 红;通过 → 绿且进 report', () => {
+test('gateX: 自定义门失败 → verify 红;通过 → 绿且进 report', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'gatex-fail' });
   writeFileSync(join(dir, 'my-gate.mjs'), 'process.exit(1);\n');
   writeFileSync(join(dir, 'spec.json'), JSON.stringify({
@@ -645,7 +671,8 @@ test('gateX: 自定义门失败 → verify 红;通过 → 绿且进 report', () 
   assert.equal(report2.gateX.gates[0].id, 'my-gate');
 });
 
-test('gateX: verify 后篡改自定义门脚本 → pr-block 因 hash 不一致拒绝', () => {
+test('gateX: verify 后篡改自定义门脚本 → pr-block 因 hash 不一致拒绝', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({ name: 'gatex-tamper' });
   writeFileSync(join(dir, 'my-gate.mjs'), 'process.exit(0);\n');
   writeFileSync(join(dir, 'spec.json'), JSON.stringify({
@@ -759,7 +786,8 @@ test('init.mjs 生成四件套且拒绝覆盖', () => {
   assert.match(again.stdout, /拒绝覆盖/);
 });
 
-test('viewport: 非法 viewport 被 schema 拒;合法 viewport 进 coverage', () => {
+test('viewport: 非法 viewport 被 schema 拒;合法 viewport 进 coverage', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const bad = writeDemo({
     name: 'vp-bad',
     mutateSpec: (s) => { s.verify.cases[0].viewport = { w: -1, h: 0 }; return s; },
@@ -777,7 +805,8 @@ test('viewport: 非法 viewport 被 schema 拒;合法 viewport 进 coverage', ()
   assert.deepEqual(report.coverage.cases[0].viewport, { w: 800, h: 900, dpr: 2 });
 });
 
-test('failShot: 门 B 失败自动留现场截图', () => {
+test('failShot: 门 B 失败自动留现场截图', (t) => {
+  if (!MODULE_ROOT) return t.skip(NEEDS_PRODUCT_REPO);
   const dir = writeDemo({
     name: 'failshot',
     mutateSpec: (s) => {
