@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import {
   buildInputHashes,
   checkDeclaredComponentSources,
+  hashFile,
   COMPONENT_INPUTS_FILE,
   isPlainObject,
   recheckComponentInputs,
@@ -174,11 +175,34 @@ export function validatePixelReport(demoDir, spec, report) {
   const statuses = report.results?.map((r) => r.status) ?? [];
   if (statuses.includes('WARN')) {
     for (const r of report.results.filter((x) => x.status === 'WARN')) {
-      // WARN 必须有人工裁决 artifact 且三张图(baseline/demo/diff)实际存在(codex 复审 P1:裁决/图删改后 stale 仍过)
-      if (!r.adjudication || r.adjudication.ok !== true) { problems.push(`pixel WARN ${r.key} 缺人工裁决 artifact`); continue; }
+      /* WARN 必须有人工裁决,且该裁决**绑定这一次产出的三图字节**(r7 条目 8)。
+         r6 之前只查「artifact 路径存在」—— 路径可以指向后来被换掉的图,裁决绑不住任何具体
+         字节;删改图后 stale 裁决照样过。现在三层都要对上:
+           ① report 记了三图的 artifactHashes;
+           ② 磁盘上那三张图的现算 sha256 等于 ①(pr-block 里这份 report 是可信侧重跑产出的,
+              artifact 也被它覆盖过 → ① 就是可信侧字节);
+           ③ 裁决文件声明的 artifactHashes 等于 ①。
+         裁决本身仍是**人工声明、不是机械测量**:工具只保证「它判的图是可信侧生成的那三张」。 */
+      if (!r.adjudication || r.adjudication.ok !== true) {
+        problems.push(`pixel WARN ${r.key} 缺人工裁决 artifact${r.adjudicationRejected ? `(${r.adjudicationRejected.reason})` : ''}`);
+        continue;
+      }
+      for (const field of ['reviewer', 'reason']) {
+        if (typeof r.adjudication[field] !== 'string' || !r.adjudication[field].trim())
+          problems.push(`pixel WARN ${r.key} 的人工裁决缺 ${field}——裁决人与理由必须署名,且会印在 PR 上`);
+      }
       for (const kind of ['baseline', 'demo', 'diff']) {
         const p = r.artifacts?.[kind];
-        if (!p || !existsSync(join(demoDir, p))) problems.push(`pixel WARN ${r.key} 缺 ${kind} artifact 图(裁决无凭据)`);
+        if (!p || !existsSync(join(demoDir, p))) { problems.push(`pixel WARN ${r.key} 缺 ${kind} artifact 图(裁决无凭据)`); continue; }
+        const recorded = r.artifactHashes?.[kind];
+        if (typeof recorded !== 'string' || !/^[0-9a-f]{64}$/.test(recorded)) {
+          problems.push(`pixel WARN ${r.key} 的 ${kind} artifact 缺 sha256 记录——裁决无法绑定字节(重跑 pixel-compare)`);
+          continue;
+        }
+        if (hashFile(join(demoDir, p)) !== recorded)
+          problems.push(`pixel WARN ${r.key} 的 ${kind} artifact 字节与 report 记录不符——比对后图被换过,裁决失去凭据`);
+        if (r.adjudication.artifactHashes?.[kind] !== recorded)
+          problems.push(`pixel WARN ${r.key} 的人工裁决未绑定 ${kind} 图的 sha256(声明 ${r.adjudication.artifactHashes?.[kind] ?? '(缺)'} ≠ 实际 ${recorded})——裁决判的不是这三张图`);
       }
     }
   }

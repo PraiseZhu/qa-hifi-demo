@@ -43,7 +43,7 @@
 // extractor/custom gate 放进 OS 级 sandbox(Node vm 不是安全边界,不拿它假装隔离)。
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -749,6 +749,28 @@ try {
      Node 脚本,一旦执行,被审方就能派 detached 子进程改磁盘 —— 所以它们必须在这里,
      而不是像 r6 那样排在最前面。禁止把任何观察性检查移到本分界线之下。 */
 
+  /* ── demo 侧脚本的执行封装(r7 条目 10④⑤) ──
+     ④ 杀净子进程:用 detached 起一个**新进程组**跑它,返回后无条件 kill 整组 —— 脚本自己
+        起的同组后台进程不会活过这一步。诚实标注:如果脚本刻意用 detached 再起孙进程,
+        孙进程会拿到自己的新组,这一招杀不到它(那条路由「核心观察早于执行 demo 代码」兜)。
+     ⑤ 字节绑定:执行前就地算一次脚本 sha256 并记进 report,与观察前 inputHashes 里那份
+        比对 —— 「注册的是 A 脚本、跑的是 B 脚本」在这里落地。 */
+  function runDemoScript(scriptAbs, extraArgs = [], { timeout } = {}) {
+    const sha = existsSync(scriptAbs) ? hashFile(scriptAbs) : null;
+    const res = spawnSync(process.execPath, [scriptAbs, ...extraArgs], {
+      cwd: demoDir,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      detached: true,           // 新进程组 → 下面能整组回收
+      ...(timeout ? { timeout } : {}),
+    });
+    if (res.pid) {
+      // 整组回收(best-effort:进程组可能已空;Windows 无进程组语义,失败即忽略)
+      try { process.kill(-res.pid, 'SIGKILL'); } catch {}
+    }
+    return { ...res, scriptSha256: sha };
+  }
+
   // ---------- 门 A 第三段:extractor drift(执行 demo/extract.mjs) ----------
   // 现算结果必须 ≡ truth.json;证明 truth 真由源码提取,不是手抄 value + 内嵌块蒙混。
   if (!gateA.skipped) {
@@ -757,8 +779,11 @@ try {
       gateA.extractorDrift = 'no-extractor';
       gateA.detail = [gateA.detail, '缺 extract.mjs——无法证明 truth 由源码提取(只有 provenance hash 声明,不构成机械证明);请补 extractor'].filter(Boolean).join('\n');
     } else {
+      const run = runDemoScript(extractor);
+      gateA.extractorSha256 = run.scriptSha256;
       try {
-        const fresh = execFileSync(process.execPath, [extractor], { cwd: demoDir, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+        if (run.status !== 0) throw new Error(String(run.stderr || run.stdout || `exit ${run.status}`));
+        const fresh = run.stdout;
         if (stableJson(JSON.parse(fresh)) === stableJson(truthObj)) gateA.extractorDrift = 'none';
         else {
           gateA.extractorDrift = 'drift';
@@ -787,18 +812,21 @@ try {
     } else {
       for (const g of customGates) {
         const entry = { id: g.id, script: g.script, pass: false, detail: '' };
-        try {
-          const out = execFileSync(process.execPath, [join(demoDir, g.script), '--demo', demoDir], {
-            cwd: demoDir,
-            encoding: 'utf8',
-            timeout: Number(g.timeoutMs ?? 180000),
-            maxBuffer: 32 * 1024 * 1024,
-          });
+        /* 门 X 能声称的只有:「**精确 hash 的**注册脚本被可信 runner 执行且 exit 0」这个执行事件。
+           脚本本身是 demo 代码,它的业务判断是否正确工具证明不了(r7 条目 10,PR 文案已降准)。 */
+        const run = runDemoScript(join(demoDir, g.script), ['--demo', demoDir], { timeout: Number(g.timeoutMs ?? 180000) });
+        entry.scriptSha256 = run.scriptSha256;
+        // ⑤ 实际执行的字节必须等于观察前入链的那份(注册 A 脚本、跑 B 脚本在这里落地)
+        const chained = inputHashes.customGates?.[g.script];
+        if (chained && run.scriptSha256 && chained !== run.scriptSha256) {
+          entry.detail = `执行的脚本字节(${run.scriptSha256})与观察前入链的那份(${chained})不一致——脚本在验收过程中被换过`;
+          gateX.failures.push({ gate: g.id, error: entry.detail });
+        } else if (run.status === 0) {
           entry.pass = true;
-          entry.detail = out.trim().split('\n').slice(-3).join('\n').slice(0, 400);
+          entry.detail = String(run.stdout ?? '').trim().split('\n').slice(-3).join('\n').slice(0, 400);
           gateX.passed++;
-        } catch (err) {
-          entry.detail = String(err.stdout || err.stderr || err.message).slice(-400);
+        } else {
+          entry.detail = String(run.stdout || run.stderr || `exit ${run.status}`).slice(-400);
           gateX.failures.push({ gate: g.id, error: entry.detail });
         }
         gateX.gates.push(entry);

@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from
 import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
+  hashFile,
   failJson,
   failProblems,
   TOOL_VERSION,
@@ -148,10 +149,31 @@ try {
           demo: `pixel-artifacts/${artKey}.demo.png`,
           diff: `pixel-artifacts/${artKey}.diff.png`,
         };
+        /* r7 条目 8:artifact 三图的 **sha256** 一并记进 report。
+           它是「人工裁决判的是哪三张图」的唯一凭据 —— 只校验路径存在是不够的:
+           路径可以指向后来被换掉的图,裁决就绑不住任何具体字节。可信侧重跑会覆盖这三张图,
+           于是 report 里的 hash 就是**可信侧生成字节**的 hash。 */
+        item.artifactHashes = {
+          baseline: hashFile(baseOut),
+          demo: hashFile(demoOut),
+          diff: hashFile(diffOut),
+        };
         const adj = readAdjudication(demoDir, artKey);
         if (item.status === 'WARN') {
-          if (adj?.ok === true) item.adjudication = adj;
-          else item.detail += '; 缺人工裁决 artifact';
+          /* 裁决要能影响放行,前提是它**绑定这一次(可信侧)产出的三图 sha256**。
+             裁决文件本身是**人工裁决声明、不是机械测量** —— 工具只能保证「它判的图是我们
+             生成的那三张」,保证不了「判断本身对」。绑不上就不认这份裁决(WARN 无有效裁决 → ok=false)。 */
+          const bound = adj?.artifactHashes;
+          const same = bound && ['baseline', 'demo', 'diff'].every((k) => bound[k] === item.artifactHashes[k]);
+          if (adj?.ok === true && same) item.adjudication = adj;
+          else if (adj?.ok !== true) item.detail += '; 缺人工裁决 artifact';
+          else {
+            item.detail += '; 人工裁决未绑定本次可信侧产出的三图 sha256(裁决无凭据)';
+            item.adjudicationRejected = {
+              file: adj.file,
+              reason: bound ? '裁决声明的 artifactHashes 与本次产出不符(图被换过 / 裁决是旧版)' : '裁决缺 artifactHashes 字段',
+            };
+          }
         }
       }
     } catch (err) {
