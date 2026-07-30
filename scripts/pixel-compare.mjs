@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 // pixel-compare.mjs — 门 E 像素基准比对(Node 可信侧 PNG 解码/比较/热图)。
+//
+// 门 E 不在 verify.mjs 的 GATE_LETTERS 里,它的**可信侧来源就是本脚本**:r6 起 pr-block
+// 在定稿出块前会亲自 spawn 它(--report-out 写到 demo 之外),以自己重跑的结果为放行依据;
+// demo 里的 report-pixel.json 降级为仅供对账的自报材料。r5 之前 pr-block 只对那份自报做
+// 算术自洽校验(diffRatio===bad/total、threshold===spec…),从不重新对真实图片跑
+// odiff/pixelmatch —— 手写一份满足全部自洽约束的 JSON 就能把视觉回归伪造成 PASS。
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -19,6 +25,14 @@ const args = process.argv.slice(2);
 const demoIdx = args.indexOf('--demo');
 if (demoIdx === -1 || !args[demoIdx + 1]) failJson('缺 --demo <dir>');
 const demoDir = resolve(args[demoIdx + 1]);
+/* --report-out <file>:把门 E 报告写到指定路径而不是 <demo>/report-pixel.json。
+   供 pr-block 在**可信侧亲自重跑门 E**时使用(r6 条目 2):重跑结果落在 demo 之外,
+   既不覆盖作者的 report-pixel.json(要留着对账),也不让被审对象碰到我们的裁决依据。
+   注意:比对用的 artifact 图仍写在 demo 的 pixel-artifacts/ —— WARN 人工裁决要看图,
+   而可信侧重跑正好把那三张图换成**我们自己生成的**,裁决从此绑在可信产物上。 */
+const reportOutIdx = args.indexOf('--report-out');
+if (reportOutIdx !== -1 && !args[reportOutIdx + 1]) failJson('--report-out 需要一个文件路径');
+const reportOut = reportOutIdx !== -1 ? resolve(args[reportOutIdx + 1]) : join(demoDir, 'report-pixel.json');
 
 let spec;
 try {
@@ -42,7 +56,7 @@ if (declared.length === 0) {
     reason: 'spec.baselines 为空——像素级未比对',
     inputHashes: buildInputHashes(demoDir, spec),
   };
-  writeFileSync(join(demoDir, 'report-pixel.json'), JSON.stringify(out, null, 2) + '\n');
+  writeFileSync(reportOut, JSON.stringify(out, null, 2) + '\n');
   console.log(JSON.stringify(out, null, 2));
   process.exit(0);
 }
@@ -181,6 +195,6 @@ const out = {
   results,
   generatedAt: new Date().toISOString(),
 };
-writeFileSync(join(demoDir, 'report-pixel.json'), JSON.stringify(out, null, 2) + '\n');
+writeFileSync(reportOut, JSON.stringify(out, null, 2) + '\n');
 console.log(JSON.stringify(out, null, 2));
 process.exit(ok ? 0 : 2);

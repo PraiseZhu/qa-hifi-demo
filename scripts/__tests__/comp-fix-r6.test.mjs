@@ -24,7 +24,9 @@ import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readF
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
+import { buildInputHashes, hashFile, safeJsonForScript, stableJson, TOOL_VERSION } from '../lib/fs-utils.mjs';
+import { validatePixelForPr } from '../lib/report.mjs';
+import { loadPngApi } from '../lib/png-compare.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const CORE = join(ROOT, 'scripts/lib/component-build-core.mjs');
@@ -286,6 +288,89 @@ test('条目 1 真 tailwind 分支(实跑): 编译确定 + 手改样式源文件
   const a3 = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
   assert.equal(a3.status, 0, `${a3.stdout}${a3.stderr}`);
   assert.notEqual(JSON.parse(a3.stdout).sha256, exp.sha256, '改了 Tailwind 实扫文件却算出同样的 CSS = 复算没真跑');
+});
+
+// ==================== 条目 2 — 门 E 被排除在可信侧重跑之外 ====================
+
+test('条目 2 源码契约(不 skip): pr-block 必须亲自重跑 pixel-compare;不许再出现「全门重跑」的不实声明', () => {
+  const src = readFileSync(PR_BLOCK, 'utf8');
+  assert.match(src, /CANONICAL_PIXEL\s*=\s*join\(SCRIPT_DIR, 'pixel-compare\.mjs'\)/, 'pr-block 必须指向 skill 自己的 pixel-compare');
+  assert.match(
+    src,
+    /spawnSync\(process\.execPath, \[CANONICAL_PIXEL, '--demo', demoDir, '--report-out'/,
+    '门 E 必须由 pr-block 亲自重跑,而不是只校验 demo 自报的算术自洽',
+  );
+  assert.match(src, /trusted-pixel:/, '可信重跑门 E 未通过必须落成 problem');
+  assert.match(src, /pixel = \{ present: true, problems: \[\], report: trustedPx \}/, '出块的像素结论必须取可信侧结果');
+  assert.match(src, /pixel\(自报\)/, 'demo 自报必须被明确标注为对账材料');
+  // r5 那句「可信侧重跑全门(A/B/C/D/F/X)」漏了 E —— 表述必须诚实
+  assert.ok(!/重跑全门/.test(src), 'pr-block 仍在声称「全门重跑」,而 verify 的门集合不含 E');
+  assert.ok(!/重跑全门/.test(readFileSync(VERIFY, 'utf8')), 'verify 仍在声称「全门」');
+  assert.ok(
+    readFileSync(VERIFY, 'utf8').includes('门 E(像素基准)**不在本文件**'),
+    'verify 必须写明门 E 的可信来源在哪(否则又会有人以为 verify 覆盖了全门)',
+  );
+  // pixel-compare 必须支持写到 demo 之外(否则重跑会覆盖被审方自报,对账就没了)
+  assert.match(readFileSync(PIXEL, 'utf8'), /--report-out/);
+});
+
+test('条目 2 复现样本: 手写全 PASS 的 report-pixel.json + 从不跑 pixel-compare(基准图是非 PNG 字节)→ pr-block 必须拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const baselines = [{ key: 'one', frameSel: '#frame' }];
+  const { dir, spec } = makeFixture({ name: 'pixel-forged', repoDeps: true, baselines });
+  // 基准图根本不是 PNG —— 真跑 pixel-compare 一定 ERROR;手写报告里却写 PASS。
+  // 必须在 verify 之前落盘:baselines 进 inputHashes,后建会让 report.json 先被 hash 门拦下,
+  // 那就证明不了门 E 这个洞(测的是别的门)。
+  mkdirSync(join(dir, 'baselines'), { recursive: true });
+  writeFileSync(join(dir, 'baselines/one.png'), 'NOT-A-PNG');
+  buildVerifyAssets(dir);
+  const forged = {
+    ok: true,
+    skipped: false,
+    toolVersion: TOOL_VERSION,
+    threshold: 0.005,
+    compared: 1,
+    declared: 1,
+    // inputHashes 用**可导出的** buildInputHashes 对自己控制的文件现算 → 天然自洽
+    inputHashes: buildInputHashes(dir, spec),
+    results: [{ key: 'one', status: 'PASS', engine: 'odiff', bad: 0, total: 10000, masked: 0, diffRatio: 0, detail: '' }],
+    generatedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(dir, 'report-pixel.json'), `${JSON.stringify(forged, null, 2)}\n`);
+
+  // 先证明这份手写报告能过完整的「自报自洽」校验 —— 所以静态层本身不构成证明
+  assert.deepEqual(
+    validatePixelForPr(dir, spec).problems,
+    [],
+    '静态自洽层如果能拦住手写 pixel 报告,这条 CRITICAL 就不成立了',
+  );
+
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 2, `手写全 PASS 的门 E 报告居然出了块(条目 2 未修):${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /trusted-pixel/, '必须点名是门 E 的可信重跑不符,而不是别的偶然原因');
+});
+
+test('条目 2 阳性对照(实跑,不 skip): 真跑 pixel-compare 且基准与渲染一致 → pr-block 照常出块', async (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const baselines = [{ key: 'one', frameSel: '#frame' }];
+  const { dir } = makeFixture({ name: 'pixel-ok', repoDeps: true, baselines });
+  // 与 gate-e-v2 同手法:#frame 是 16x16 纯红 × baselineDpr 2 → 32x32 纯红基准
+  const { PNG } = await loadPngApi(dir);
+  const png = new PNG({ width: 32, height: 32 });
+  for (let i = 0; i < png.data.length; i += 4) { png.data[i] = 255; png.data[i + 1] = 0; png.data[i + 2] = 0; png.data[i + 3] = 255; }
+  mkdirSync(join(dir, 'baselines'), { recursive: true });
+  writeFileSync(join(dir, 'baselines/one.png'), PNG.sync.write(png));
+
+  buildVerifyAssets(dir);
+  const px = run(PIXEL, ['--demo', dir], { env: env() });
+  assert.equal(px.status, 0, `基准与渲染一致却没 PASS:${px.stdout}${px.stderr}`);
+  assert.equal(readJson(join(dir, 'report-pixel.json')).results[0].status, 'PASS');
+  // artifact 目录新增后要重跑资产闸门(assets/ 不含 pixel-artifacts,但 report hash 要新)
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 0, `门 E 可信重跑误伤了正常路径:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /像素基准/);
+  assert.ok(!pr.stdout.includes('未运行 pixel-compare'), '门 E 真跑过,不该打「未运行」');
 });
 
 test('条目 1 占位模式也入锚: 未配 tailwind 时手改占位 CSS 同样被抓', (t) => {

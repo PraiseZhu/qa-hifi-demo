@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // verify.mjs — qa-hifi-demo 门 A/B/C/D/F/X 动态验收执行器。
 //
+// 门 E(像素基准)**不在本文件**:它住在 pixel-compare.mjs,可信侧来源是 pr-block 定稿时
+// 亲自 spawn 那个脚本(--report-out 落到 demo 之外)。因此本文件与调用方一律不得出现
+// 「A-F 全部重跑」这类表述 —— r5 的 pr-block 就是这么写的,而它漏了 E(r6 条目 2 CRITICAL)。
+// 门级可信来源全表见 SKILL.md「门级全表」。
+//
 // 增量模式(调试用,2026-07-30 起):
 //   --gate A,D      只跑指定门(A/B/C/D/F/X;E 在 pixel-compare.mjs)
 //   --case <id,...> 只跑指定 case
@@ -38,7 +43,7 @@ if (demoIdx === -1 || !args[demoIdx + 1]) failJson('缺 --demo <dir>');
 const demoDir = resolve(args[demoIdx + 1]);
 const headed = args.includes('--headed');
 // --report-out <file>:把 report 写到指定路径而不是 <demo>/report.json。
-// 供 pr-block 在**可信侧重跑全门**时使用(r5 架构主线 P0-1):重跑结果落在 demo 之外,
+// 供 pr-block 在**可信侧重跑 A/B/C/D/F/X**时使用(r5 架构主线 P0-1):重跑结果落在 demo 之外,
 // 既不覆盖作者的 report.json,也不让被审对象碰到我们自己的裁决依据。
 const reportOutIdx = args.indexOf('--report-out');
 if (reportOutIdx !== -1 && !args[reportOutIdx + 1]) failJson('--report-out 需要一个文件路径');
