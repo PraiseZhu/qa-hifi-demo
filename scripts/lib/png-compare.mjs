@@ -145,15 +145,21 @@ export function writePng(PNG, file, png) {
 // (点名,失败直接报错不静默回退)/ pixelmatch(跳过 odiff,供 A/B 对比与排障)。
 
 function maskToIgnoreRegions(masks, dpr, width, height) {
-  return masks.map((rect) => {
+  // 区间口径陷阱(review finding #1):我们的 maskBitmap 是半开区间 [x0,x1),
+  // 而 odiff ignoreRegions 的 x2/y2 是**包含式**——半开终点直接传进去会在 mask 右/下
+  // 各多遮 1 像素(护栏按声明面积计、实际遮更多 = 实质放宽)。这里 -1 对齐成
+  // 「最后一个被遮像素」;零面积区(如 mask 完全在图外)整条跳过,不下发 odiff。
+  const regions = [];
+  for (const rect of masks) {
     const [x, y, w, h] = rect.map(Number);
-    return {
-      x1: Math.max(0, Math.floor(x * dpr.x)),
-      y1: Math.max(0, Math.floor(y * dpr.y)),
-      x2: Math.min(width, Math.ceil((x + w) * dpr.x)),
-      y2: Math.min(height, Math.ceil((y + h) * dpr.y)),
-    };
-  });
+    const x1 = Math.max(0, Math.floor(x * dpr.x));
+    const y1 = Math.max(0, Math.floor(y * dpr.y));
+    const x2 = Math.min(width, Math.ceil((x + w) * dpr.x)) - 1;
+    const y2 = Math.min(height, Math.ceil((y + h) * dpr.y)) - 1;
+    if (x2 < x1 || y2 < y1) continue;
+    regions.push({ x1, y1, x2, y2 });
+  }
+  return regions;
 }
 
 async function comparePngsOdiff({ PNG, odiff, baselineRaw, actualRaw, cssSize, masks = [], threshold = 0.005, maxMaskRatio = 0.25, minUnmaskedRatio = 0.5 }) {

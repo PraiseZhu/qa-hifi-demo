@@ -58,8 +58,22 @@ try {
 const specProblems = validateSpec(spec);
 if (specProblems.length) failProblems(specProblems.map((p) => `spec: ${p}`));
 
-const entry = (spec.baselines ?? []).find((b) => b.key === key);
-if (!entry) failJson(`key "${key}" 未在 spec.baselines 声明——先声明(带 via/frameSel/mask/platform)再采集`, 2);
+const platformArg = argOf('--platform');
+// 复合键查找(review finding #4):与 capture-baseline 同一规则——同 key 多条命中且
+// 未传 --platform 时 fail-closed 列候选,防 ios/android 截图互相写错端目录
+const matches = (spec.baselines ?? []).filter((b) => b.key === key);
+let entry;
+if (platformArg) {
+  entry = matches.find((b) => (b.platform ?? '') === platformArg);
+  if (!entry)
+    failJson(`key "${key}" + platform "${platformArg}" 未在 spec.baselines 声明(候选:${matches.map((b) => b.platform ?? '(无platform)').join(', ') || '无'})`, 2);
+} else if (matches.length === 0) {
+  failJson(`key "${key}" 未在 spec.baselines 声明——先声明(带 via/frameSel/mask/platform)再采集`, 2);
+} else if (matches.length > 1) {
+  failJson(`key "${key}" 在 spec.baselines 有 ${matches.length} 条(${matches.map((b) => b.platform ?? '(无platform)').join(', ')})——必须加 --platform 指定,防截图静默写错端目录`, 2);
+} else {
+  entry = matches[0];
+}
 const targetDpr = Number(spec.baselineDpr ?? 2);
 const deviceDpr = Number(argOf('--device-dpr') ?? targetDpr);
 if (!Number.isFinite(deviceDpr) || deviceDpr <= 0) failJson(`--device-dpr 必须是正数:${argOf('--device-dpr')}`);

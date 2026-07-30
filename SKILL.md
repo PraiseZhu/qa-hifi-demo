@@ -127,7 +127,9 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
   **采集用 `scripts/capture-baseline.mjs`**：`--url <dev实例>` 直接截真沙盒帧元素（DPR 与
   pixel-compare 同口径），`--electron-app <main入口或app目录>` 起真实 Electron 壳截首窗口
   （桌面端真渲染，mac/win 各存各的基准），或 `--from-png <截图>` 导入真机截图（先渲染 demo 量帧尺寸，
-  尺寸不符拒收，防「随手一张图」冒充基准）。key 必须先在 spec.baselines 声明。
+  尺寸不符拒收，防「随手一张图」冒充基准）。key 必须先在 spec.baselines 声明；
+  同 key 声明了多个 platform 时必须加 `--platform <端>` 指定（fail-closed，防截图静默写错端目录），
+  `--electron-app` 还会校验端与宿主一致（mac 上采 `electron-win` 直接拒绝）。
   **移动端采集用 `scripts/capture-mobile.mjs`**：maestro/simctl/adb 截图 → OS chrome 裁切
   （`--crop`/`--crop-top`）→ DPR 归一化（`--device-dpr`，Chromium canvas 重采样）→ 与 --from-png
   同口径尺寸校验 → 落分端目录；驱动链路模板见 `templates/maestro-flow.yaml`（testID 定位 +
