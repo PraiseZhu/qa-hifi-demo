@@ -3,15 +3,20 @@
 //
 // 设计边界(诚实分档):
 //   · 参数级改动(色值/几何/字号/文案等「值」)→ 本脚本机械写回,前提是该 truth 叶子的
-//     provenance 带 locatorPattern(恰含一个捕获组的正则,唯一命中源码中的该值)。
+//     provenance 带定位锚,两种通道(同时有时优先 locatorPattern):
+//       a) locatorPattern:恰含一个捕获组的正则,唯一命中源码中的该值;
+//       b) locatorKeyPath:源文件中该值的完整对象路径(如 'loginDesignTokens.hero.size'),
+//          用产品仓的 typescript 在 AST 上定位字面量(支持 ts/tsx/js/json;as const/satisfies
+//          自动解包;shorthand/spread/计算属性/非字面量初始化一律拒转走 agent)。
 //   · 结构级改动(新增元素/布局重构/新交互)→ 无机械通道,由 agent 同步改产品代码与 demo,
-//     再经 extract→verify 闭环证明双边一致。本脚本对无 locatorPattern 的叶子明确拒绝并提示走 agent 双改。
+//     再经 extract→verify 闭环证明双边一致。本脚本对无定位锚的叶子明确拒绝并提示走 agent 双改。
 //
 // 用法:
 //   node writeback.mjs --demo <dir> --repo <产品仓根> --set <truth路径>=<新值> [--set ...] [--dry-run]
 // 流程(每个 --set):
-//   1. truth 叶子必须有 provenance.locatorPattern;正则在源文件中必须恰命中一次;
-//   2. 捕获组当前内容必须 == truth 旧值(不等 = 源码已变,先重跑 truth.mjs 同步);
+//   1. truth 叶子必须有 provenance.locatorPattern 或 provenance.locatorKeyPath;
+//      regex 正则在源文件中必须恰命中一次;keyPath 在 AST 上必须恰命中一处字面量;
+//   2. 定位处当前内容必须 == truth 旧值(不等 = 源码已变,先重跑 truth.mjs 同步);
 //   3. 写回新值(--dry-run 只预览);
 //   4. 全部写完后重跑 extract.mjs:新 truth 里该叶子必须 == 新值(round-trip 证明),
 //      truth.json 落盘 + index.html qa-truth 块同步(--embed 同款逻辑)。
@@ -19,8 +24,11 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, dirname, join, resolve } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { failJson, failProblems, safeJsonForScript, stableJson } from './lib/fs-utils.mjs';
+import { resolveFrom } from './lib/extract-helpers.mjs';
+import { locateKeyPathLiteral, buildReplacement, LocateError } from './lib/keypath-locate.mjs';
 import { validateTruth } from './lib/schema.mjs';
 
 // schema.truthAt 会把叶子解包成裸 value;写回需要原始 {value, provenance} 节点,本地实现
@@ -70,6 +78,27 @@ function resolveSource(source) {
 // 阶段 1:全部预检(不写盘)——任何一条不合格,一个字都不改
 const plans = [];
 const problems = [];
+// typescript 惰性解析:只有 keyPath 通道的 --set 才需要,从产品仓 node_modules 偷(零新增依赖)
+let tsModule = null;
+let tsError = null;
+const skillRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+async function loadTs() {
+  if (tsModule || tsError) return;
+  try {
+    // 显式取 lib/typescript.js 经典入口:TS7+ 原生重写版 exports['.'] 指向 version.cjs,
+    // 没有 Compiler API——那种环境直接拒转,不在模块形态上猜
+    const pkgPath = resolveFrom('typescript/package.json', [repoRoot, demoDir, skillRoot]);
+    const entry = join(dirname(pkgPath), 'lib/typescript.js');
+    if (!existsSync(entry)) {
+      throw new Error(`typescript 包内无 lib/typescript.js(TS7+ 原生版无 Compiler API,需要 5.x)`);
+    }
+    tsModule = await import(pathToFileURL(entry).href);
+    if (!tsModule.createSourceFile && tsModule.default?.createSourceFile) tsModule = tsModule.default;
+    if (!tsModule.createSourceFile) throw new Error('typescript 模块形态不可识别(无 createSourceFile)');
+  } catch (err) {
+    tsError = err.message;
+  }
+}
 for (const s of sets) {
   const leaf = rawAt(truth, s.path);
   if (!leaf || typeof leaf !== 'object' || !('value' in leaf)) {
@@ -77,8 +106,49 @@ for (const s of sets) {
     continue;
   }
   const prov = leaf.provenance ?? {};
+  const sourceFile = prov.source ? resolveSource(prov.source) : null;
   if (typeof prov.locatorPattern !== 'string' || !prov.locatorPattern) {
-    problems.push(`${s.path}: provenance 无 locatorPattern——该叶子不可机械写回,走 agent 双改(同步改产品代码与 demo,再 extract→verify 闭环)`);
+    if (typeof prov.locatorKeyPath === 'string' && prov.locatorKeyPath) {
+      // keyPath 通道:AST 定位(下方统一处理,typescript 惰性加载)
+      if (!sourceFile) {
+        problems.push(`${s.path}: 源文件 ${prov.source} 在 demo 目录与 --repo 下都找不到(需要 --repo <产品仓根>?)`);
+        continue;
+      }
+      if (!tsModule && !tsError) await loadTs();
+      if (tsError) {
+        problems.push(`${s.path}: keyPath 定位需要产品仓的 typescript,解析失败:${tsError}`);
+        continue;
+      }
+      const content = readFileSync(sourceFile, 'utf8');
+      try {
+        const loc = locateKeyPathLiteral(tsModule, { fileName: sourceFile, content, keyPath: prov.locatorKeyPath });
+        if (loc.currentValue !== String(leaf.value)) {
+          problems.push(`${s.path}: 源码当前值 "${loc.currentValue}" ≠ truth 旧值 "${leaf.value}"——源码已变,先重跑 truth.mjs 同步再写回`);
+          continue;
+        }
+      const replacement = buildReplacement(loc, s.value);
+        plans.push({
+          path: s.path,
+          sourceFile,
+          source: prov.source,
+          old: loc.currentValue,
+          next: s.value,
+          via: `keyPath:${prov.locatorKeyPath}`,
+          start: loc.start,
+          end: loc.end,
+          newText: replacement,
+          backup: content,
+        });
+      } catch (err) {
+        if (err instanceof LocateError) {
+          problems.push(`${s.path}: keyPath 定位拒转(${err.code})——${err.message};请走 agent 双改(同步改产品代码与 demo,再 extract→verify 闭环)`);
+        } else {
+          problems.push(`${s.path}: keyPath 定位异常:${err.message}`);
+        }
+      }
+      continue;
+    }
+    problems.push(`${s.path}: provenance 无 locatorPattern/locatorKeyPath——该叶子不可机械写回,走 agent 双改(同步改产品代码与 demo,再 extract→verify 闭环)`);
     continue;
   }
   let re;
@@ -88,7 +158,6 @@ for (const s of sets) {
     problems.push(`${s.path}: locatorPattern 不是合法正则:${err.message}`);
     continue;
   }
-  const sourceFile = resolveSource(prov.source);
   if (!sourceFile) {
     problems.push(`${s.path}: 源文件 ${prov.source} 在 demo 目录与 --repo 下都找不到(需要 --repo <产品仓根>?)`);
     continue;
@@ -115,23 +184,37 @@ for (const s of sets) {
     source: prov.source,
     old: m[1],
     next: s.value,
-    newContent: content.slice(0, start) + s.value + content.slice(start + m[1].length),
+    start,
+    end: start + m[1].length,
+    newText: s.value,
     backup: content,
   });
 }
 if (problems.length) failProblems(problems);
 
 if (dryRun) {
-  console.log(JSON.stringify({ ok: true, dryRun: true, plans: plans.map(({ path, source, old, next }) => ({ path, source, old, new: next })) }, null, 2));
+  console.log(JSON.stringify({ ok: true, dryRun: true, plans: plans.map(({ path, source, old, next, via }) => ({ path, source, old, new: next, ...(via ? { via } : {}) })) }, null, 2));
   process.exit(0);
 }
 
 // 阶段 2:写回 + round-trip 验证;extract 不认账就整体回滚
+// 同一文件多个 --set:按 start 降序累积应用(前面的位置不因后面的替换而移位),
+// 每个文件只写一次——否则后写的 plan 会拿原始内容覆盖先写的结果
 const written = [];
 try {
+  const byFile = new Map();
   for (const p of plans) {
-    writeFileSync(p.sourceFile, p.newContent);
-    written.push(p);
+    const list = byFile.get(p.sourceFile) ?? [];
+    list.push(p);
+    byFile.set(p.sourceFile, list);
+  }
+  for (const [file, filePlans] of byFile) {
+    let content = filePlans[0].backup;
+    for (const p of [...filePlans].sort((a, b) => b.start - a.start)) {
+      content = content.slice(0, p.start) + p.newText + content.slice(p.end);
+    }
+    writeFileSync(file, content);
+    written.push(...filePlans);
   }
   const extractor = join(demoDir, 'extract.mjs');
   if (!existsSync(extractor)) throw new Error('缺 extract.mjs,无法 round-trip 验证');
@@ -163,7 +246,7 @@ try {
     ok: true,
     roundTrip: true,
     embedded,
-    written: plans.map(({ path, source, old, next }) => ({ path, source, old, new: next })),
+    written: plans.map(({ path, source, old, next, via }) => ({ path, source, old, new: next, ...(via ? { via } : {}) })),
     next: '重跑 verify.mjs 门 A-F 确认双边一致;结构级改动另走 agent 双改',
   }, null, 2));
 } catch (err) {

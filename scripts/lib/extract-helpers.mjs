@@ -59,10 +59,13 @@ export function readJson(file) {
  * @param value 提取到的值(界面文案/几何/色值等)
  * @param sourceFile 源文件绝对路径(或相对 demoDir 的路径)
  * @param opts.locator 必填:一句话说明该值在源文件中的定位方式(人读)
- * @param opts.locatorPattern 可选:恰含一个捕获组的正则(writeback 机械写回的锚)
+ * @param opts.locatorPattern 可选:恰含一个捕获组的正则(writeback 机械写回的锚,regex 模式)
+ * @param opts.keyPath 可选:源文件中该值的完整对象路径(writeback 机械写回的锚,AST 模式;
+ *   从顶层变量名/export default/JSON 根起,如 'loginDesignTokens.hero.size';记进
+ *   provenance.locatorKeyPath,由 writeback 用产品仓 typescript 在 AST 上定位)
  * @param opts.demoDir 默认 process.cwd()(truth.mjs 保证 = demo 目录)
  */
-export function makeLeaf(value, sourceFile, { locator, locatorPattern, demoDir = process.cwd() } = {}) {
+export function makeLeaf(value, sourceFile, { locator, locatorPattern, keyPath, demoDir = process.cwd() } = {}) {
   if (!locator || typeof locator !== 'string') {
     throw new Error(`makeLeaf(${JSON.stringify(value)}): 必须写 locator——一句话说明该值在源文件里怎么定位`);
   }
@@ -77,8 +80,14 @@ export function makeLeaf(value, sourceFile, { locator, locatorPattern, demoDir =
     }
     if (groups !== 1) throw new Error(`makeLeaf: locatorPattern 必须恰含一个捕获组(当前 ${groups} 个):${locatorPattern}`);
   }
+  if (keyPath !== undefined) {
+    if (typeof keyPath !== 'string' || !keyPath.trim() || keyPath.split('.').some((s) => !s || /\s/.test(s))) {
+      throw new Error(`makeLeaf: keyPath 必须是「段.段.段」非空路径(段不含空白):${JSON.stringify(keyPath)}`);
+    }
+  }
   const provenance = { source: relative(demoDir, abs), locator, hash: sha256File(abs) };
   if (locatorPattern !== undefined) provenance.locatorPattern = locatorPattern;
+  if (keyPath !== undefined) provenance.locatorKeyPath = keyPath;
   return { value, provenance };
 }
 
@@ -97,7 +106,7 @@ export function extractByPattern(sourceFile, pattern, { locator, demoDir = proce
   });
 }
 
-function resolveFrom(name, startDirs) {
+export function resolveFrom(name, startDirs) {
   const attempts = [];
   for (const dir of startDirs.filter(Boolean)) {
     try {
