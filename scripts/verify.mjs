@@ -21,6 +21,7 @@ import {
   failProblems,
   readComponentInputsManifest,
   recheckComponentBundle,
+  recheckComponentCss,
   recheckComponentInputs,
   sha256Buffer,
   stableJson,
@@ -166,6 +167,16 @@ else {
     if (bundleCheck.problems.length) {
       gateA.pass = false;
       gateA.detail = [gateA.detail, ...bundleCheck.problems].filter(Boolean).join('\n');
+    }
+    /* r6 条目 1:CSS 字节必须等于可信侧重编结果(与 bundle 同型)。
+       原先 assets/component.css 全仓没有任何字节复算 —— 合法构建后手改它,
+       只要不动入链的输入文件,全流程零检测通过。这一条同时兜住 content glob
+       语义差异 / node_modules 非对称扫描 / config 的 preset·plugin 未入链。 */
+    const cssCheck = recheckComponentCss(demoDir, spec.component);
+    gateA.cssRecheck = cssCheck.status;
+    if (cssCheck.problems.length) {
+      gateA.pass = false;
+      gateA.detail = [gateA.detail, ...cssCheck.problems].filter(Boolean).join('\n');
     }
   }
 }

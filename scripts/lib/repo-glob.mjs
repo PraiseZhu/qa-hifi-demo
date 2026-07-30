@@ -10,6 +10,35 @@ import { join } from 'node:path';
 
 const GLOB_SKIP_DIRS = new Set(['.git', 'node_modules']);
 
+/* ── demo 自带 node_modules 的探测(r6:实现从 fs-utils 移到本模块) ──
+   为什么搬家:构建核心(component-build-core.mjs)在 r6 起会**执行产品仓的
+   tailwind config**(可信侧复算 CSS 字节),按审核裁定这一步必须排在
+   「demo node_modules 前置门」之后。而构建核心不能反向 import 整个 fs-utils
+   (会把 git/hash 全套拖进 demo 拷贝),于是把探测实现放进 repo-glob ——
+   它本来就是构建核心与 fs-utils 共用、且随模板拷进 demo 的零依赖模块。
+   fs-utils.checkDemoNoNodeModules 改为复用本函数,**只有一份实现**,不会漂移。 */
+export function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
+  const hits = [];
+  const walk = (dir, rel) => {
+    if (hits.length >= limit) return;
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.isSymbolicLink()) {
+        // symlink 到依赖目录同样能被 module resolution 命中,一并算
+        if (e.isSymbolicLink() && e.name === 'node_modules') hits.push(rel ? `${rel}/${e.name}` : e.name);
+        continue;
+      }
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.name === 'node_modules') { hits.push(childRel); continue; }
+      if (e.name === '.git') continue;
+      walk(join(dir, e.name), childRel);
+    }
+  };
+  walk(demoDir, '');
+  return hits;
+}
+
 /* ── 受限 glob 语法的**白名单式**校验(r5 #2c-b P0) ──
    本模块只实现 `*` / `**` / `?` 三种通配。r4 用黑名单挡 `{}()!,`,漏了字符类 `[ab]`:
    globToRegExp 把中括号**转义成字面量**,而 Tailwind 用的 fast-glob/micromatch 把它当
