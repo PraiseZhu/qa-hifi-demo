@@ -10,6 +10,14 @@
 //   修法:核心观察(浏览器门 + 字节复算)全部排在执行 demo 代码**之前**;之后再复算一次
 //   输入 hash 作纵深(不是主防线 —— 攻击能恢复原文件让前后 hash 都自洽)。
 //
+// 条目 2(破坏性接口变更)
+//   component.css.content 从 glob 降级为**显式 repo-relative 文件路径列表**。自研 glob 语义
+//   已被证伪四次、复用 fast-glob 后仍留三条残余(relative 靠静态扫描、fast-glob 未必与
+//   tailwind 内部同源、plugin/preset 不递归入链)。Tailwind v3 没有公开稳定 API 能导出真实
+//   file set,于是收回语义解释权:只接受显式文件,构建时转绝对路径传 --content ——
+//   CLI override 之后 config.content 与 config.content.relative 都不再决定集合。
+//   不变式 S ⊆ E = L(实扫集 ⊆ 期望集 = 入链集)由**参数结构**保证,不靠事后猜测。
+//
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,7 +26,10 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpat
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
+import { explicitContentFileProblem, restrictedGlobProblem } from '../lib/repo-glob.mjs';
+import { resolveContentFiles } from '../lib/component-build-core.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const CORE = join(ROOT, 'scripts/lib/component-build-core.mjs');
@@ -284,4 +295,209 @@ test('条目 1 事后 hash 纵深(实跑): 自定义门改写 index.html → 门
   const v = run(VERIFY, ['--demo', dir], { env: env() });
   assert.notEqual(v.status, 0, '自定义门改写输入文件后 verify 仍然全绿 = 事后 hash 复算没生效');
   assert.match(`${v.stdout}${v.stderr}`, /输入 hash 与观察前不一致/);
+});
+// ============================================================================
+// 条目 2 — content 改「显式文件路径列表」
+// ============================================================================
+
+test('条目 2 纯函数(不 skip): 显式文件校验拒 glob/越狱/绝对路径/.git/node_modules', () => {
+  const rejected = [
+    'src/**/*.tsx', 'src/*.tsx', 'src/?.tsx', 'src/[ab].tsx', 'src/{a,b}.tsx', '!src/a.tsx',
+    'src/+(a).tsx', 'src/@(a).tsx', 'src/a,b.tsx', 'src/a|b.tsx', 'src/a^.tsx', 'src/a$.tsx',
+    'src\\a.tsx', '/abs/a.tsx', '../outside.tsx', 'src/../../x.tsx', '', '   ',
+    '.git/config', 'node_modules/pkg/a.tsx', 'src/node_modules/vendor/a.tsx',
+  ];
+  for (const p of rejected) assert.ok(explicitContentFileProblem(p), `未拒绝非法 content 条目:${JSON.stringify(p)}`);
+  const accepted = ['src/a.tsx', 'apps/desktop/src/Foo.tsx', 'src/中文文件.tsx', 'src/a-b_c.1.tsx'];
+  for (const p of accepted) assert.equal(explicitContentFileProblem(p), null, `误杀合法显式文件:${p}`);
+  // 报错文案必须写清迁移方式(破坏性变更)
+  assert.match(explicitContentFileProblem('src/**/*.tsx'), /显式|glob/);
+  // r5 的受限 glob 白名单保留(仍服务 component.sources 等其它路径)
+  assert.equal(typeof restrictedGlobProblem, 'function');
+});
+
+test('条目 2 源码契约(不 skip): content 路径不再做任何 glob 展开;--content 传绝对路径', () => {
+  const core = readFileSync(CORE, 'utf8');
+  assert.match(core, /export function resolveContentFiles/, '必须有显式文件解析入口');
+  assert.ok(!/expandTailwindContent/.test(stripComments(core)), '构建核心仍在对 content 做 glob 展开');
+  assert.ok(!/expandRepoGlob\(repoRoot, pattern\)/.test(core), '构建核心仍在用自研展开算 tailwind content');
+  assert.match(core, /S ⊆ E = L/, '不变式必须写进代码注释');
+  // 两侧(可信侧复算 / demo 侧薄壳 build)必须共用同一份参数构造,否则字节复算会误杀
+  assert.match(core, /export function contentCliArg/);
+  const tpl = readFileSync(join(ROOT, 'templates/component-build.mjs'), 'utf8');
+  assert.match(tpl, /contentCliArg\(/, '薄壳模板必须复用同一份 --content 参数构造');
+  assert.ok(!/comp\.css\.content\.join\(','\)/.test(tpl), '模板仍在直接 join 相对路径 → 语义解释权没收回');
+  assert.ok(!/comp\.css\.content\.join\(','\)/.test(core), '可信侧仍在直接 join 相对路径');
+  // repo-glob 里 content 专用的 fast-glob 展开已下线(其它 glob 用途保留)
+  const rg = readFileSync(join(ROOT, 'scripts/lib/repo-glob.mjs'), 'utf8');
+  assert.ok(!/export function expandTailwindContent/.test(rg), 'content 的 fast-glob 展开应随本轮下线');
+  assert.match(rg, /export function explicitContentFileProblem/);
+  assert.match(rg, /export function expandRepoGlob/, 'assets/sources 等其它 glob 用途必须保留');
+});
+
+test('条目 2 集成(实跑真 tailwind): CLI override 后 Tailwind 实扫集恰等于 manifest 的 resolved list', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到清单阶段');
+  const { repo, dir } = makeFixture({
+    name: 'exact-set',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'apps/desktop/tailwind.config.js', content: ['src/Declared.tsx', 'apps/desktop/src/Also.tsx'] },
+    extraRepoFiles: {
+      // relative:true + 一堆 config.content 声明:CLI override 之后都不该影响集合
+      'apps/desktop/tailwind.config.js': "module.exports = { content: { relative: true, files: ['./**/*.tsx'] }, theme: {} };\n",
+      'apps/desktop/src/Also.tsx': 'export const a = "bg-lime-500";\n',
+      'src/Declared.tsx': 'export const d = "bg-sky-500";\n',
+    },
+  });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const product = JSON.parse(r.stdout).buildInputs.product;
+  const declared = ['src/Declared.tsx', 'apps/desktop/src/Also.tsx'].sort();
+  // 断言 ③ 的一半:buildInputs.product 里的 content 部分 === resolved list
+  assert.deepEqual(product.filter((p) => p.endsWith('.tsx')).sort(), declared, `入链集不等于声明集:${JSON.stringify(product)}`);
+
+  /* 交叉验证 Tailwind **实际会扫的 file set**:调当前安装版本的私有 parseCandidateFiles。
+     内部 API 不可加载或形状变化 → 本测试 fail-closed(强制升级适配),绝不 fallback 到自研 glob。 */
+  const req = createRequire(join(ROOT, 'package.json'));
+  let parseCandidateFiles;
+  let resolveConfig;
+  try {
+    ({ parseCandidateFiles } = req('tailwindcss/lib/lib/content.js'));
+    resolveConfig = req('tailwindcss/resolveConfig');
+  } catch (err) {
+    assert.fail(`tailwindcss 内部 API 不可加载(${err.message})——版本升级后必须显式适配本测试,不许退回自研 glob 语义`);
+  }
+  assert.equal(typeof parseCandidateFiles, 'function', 'parseCandidateFiles 形状变了,必须显式适配');
+  const abs = declared.map((p) => realpathSync(join(repo, p)));
+  const cfg = resolveConfig({ content: abs });
+  const entries = parseCandidateFiles({ tailwindConfig: cfg }, cfg);
+  assert.equal(entries.length, abs.length, `Tailwind 解析出的条目数不等于声明数:${JSON.stringify(entries)}`);
+  for (const e of entries) {
+    // 关键:显式绝对文件路径 ⇒ glob 为 null ⇒ 扫描集**就是**这个文件,不存在语义差异空间
+    assert.equal(e.glob, null, `声明项被当成 glob 解释了(${e.original})——不变式 E = L 不成立`);
+    assert.ok(abs.includes(realpathSync(e.base)), `Tailwind 会扫一个我们没声明的路径:${e.base}`);
+  }
+  assert.deepEqual(entries.map((e) => realpathSync(e.base)).sort(), abs.slice().sort(), '实扫集 ≠ 声明集');
+
+  // resolveContentFiles(可信侧唯一实现)与上面 Tailwind 的解释必须一致
+  assert.deepEqual(resolveContentFiles(repo, ['src/Declared.tsx', 'apps/desktop/src/Also.tsx']).absolute.map((p) => realpathSync(p)).sort(), abs.slice().sort());
+});
+
+test('条目 2 对抗 fixture(实跑真 tailwind): 只声明的文件的 class 进 CSS,所有陷阱都不进', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走完 build');
+  /* 陷阱一次性全放:configDir 同名文件、repoRoot 同名文件、node_modules 下文件、.git 下文件、
+     dotfile、字面 [ab].tsx、`***` 形态目录、symlink、中文路径、含逗号路径。
+     每个文件放**唯一** class;只声明其中若干个。构建后:声明的必须出现,未声明的必须不出现。 */
+  const decls = { 'src/Declared.tsx': 'bg-sky-500', 'apps/desktop/src/Also.tsx': 'bg-lime-500', 'src/中文目录/文件.tsx': 'bg-rose-500' };
+  const traps = {
+    'apps/desktop/src/Declared.tsx': 'bg-amber-500',
+    'src/Also.tsx': 'bg-violet-500',
+    'src/node_modules/vendor-widget/Widget.tsx': 'bg-fuchsia-500',
+    'src/.hidden.tsx': 'bg-orange-500',
+    'src/[ab].tsx': 'bg-emerald-500',
+    'src/***/Star.tsx': 'bg-cyan-500',
+    'src/a,b.tsx': 'bg-indigo-500',
+    'src/Untouched.tsx': 'bg-yellow-500',
+  };
+  const files = {};
+  for (const [rel, cls] of Object.entries({ ...decls, ...traps })) files[rel] = `export const c = "${cls}";\n`;
+  files['apps/desktop/tailwind.config.js'] = "module.exports = { content: { relative: true, files: ['./**/*.tsx', '../../src/**/*.tsx'] }, theme: {} };\n";
+
+  const { repo, dir } = makeFixture({
+    name: 'traps',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'apps/desktop/tailwind.config.js', content: Object.keys(decls) },
+    extraRepoFiles: files,
+  });
+  // symlink 陷阱:指向一个未声明的文件
+  writeFileSync(join(repo, 'src/SymTarget.tsx'), 'export const c = "bg-pink-500";\n');
+  symlinkSync(join(repo, 'src/SymTarget.tsx'), join(repo, 'src/SymLink.tsx'));
+  // .git 下的陷阱文件
+  writeFileSync(join(repo, '.git/GitTrap.tsx'), 'export const c = "bg-stone-500";\n');
+
+  const b = run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() });
+  assert.equal(b.status, 0, `${b.stdout}${b.stderr}`);
+  const css = readFileSync(join(dir, 'assets/component.css'), 'utf8');
+  for (const cls of Object.values(decls)) assert.match(css, new RegExp(cls.replace(/[-]/g, '\\-')), `声明文件的 class ${cls} 没进 CSS`);
+  for (const [rel, cls] of Object.entries(traps)) assert.ok(!css.includes(cls), `未声明的陷阱 ${rel} 的 class ${cls} 进了 CSS —— E = L 不成立`);
+  for (const cls of ['bg-pink-500', 'bg-stone-500']) assert.ok(!css.includes(cls), `symlink/.git 陷阱的 class ${cls} 进了 CSS`);
+
+  // 断言 ③ 的另一半:逐一修改每个声明文件都让旧 report/hash 失效
+  for (const rel of Object.keys(decls)) {
+    const before = readFileSync(join(repo, rel), 'utf8');
+    writeFileSync(join(repo, rel), `${before}export const extra = "bg-gray-500";\n`);
+    const r = run(CORE, ['--check-css', '--demo', dir], { cwd: dir, env: env() });
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.notEqual(JSON.parse(r.stdout).sha256, hashFile(join(dir, 'assets/component.css')), `改 ${rel} 之后 CSS 字节复算没失效`);
+    writeFileSync(join(repo, rel), before);
+  }
+});
+
+test('条目 2 不扩大扫描集(实跑真 tailwind): config.relative / config.content / plugin 都不改集合;改 plugin 让旧 CSS 被拒', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走完 build');
+  const { repo, dir } = makeFixture({
+    name: 'no-widen',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] },
+    extraRepoFiles: {
+      'tw-plugin.js': "module.exports = function ({ addUtilities }) { addUtilities({ '.qa-mark': { color: '#111111' } }); };\n",
+      'src/Sneaky.tsx': 'export const s = "bg-emerald-500";\n',
+    },
+  });
+  // config 里 relative:true + 声明一堆 content + require 一个 plugin:集合不该被扩大
+  writeFileSync(
+    join(repo, 'tailwind.config.js'),
+    "module.exports = { content: { relative: true, files: ['./src/**/*.tsx'] }, theme: {},"
+    + " plugins: [require('./tw-plugin.js')], safelist: ['qa-mark'] };\n",
+  );
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const css = readFileSync(join(dir, 'assets/component.css'), 'utf8');
+  assert.ok(!css.includes('bg-emerald-500'), 'config.content 把未声明文件带进了扫描集 —— override 没生效');
+  assert.match(css, /#111111/, 'plugin 的产物应在 CSS 里(它不改扫描集,但改字节)');
+  const inputs = readJson(join(dir, 'component.inputs.json'));
+  assert.deepEqual(inputs.buildInputs.product.filter((p) => p.endsWith('.tsx')), ['src/StyleOnly.tsx']);
+  assert.ok(!inputs.buildInputs.product.includes('tw-plugin.js'), '前提:plugin 依赖确实不在入链清单里(靠 CSS 字节复算兜)');
+
+  // 改 plugin(不在入链清单里)→ trusted CSS 字节复算立刻不符 → verify 红
+  writeFileSync(
+    join(repo, 'tw-plugin.js'),
+    "module.exports = function ({ addUtilities }) { addUtilities({ '.qa-mark': { color: '#222222' } }); };\n",
+  );
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, 'plugin 改了没重建,verify 必须红');
+  assert.match(`${v.stdout}${v.stderr}`, /CSS 字节与可信侧复算结果不一致/);
+});
+
+test('条目 2 破坏性迁移(实跑): 旧式 glob content 直接被拒并给出迁移指引', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到 content 校验');
+  const { dir } = makeFixture({
+    name: 'legacy-glob',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/**/*.tsx'] },
+  });
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, '旧式 glob content 必须被拒(破坏性变更)');
+  const out = `${v.stdout}${v.stderr}`;
+  assert.match(out, /component\.css\.content/);
+  assert.match(out, /显式/, '报错必须写清迁移方式:改成显式文件路径列表');
+  // 生成器提示:让作者知道有工具可以把当前 glob 展成建议清单
+  assert.match(out, /--suggest-content|生成器/);
+});
+
+test('条目 2 版本联动(不 skip): tailwindcss/fast-glob/micromatch 版本变化必须触发本套集成测试', () => {
+  const pkg = readJson(join(ROOT, 'package.json'));
+  const dev = { ...(pkg.devDependencies ?? {}), ...(pkg.dependencies ?? {}) };
+  assert.ok(dev.tailwindcss, 'tailwindcss 必须钉成依赖,否则真 tailwind 分支无法被真跑');
+  const lock = readJson(join(ROOT, 'package-lock.json'));
+  const pinned = readJson(join(ROOT, 'scripts/__tests__/fixtures/r7-content-engine-versions.json'));
+  const versionOf = (name) => lock.packages?.[`node_modules/${name}`]?.version ?? null;
+  for (const name of Object.keys(pinned)) {
+    assert.equal(
+      versionOf(name),
+      pinned[name],
+      `${name} 版本从 ${pinned[name]} 变成 ${versionOf(name)} —— content 扫描语义可能变了。`
+      + '\n请重跑本文件的「条目 2 集成/对抗 fixture」两条实跑测试确认 E = L 仍成立,'
+      + '再把 scripts/__tests__/fixtures/r7-content-engine-versions.json 更新到新版本。'
+      + '\n(tailwind 的 parseCandidateFiles 是包内私有 API,不是升级稳定契约,必须每次显式适配。)',
+    );
+  }
 });

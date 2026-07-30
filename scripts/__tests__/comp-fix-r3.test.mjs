@@ -273,7 +273,10 @@ test('#2c-a 复算路径不执行 demo 目录里的代码(伪 build.mjs 的副�
 
 // ==================== #2c-b tailwind content 入链 ====================
 
-const CSS_SPEC = { tailwindConfig: 'tailwind.config.js', content: ['src/styles/*.css'] };
+/* r7 条目 2:content 从 glob 降级为**显式文件路径列表**(破坏性接口变更)。
+   下面三条 #2c-b 回归的意图不变(content 命中的文件必须逐个入链、非法声明必须 exit 2),
+   只是声明形态从 glob 改成显式清单;拒收范围只扩大不缩小(glob 现在也在拒收之列)。 */
+const CSS_SPEC = { tailwindConfig: 'tailwind.config.js', content: ['src/styles/extra.css', 'src/styles/theme.css'] };
 
 test('#2c-b content 命中的文件逐个进 buildInputs.product,改它 → 旧 report 被拒', (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
@@ -308,23 +311,27 @@ test('#2c-b content 命中的文件逐个进 buildInputs.product,改它 → 旧 
   );
 });
 
-test('#2c-b content glob 零命中 → exit 2(声明了却匹配不到 = 配置错误)', (t) => {
+test('#2c-b content 声明了不存在的文件 → exit 2(r7 变形:等价于旧「glob 零命中」)', (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
   const { dir } = makeFixture({
     name: 'content-nomatch',
     boot: 'renderTarget',
     exportName: 'Claimed',
-    css: { tailwindConfig: 'tailwind.config.js', content: ['src/styles/*.css'] },
+    // 声明了不存在的文件:r6 的等价情形是「glob 零命中」,r7 直接就是「文件不存在」——
+    // 两者同一个危害(CSS 按更小的集合编译却不被发现),都必须 exit 2。
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/styles/theme.css'] },
   });
   const r = buildDemo(dir);
-  assert.equal(r.status, 2, `零命中 content 居然构建成功:${r.stdout}${r.stderr}`);
-  assert.match(r.stdout + r.stderr, /零命中/);
-  assert.match(r.stdout + r.stderr, /src\/styles\/\*\.css/);
+  assert.equal(r.status, 2, `声明了不存在的 content 文件居然构建成功:${r.stdout}${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /文件不存在/);
+  assert.match(r.stdout + r.stderr, /src\/styles\/theme\.css/);
 });
 
-test('#2c-b content 用了非标准 glob(brace / 否定 / 绝对路径)→ exit 2 并说明受限格式', (t) => {
+test('#2c-b content 非显式文件形态(glob / brace / 否定 / 绝对路径 / 目录 / 越狱 / node_modules)→ exit 2', (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置');
-  for (const pattern of ['src/**/*.{ts,tsx}', '!src/skip.css', '/abs/path/*.css']) {
+  // r7 起 glob 本身也在拒收之列,清单里因此新增 '*' / '?' / 字符类 / 目录 形态
+  for (const pattern of ['src/**/*.{ts,tsx}', '!src/skip.css', '/abs/path/*.css', 'src/styles/*.css',
+    'src/styles/[ab].css', 'src/styles/?.css', 'src/styles', 'node_modules/pkg/a.css', '../outside.css']) {
     const { dir } = makeFixture({
       name: `content-badglob-${Buffer.from(pattern).toString('hex').slice(0, 8)}`,
       boot: 'renderTarget',
@@ -336,6 +343,10 @@ test('#2c-b content 用了非标准 glob(brace / 否定 / 绝对路径)→ exit 
     assert.equal(r.status, 2, `${JSON.stringify(pattern)} 居然被接受:${r.stdout}${r.stderr}`);
     // r5 #2c-b:黑名单改成白名单式字符扫描,报文措辞随之改为「受限 glob」
     // (拒收范围只扩大不缩小:brace/否定/绝对路径依旧拒,另新增字符类等元字符)
-    assert.match(r.stdout + r.stderr, /不是本工具可解析的受限 glob|不允许绝对路径/);
+    // r7:报文统一为「content 只接受显式文件路径」+ 迁移指引(目录/越狱/依赖目录另有专门措辞)
+    assert.match(
+      r.stdout + r.stderr,
+      /含 glob\/元字符|不允许绝对路径|不是普通文件|越狱|默认拒绝 node_modules/,
+    );
   }
 });
