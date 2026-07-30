@@ -334,6 +334,8 @@ test('#2c-b content 用了非标准 glob(brace / 否定 / 绝对路径)→ exit 
     });
     const r = buildDemo(dir);
     assert.equal(r.status, 2, `${JSON.stringify(pattern)} 居然被接受:${r.stdout}${r.stderr}`);
-    assert.match(r.stdout + r.stderr, /不是本工具可解析的标准 glob/);
+    // r5 #2c-b:黑名单改成白名单式字符扫描,报文措辞随之改为「受限 glob」
+    // (拒收范围只扩大不缩小:brace/否定/绝对路径依旧拒,另新增字符类等元字符)
+    assert.match(r.stdout + r.stderr, /不是本工具可解析的受限 glob|不允许绝对路径/);
   }
 });

@@ -241,14 +241,19 @@ test('r4 端到端: 绿基线上事后植入 demo/node_modules → verify 转红
   assert.equal(run(VERIFY, ['--demo', dir]).status, 0, '基线应先绿');
   assert.equal(run(ASSETS_MANIFEST, ['--demo', dir]).status, 0);
   assert.equal(run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team']).status, 0, '基线应能出块');
+  const baselineReport = readJson(join(dir, 'report.json'));
 
   const marker = plantMaliciousEsbuild(repo, dir);
   const v = run(VERIFY, ['--demo', dir]);
   assert.notEqual(v.status, 0, 'demo 带上依赖目录后 verify 居然还绿');
-  const report = readJson(join(dir, 'report.json'));
-  assert.equal(report.gateA.pass, false);
-  assert.equal(report.gateA.inputsRecheck, 'bad-builder');
-  assert.match(report.gateA.detail, /demo 目录不应自带 node_modules/);
+  /* r5 P0-2 把这道检查前移成**无条件 fail-fast**:命中即 process.exit,不再「置
+     gateA.pass=false 后继续跑到 launchChromium」。所以断言从「report 里门 A 变红」
+     改成更强的形态——verify 根本没跑到写 report 这一步(磁盘上还是上一轮的绿报告),
+     失败信息直接由 stdout 给出。这是收紧不是放松:r4 的形态下恶意依赖仍会在标红之后
+     被浏览器/动态 import 路径加载,r5 连门都进不去。 */
+  assert.match(v.stdout + v.stderr, /demo 目录不应自带 node_modules/);
+  assert.equal(readJson(join(dir, 'report.json')).generatedAt, baselineReport.generatedAt,
+    'fail-fast 必须早于任何门执行 —— report.json 不应被本次运行改写');
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team']);
   assert.equal(pr.status, 2, `report 未过必须 exit 2:${pr.stdout}${pr.stderr}`);
   assert.equal(existsSync(marker), false, 'verify/pr-block 全程都不许执行 demo 目录里的代码');

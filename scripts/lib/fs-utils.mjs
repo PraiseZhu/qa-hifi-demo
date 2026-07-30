@@ -170,10 +170,14 @@ const CANONICAL_BUILD_FILES = {
  * demo 目录(含任意子目录)里出现的 node_modules —— 返回相对路径列表(空 = 干净)。
  * 只找目录名,不下钻进 node_modules 内部(命中即停,别把整棵依赖树走一遍)。
  */
+/* r5(#2c-a):去掉 depth>8 的静默停止 —— 声明是「任意子目录出现 node_modules 即拒」,
+   而 8 层上限让 demo/d0/../d8/node_modules 直接逃过检查,声明与实现不符。
+   现在完整遍历(普通 symlink 不跟随、命中 node_modules 即停、跳过 .git),
+   limit 只截断**报文里列举的条数**,不影响「是否命中」的判定。 */
 function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
   const hits = [];
-  const walk = (dir, rel, depth) => {
-    if (hits.length >= limit || depth > 8) return;
+  const walk = (dir, rel) => {
+    if (hits.length >= limit) return;
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
@@ -185,30 +189,38 @@ function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.name === 'node_modules') { hits.push(childRel); continue; }
       if (e.name === '.git') continue;
-      walk(join(dir, e.name), childRel, depth + 1);
+      walk(join(dir, e.name), childRel);
     }
   };
-  walk(demoDir, '', 0);
+  walk(demoDir, '');
   return hits;
 }
 
-export function checkDemoBuilderIntegrity(demoDir) {
-  const problems = [];
-  /* ── fail-closed:demo 自身不装依赖(审核 r4 CRITICAL 的等价变体封堵) ──
-     构建期文件的具名 hash 表只钉死 4 个文件,node_modules 既不入哈希链也不在表里。
-     而模块解析是另一条能把 demo 侧代码送进本进程的侧路:只要某个候选目录解析到
-     `<demo>/node_modules/<pkg>`,随后的 import 就会同步执行它的顶层代码。
-     解析候选已经去掉了 cwd/demoDir,这里再加一道结构性拒收:demo 目录及其任意
-     子目录只要存在 node_modules,一律不合规,不做复算比对。 */
+/* ── fail-closed:demo 自身不装依赖(r5 P0-2 把它前移成无条件 fail-fast) ──
+   构建期文件的具名 hash 表只钉死 4 个文件,node_modules 既不入哈希链也不在表里。
+   而模块解析是另一条能把 demo 侧代码送进本进程的侧路:只要某个候选目录解析到
+   `<demo>/node_modules/<pkg>`,随后的 import 就会同步执行它的顶层代码
+   (playwright 就是这么被利用的,见 lib/resolve-playwright.mjs 头注)。
+   r4 只把这道检查挂在**组件模式**的 recheckComponentInputs 上,而且命中后只置
+   gateA.pass=false 就继续跑到 launchChromium —— 经典模式 demo 完全不设防,
+   组件模式也在「标红之后」才去启动浏览器,恶意依赖照样被加载。
+   r5:任何 demo(不限模式)在 verify/pr-block 做任何动态 import、启动浏览器、
+   执行 demo 侧代码**之前**无条件跑这一道,命中即退出。 */
+export function checkDemoNoNodeModules(demoDir) {
   const nodeModules = findDemoNodeModules(demoDir);
-  if (nodeModules.length)
-    problems.push(
-      `demo 目录不应自带 node_modules,检测到依赖目录,拒绝——demo 自身不装依赖:${nodeModules.join(', ')}`
-      + '\n组件模式的构建期依赖(esbuild 等)只从产品仓或 QA_HIFI_MODULE_ROOT 解析;'
-      + 'demo 侧的依赖目录既不进哈希链、也不在构建期文件对照表里,是把 demo 代码送进校验进程的侧路。'
-      + '\n修法:删掉 demo 里的 node_modules(以及 package.json 里多余的 dependencies),'
-      + '需要宿主依赖时设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓。',
-    );
+  if (!nodeModules.length) return [];
+  return [
+    `demo 目录不应自带 node_modules,检测到依赖目录,拒绝——demo 自身不装依赖:${nodeModules.join(', ')}`
+    + '\n模块解析是把 demo 侧代码送进校验进程的侧路:解析到 <demo>/node_modules/<pkg> 后'
+    + '随后的 import 会同步执行它的顶层代码(任意代码执行)。这些目录既不进哈希链、'
+    + '也不在构建期文件对照表里。'
+    + '\n修法:删掉 demo 里的 node_modules(以及 package.json 里多余的 dependencies),'
+    + '需要宿主依赖时设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓。',
+  ];
+}
+
+export function checkDemoBuilderIntegrity(demoDir) {
+  const problems = [...checkDemoNoNodeModules(demoDir)];
   for (const name of DEMO_BUILD_FILES) {
     const demoFile = join(demoDir, name);
     const canonical = CANONICAL_BUILD_FILES[name];
@@ -292,6 +304,49 @@ export function recheckComponentInputs(demoDir) {
       `${COMPONENT_INPUTS_FILE} 与 esbuild 独立复算结果不一致——清单被手改过(或改了 spec/源码后没重跑 build)。`
       + `${diff.length ? `\n  ${diff.join('\n  ')}` : ''}`
       + '\n修法:node build.mjs 重生清单,再重跑 verify。',
+    ],
+  };
+}
+
+/**
+ * 可信侧复算 bundle 字节(r5 #1c 第一层):跑 **skill 仓自己那份**构建核心的
+ * `--check-bundle`(write:false,不落产物、不执行 demo 目录里的任何代码),
+ * 拿到「按当前 spec/源码应该得到的 bundle」的 sha256,与磁盘上的 bundle 全等比对。
+ *
+ * 堵两件事:
+ *   ① 手改 bundle(往产物里塞手写 UI / 删哨兵);
+ *   ② 「index.html 预占同形假封印 + 让真 bundle 的 defineProperty 抛错」这类伪造——
+ *      伪造方无法同时提供一份字节全等的**真** bundle,而真 bundle 里的哨兵是真的。
+ *
+ * 返回 { status: 'ok'|'mismatch'|'error'|'n/a', problems }。
+ */
+export function recheckComponentBundle(demoDir, component) {
+  const rel = typeof component?.bundle === 'string' && component.bundle ? component.bundle : 'assets/component.bundle.js';
+  const abs = join(demoDir, rel);
+  if (!existsSync(abs)) return { status: 'error', problems: [`component.bundle 不存在:${rel}——先跑 node build.mjs`] };
+  let fresh;
+  try {
+    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-bundle', '--demo', demoDir], {
+      cwd: demoDir,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    fresh = JSON.parse(out);
+  } catch (err) {
+    return {
+      status: 'error',
+      problems: [`可信侧复算 bundle 字节失败(skill 侧 component-build-core --check-bundle):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
+    };
+  }
+  const actual = hashFile(abs);
+  if (fresh?.sha256 === actual) return { status: 'ok', problems: [] };
+  return {
+    status: 'mismatch',
+    problems: [
+      `${rel} 的 bundle 字节与可信侧复算结果不一致——产物不是当前 spec/源码用 canonical 构建规范生成的。`
+      + `\n  磁盘 sha256:${actual}\n  可信侧复算:${fresh?.sha256 ?? '(无)'}`
+      + '\n可能原因:手改过 bundle(塞手写 UI / 摘哨兵)、改完源码没重跑 build、或用了别的构建器。'
+      + '\n修法:node build.mjs 重新产出,再重跑 verify。',
     ],
   };
 }

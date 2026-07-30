@@ -12,12 +12,15 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
+  checkDemoNoNodeModules,
   failJson,
   failProblems,
   readComponentInputsManifest,
+  recheckComponentBundle,
   recheckComponentInputs,
   sha256Buffer,
   stableJson,
@@ -33,6 +36,12 @@ const demoIdx = args.indexOf('--demo');
 if (demoIdx === -1 || !args[demoIdx + 1]) failJson('缺 --demo <dir>');
 const demoDir = resolve(args[demoIdx + 1]);
 const headed = args.includes('--headed');
+// --report-out <file>:把 report 写到指定路径而不是 <demo>/report.json。
+// 供 pr-block 在**可信侧重跑全门**时使用(r5 架构主线 P0-1):重跑结果落在 demo 之外,
+// 既不覆盖作者的 report.json,也不让被审对象碰到我们自己的裁决依据。
+const reportOutIdx = args.indexOf('--report-out');
+if (reportOutIdx !== -1 && !args[reportOutIdx + 1]) failJson('--report-out 需要一个文件路径');
+const reportOut = reportOutIdx !== -1 ? resolve(args[reportOutIdx + 1]) : join(demoDir, 'report.json');
 
 function listArg(flag) {
   const i = args.indexOf(flag);
@@ -50,6 +59,16 @@ if (gateFilter) {
 }
 const partial = !!(gateFilter || caseFilter || stateFilter);
 const runGate = (letter) => !gateFilter || gateFilter.includes(letter);
+
+/* ── 无条件 fail-fast:demo 自带 node_modules 一律拒(r5 P0-2) ──
+   必须排在**任何** demo 侧输入解析、动态 import、子进程执行、浏览器启动之前:
+   playwright/esbuild 这类模块一旦从 <demo>/node_modules 解析出来,import 的瞬间
+   它的顶层代码就在本进程里跑了。不限组件模式,对所有 demo 生效;命中即退出,
+   不是「标红后继续」。 */
+{
+  const problems = checkDemoNoNodeModules(demoDir);
+  if (problems.length) failProblems(problems);
+}
 
 for (const f of ['spec.json', 'truth.json', 'index.html'])
   if (!existsSync(join(demoDir, f))) failJson(`${f} 不存在于 ${demoDir}`);
@@ -139,6 +158,15 @@ else {
       gateA.pass = false;
       gateA.detail = [gateA.detail, ...recheck.problems].filter(Boolean).join('\n');
     }
+    // r5 #1c 第一层:bundle 字节必须等于可信侧 write:false 复算结果
+    // (堵手改 bundle,也堵「预占同形假封印 + 让真 bundle 初始化失败」——
+    //  伪造方拿不出一份字节全等的真 bundle)。
+    const bundleCheck = recheckComponentBundle(demoDir, spec.component);
+    gateA.bundleRecheck = bundleCheck.status;
+    if (bundleCheck.problems.length) {
+      gateA.pass = false;
+      gateA.detail = [gateA.detail, ...bundleCheck.problems].filter(Boolean).join('\n');
+    }
   }
 }
 
@@ -149,6 +177,8 @@ let page = null;
 let currentPageKey = null;
 const artifactDir = join(demoDir, 'verify-artifacts');
 let shotSeq = 0;
+/** 页面未捕获异常(r5 #1c 第二层);哨兵断言时非空即 fail-closed。 */
+const pageErrors = [];
 
 /** per-case 视口:case 声明 viewport(w/h/dpr)时换新 page——移动端 case 必须在移动端视口下验。 */
 async function pageFor(testCase = {}) {
@@ -160,6 +190,11 @@ async function pageFor(testCase = {}) {
     viewport: { width: vp?.w ?? 1440, height: vp?.h ?? 960 },
     ...(vp?.dpr ? { deviceScaleFactor: vp.dpr } : {}),
   });
+  /* r5 #1c 第二层:监听 pageerror。组件模式的 bundle 初始化是**故意不 try/catch** 的——
+     哨兵 defineProperty 撞上「页面侧预占的不可配置同名全局」时会抛错,bundle 整段初始化
+     失败。r4 的 verify 不听 pageerror,于是读到的是预占的那份假封印。现在任何未捕获
+     页面异常都被记下,哨兵断言处 fail-closed。 */
+  page.on('pageerror', (err) => { pageErrors.push(String(err?.message ?? err).slice(0, 300)); });
   currentPageKey = key;
   return page;
 }
@@ -216,21 +251,47 @@ try {
       // 只认封印形态的证据(r4 追加 #1c):证据存在 bundle 模块闭包里,页面侧只能读
       // 一个 non-writable/non-configurable 全局上的 get-only snapshot。
       // demo 侧写任何可写全局都影响不了它;形态不对 = 有人顶替了哨兵,当造假处理。
-      const raw = await p.evaluate(() => {
+      /* bundle 初始化期抛错 = 哨兵没能装上(最常见成因:页面侧预占了同名不可配置全局,
+         让真 bundle 的 defineProperty 抛错)。此时页面上留下的那份「证据」必然不是
+         哨兵写的,一律按造假处理(r5 #1c 第二层)。 */
+      if (pageErrors.length)
+        throw new Error(
+          `bundle 初始化期页面抛错,哨兵未能装上——不接受页面上残留的任何「证据」:${pageErrors.slice(0, 3).join(' | ')}`
+          + '\n最常见成因:index.html 在 bundle 之前预占了 globalThis.__QA_ENTRY_SENTINEL__(不可配置),'
+          + '导致真哨兵的 defineProperty 抛错。'
+          + '\n修法:删掉 demo 侧对 __QA_ENTRY_* 的任何定义/赋值,重跑 node build.mjs。',
+        );
+      // challenge:每次运行一个不可预测 nonce,回应必须原样带回(r5 #1c 第三层)。
+      // 静态预置的冻结 snapshot 预知不了它;要能回应就得写真函数,而那躲不过字节复算与 pageerror。
+      const challenge = randomUUID();
+      const raw = await p.evaluate((nonce) => {
         const d = Object.getOwnPropertyDescriptor(globalThis, '__QA_ENTRY_SENTINEL__');
         if (!d) return { present: false };
         const sd = d.value && typeof d.value === 'object' ? Object.getOwnPropertyDescriptor(d.value, 'snapshot') : null;
+        const pd = d.value && typeof d.value === 'object' ? Object.getOwnPropertyDescriptor(d.value, 'prove') : null;
         let snap = null;
         try { snap = d.value?.snapshot ?? null; } catch { snap = null; }
+        let proof = null;
+        try { proof = d.value?.prove?.(nonce) ?? null; } catch { proof = null; }
         return {
           present: true,
           sealed: d.writable === false && d.configurable === false,
           accessorOk: !!sd && typeof sd.get === 'function' && sd.set === undefined && sd.configurable === false,
+          proveOk: !!pd && typeof pd.value === 'function' && pd.writable === false && pd.configurable === false,
           frozen: !!d.value && Object.isFrozen(d.value),
           snap,
+          proof,
         };
-      });
-      const st = { rendered: raw.snap?.rendered === true, targetRendered: raw.snap?.targetRendered === true, shape: raw.snap?.shape ?? null };
+      }, challenge);
+      // 结论一律取 challenge 回应(而不是静态 snapshot)——静态形状只用于形态校验
+      const st = { rendered: raw.proof?.rendered === true, targetRendered: raw.proof?.targetRendered === true, shape: raw.proof?.shape ?? null };
+      if (raw.present && !(raw.proveOk && raw.proof && raw.proof.nonce === challenge))
+        throw new Error(
+          '哨兵未按 challenge 回应——页面上的 __QA_ENTRY_SENTINEL__ 不是本次 bundle 里那个活的哨兵'
+          + `(prove 形态:${raw.proveOk} 回应 nonce:${JSON.stringify(raw.proof?.nonce ?? null)} 期望:${challenge})。`
+          + '\n静态预置的同形封印能仿造形状,但预知不了每次运行才生成的 nonce。'
+          + '\n修法:删掉 demo 侧对 __QA_ENTRY_* 的任何定义/赋值,重跑 node build.mjs。',
+        );
       if (!st.shape?.sentinel)
         throw new Error('运行期哨兵未在页面里出现——assets/component.bundle.js 不是当前 build.mjs 产出的(手改过 bundle?),重跑 node build.mjs');
       if (!(raw.sealed && raw.accessorOk && raw.frozen))
@@ -655,7 +716,7 @@ try {
     gateX,
     generatedAt: new Date().toISOString(),
   };
-  writeFileSync(join(demoDir, 'report.json'), JSON.stringify(report, null, 2) + '\n');
+  writeFileSync(reportOut, JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report, null, 2));
   process.exitCode = allPass ? 0 : 2;
 } catch (err) {

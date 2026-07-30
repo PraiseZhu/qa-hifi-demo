@@ -69,12 +69,27 @@ hash 入链，而界面完全可以是 bootstrap 手搓的。构建期给 `entry
 实例化（React 调函数组件、`new` 类组件、`memo`/`forwardRef` 的 `render`）时置位；verify 在
 门 B 挂载完成后、第一个状态断言前查一次。
 
-**哨兵证据是封印的，demo 侧写不了（r4）**：置位与计数留在 bundle 的模块闭包里，对外只暴露一个
-`writable:false` / `configurable:false` 的全局 `__QA_ENTRY_SENTINEL__`，其上只有 get-only 的
-`snapshot` 访问器；verify 先校验这三项封印形态（不可写 / 只读访问器 / 对象已冻结）再读值，形态
-不对即按造假处理。r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_RENDERED__`
-上，而 bootstrap 是允许作者编辑的输入——「只持引用不调用 + 直接把布尔量写 true + 手搓 UI」
-当时能拿到 `proved`。现在 demo 侧对旧字段的任何赋值都不再有作用。
+**哨兵证据由可信侧观察，不靠 demo 侧提供的形状（r5）**：置位与计数留在 bundle 的模块闭包里，
+对外只暴露一个 `writable:false` / `configurable:false` 的全局 `__QA_ENTRY_SENTINEL__`。
+r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_RENDERED__` 上——
+「只持引用不调用 + 把布尔量写 true + 手搓 UI」当时能拿到 `proved`；r4 改成封印形态校验
+（不可写 / 只读访问器 / 对象已冻结）后，**这套形状本身是公开可仿造的**：index.html 在 bundle
+之前抢先 `defineProperty` 一个同形封印（不可配置的 `snapshot` getter），真 bundle 的
+`defineProperty` 抛错、verify 又不听 `pageerror`，于是读到的是假证据。r5 起三层叠加，全部落在
+可信侧：
+
+* **bundle 字节全等复算**：门 A 跑 skill 仓自己那份 `component-build-core.mjs --check-bundle`
+  （`write:false`，不落产物、不执行 demo 目录里的任何代码）现算一遍期望产物，与磁盘上的
+  `assets/component.bundle.js` 做 sha256 全等比对。伪造方要过这关就得提供一份**字节全等的真
+  bundle**，而真 bundle 里的哨兵是真的；顺带堵死一切手改 bundle（塞手写 UI / 摘哨兵）。
+* **`pageerror` fail-closed**：verify 监听页面未捕获异常，哨兵断言处非空即硬失败——预占封印
+  导致真 bundle 初始化抛错的场景在这里直接暴露（bundle 初始化**故意不 try/catch**）。
+* **不可预测 challenge**：封印上有不可写/不可配置的 `prove(nonce)`，回应原样带回 nonce；
+  verify 每次运行生成随机 nonce，并**以回应而非静态 `snapshot` 为结论来源**，回应缺失或 nonce
+  不符即硬失败。静态预置的冻结对象预知不了 nonce；要能回应就得写真函数，而那躲不过前两层。
+
+封印形态校验仍在（不可写 / 只读访问器 / `prove` 形态 / 对象已冻结），但它只是形态检查，
+**不再是结论的来源**。
 
 判定分三种（`manifest.entrySentinel`）：
 
@@ -106,8 +121,13 @@ import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bun
 省略/空数组一律 schema + build 双重 fail-closed，因为不显式声明时 Tailwind 会按
 `tailwind.config.js` 里的 `content` **隐式扫描**，那些样式源文件不进防伪链，改了 hash 不变、
 旧 CSS + 旧 report 照过；build 现在始终用显式 `--content` 覆盖 config。每个 glob 必须是仓内
-相对的标准 glob——只支持 `*` / `**` / `?`；`{a,b}`、`!` 否定、绝对路径、`require()`/对象形式
-一律拒；任一 glob 零命中也直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链。
+相对的**受限 glob**——r5 起改成**白名单式字符扫描**：只允许 `A-Za-z0-9` 与 `_ - . / * ?`
+（外加非 ASCII 文件名字符），其余 ASCII 标点一律拒。r4 用黑名单 `{}()!,` 挡，漏了字符类：
+本工具把 `[ab]` 转义成**字面量**，Tailwind 的 fast-glob/micromatch 却当**字符类**——仓里放一个
+字面文件名 `src/[ab].tsx` 就能做到「我们零命中不入链、Tailwind 实扫 a/b」，改 a/b 不换 hash。
+所以字符类 `[ab]`、brace `{a,b}`、`!` 否定、extglob `+(a)`/`@(a)`/`!(a)`、括号、逗号多值、
+反斜杠、绝对路径、`..`、`require()`/对象形式一律 fail-closed 并点名触发的元字符；
+任一 glob 零命中也直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链。
 不需要 tailwind 就把 `component.css` 设为 `null`） / `themeVars.truthPath` /
 `fixtures[{id,why,shape?}]` / `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
 （`"inject"` / `"via"`，单一真相源）。adapter 升级：
@@ -249,13 +269,30 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
 （历史事故:全量 verify 超时把整轮验收堵死,obs 16320）。任一过滤参数出现 →
 `report.partial=true`，**pr-block 一律拒收 partial 报告**——增量只用于调试，定稿必须全量重跑。
 
+**pr-block 定稿前会在可信侧把全门重跑一遍（r5）**：`report.json` 整份都住在 demo 目录里、
+是被审方可写的，而 `inputHashes` 是用**可导出的** `buildInputHashes()` 对被审方自己控制的文件
+现算的——天然自洽，锁不住任何东西。所以「正常 build + 只持引用不调用 + 手搓 UI + **完全不跑
+verify** + 手写一份全 pass 的 `report.json`」曾能让 pr-block exit 0 并打出「真组件直渲」。
+r5 起 pr-block 用 **skill 仓自己那份 `verify.mjs`** 重跑 A/B/C/D/F/X（`--report-out` 写到 demo
+之外，不覆盖作者的 `report.json`），**以自己重跑的结果为唯一放行依据**；demo 的 `report.json`
+降级为仅供对账的自报材料——两者在 `ok`/`partial`/`entryRenderProof`/六门 pass/`gateB`·`gateD`
+计数/coverage case 集上不一致即阻断。代价是定稿时会多跑一次浏览器验收（已有其它 problems 时
+跳过重跑）。
+
 **失败取证**：任一动态门失败自动截图到 `verify-artifacts/`，failure 条目带 `screenshot`
 字段——不用再开 `--headed` 人肉复现失败现场。`verify-artifacts/` 是生成产物，不入库。
 
-> **playwright 依赖解析**:verify/pixel 需要 playwright。脚本按 `cwd` → `INIT_CWD` → skill 目录向上 →
-> 宿主 `projects/*` package root 依次解析宿主 `node_modules`(playwright 或 playwright-core),
-> Chromium 用本机缓存/系统 Chrome。宿主仓没装时打印一串 attempts + 安装提示;可用
-> `QA_HIFI_MODULE_ROOT=<装了 playwright 的目录>` 显式指定。无 playwright 时门 B/C/D/F 跑不了,门 A 仍可跑。
+> **playwright 依赖解析(r5 收紧)**:verify/pixel 需要 playwright。解析候选**只含不受 demo 目录
+> 内容左右的根**:`QA_HIFI_MODULE_ROOT` → `PLAYWRIGHT_MODULE_ROOT` → demo 所在产品仓根
+> (`git rev-parse --show-toplevel`,且必须是 demo 目录的严格祖先) → skill 自身位置,
+> 外加这些根的 package root 与宿主 `projects/*` package root;Chromium 用本机缓存/系统 Chrome。
+> **不再有 `cwd` / `INIT_CWD` / demo 目录**——它们曾让 `<demo>/node_modules/playwright/index.js`
+> 的顶层代码在 `import` 时于 verify 进程内执行(RCE),而且 demo 目录还排在候选第一位、优先于
+> 机器上真实的 Playwright。另有两道兜底:解析结果落在 demo 子树里一律拒收;且**任何 demo
+> (不限组件模式)只要目录及任意子目录存在 `node_modules`,verify / pr-block 在解析依赖、
+> 启动浏览器、执行任何 demo 侧代码之前就无条件 fail-fast 退出**(不是标红后继续)。
+> 宿主仓没装时打印一串 attempts + 安装提示;可用 `QA_HIFI_MODULE_ROOT=<装了 playwright 的目录>`
+> 显式指定。无 playwright 时门 B/C/D/F 跑不了,门 A 仍可跑。
 >
 > **大矩阵必须配 `verify.cases` 收敛**:门 B/C 对每个 `case × state` 都 freshLoad(两次页面加载),
 > 全 matrix 笛卡尔积(如 3×2×2×4=48 组 × N 状态)会慢到不可用。真实 demo 用 `spec.verify.cases`
