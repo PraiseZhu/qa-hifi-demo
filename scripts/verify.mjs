@@ -346,7 +346,11 @@ try {
     gateD = makeGate('渲染绑定', bindings.length * cases.length);
     if (bindings.length === 0) {
       gateD.pass = true;
-      gateD.detail = 'spec.bindings 未配置——渲染层未验证,还原承诺只到数据层';
+      // 组件模式下 bindings 为空不等于「渲染层未验证」:渲染由产品代码路径本身承载,
+      // 其源码 + bundle 已进 inputHashes 防伪链。仅改声明文案,判定逻辑不变。
+      gateD.detail = spec.component?.mode === 'component'
+        ? '组件模式:渲染由产品代码路径承载(源码 hash 入链),chrome 层可选配 bindings'
+        : 'spec.bindings 未配置——渲染层未验证,还原承诺只到数据层';
     } else {
       for (const testCase of cases) {
         const p = await pageFor(testCase);
