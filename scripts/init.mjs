@@ -71,10 +71,13 @@ const isComponent = mode === 'component';
 const entry = argOf('--entry');
 if (isComponent && !entry) failJson('--mode component 必须给 --entry <组件入口(相对 repoRoot 的路径)>');
 if (!isComponent && entry) failJson('--entry 只在 --mode component 下有意义');
+// 目标组件导出名(可选):不给就在 spec 里留 TODO,作者填完才可能拿到「真组件直渲」结论
+const entryExport = argOf('--entry-export');
+if (!isComponent && entryExport) failJson('--entry-export 只在 --mode component 下有意义');
 
 mkdirSync(dir, { recursive: true });
 const files = ['spec.json', 'extract.mjs', 'extract-helpers.mjs', 'index.html'];
-if (isComponent) files.push('build.mjs', 'src/bootstrap.tsx', 'shims/README.md', 'shims/_template.ts');
+if (isComponent) files.push('build.mjs', 'component-build-core.mjs', 'repo-glob.mjs', 'src/bootstrap.tsx', 'shims/README.md', 'shims/_template.ts');
 const clash = files.filter((f) => existsSync(join(dir, f)));
 if (clash.length) failJson(`拒绝覆盖已存在文件:${clash.join(', ')}(init 只用于全新 demo)`);
 
@@ -129,6 +132,11 @@ if (isComponent) {
     // 真组件入口(相对 repoRoot):必须是 bootstrap 真正 import 渲染的那个组件——
     // build.mjs 会用 esbuild metafile 核对,它不在 bundle 真实输入里就直接构建失败。
     entry,
+    // 目标组件导出名:运行期哨兵只给这个导出算「被渲染」,是拿到 PR 结论「真组件直渲」
+    // 的**唯一**途径(默认导出写 "default")。不声明 → 结论一律降级为「需人工审查」;
+    // 声明了但 entry 里没这个导出 → build.mjs 直接 exit 2(错误声明不许静默降级)。
+    // (只有 --entry-export 给了才写这一行:塞占位值会让 build 直接 exit 2)
+    ...(entryExport ? { export: entryExport } : {}),
     // 可选的人读声明(相对 repoRoot 的路径/glob)。**代码层防伪链不看这里**:
     // 真相源是 build.mjs 落下的 component.inputs.json(bundle 真实输入逐文件 sha256)。
     // 写了就必须 ⊆ 真实输入,否则 report fail-closed 拒绝出块。默认留空即可。
@@ -214,7 +222,12 @@ writeFileSync(join(dir, 'index.html'), shell);
 
 // 组件模式四件套:build.mjs / src/bootstrap.tsx / shims 骨架
 if (isComponent) {
+  // build.mjs 是薄壳,构建规范正本在 component-build-core.mjs;两份都必须与 skill
+  // canonical 逐字节一致(门 A 会 hash 比对,改写即 fail-closed「自定义构建器」)
   copyFileSync(join(SKILL_ROOT, 'templates/component-build.mjs'), join(dir, 'build.mjs'));
+  copyFileSync(join(SKILL_ROOT, 'scripts/lib/component-build-core.mjs'), join(dir, 'component-build-core.mjs'));
+  // 构建核心 import 的仓内 glob 实现(tailwind content 展开用)
+  copyFileSync(join(SKILL_ROOT, 'scripts/lib/repo-glob.mjs'), join(dir, 'repo-glob.mjs'));
   mkdirSync(join(dir, 'src'), { recursive: true });
   writeFileSync(
     join(dir, 'src/bootstrap.tsx'),
@@ -234,6 +247,8 @@ console.log(JSON.stringify({
     ? [
         '0. coupling 侦察:确认组件 render 期不碰 IPC/网络/原生能力,列出必须 shim 的依赖',
         '1. 填 spec.json component 段(rendererRoot/packageRoots/shims/css),写 shims/*(sources 可留空)',
+        '1.5 填 spec.json component.export = 目标组件导出名(默认导出写 "default")——不填的话 PR 附贴块'
+        + '拿不到「真组件直渲」结论,只会写「已打包,是否为 UI 组件需人工审查」;填错(entry 里没这个导出)build 直接 exit 2',
         '2. 写 src/bootstrap.tsx(import 真组件,Object.assign 出 states/mount/inject),node build.mjs 出 bundle',
         '3. 写 extract.mjs(含 extractThemeVars 主题桥),跑 truth.mjs --demo <dir> --embed',
         '4. spec.states[].driver 与 bootstrap 的 __qaDemo.states 键集一致,node scripts/states.mjs && verify.mjs',

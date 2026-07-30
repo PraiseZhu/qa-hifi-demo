@@ -196,26 +196,48 @@ try {
     // 界面全是 bootstrap 手搓的。这里在挂载完成后、第一个状态断言前查一次。
     // 只有哨兵真挂上(manifest.entrySentinel === 'active')才断言;entry 导出全是常量/
     // 纯数据时探针套不上,不误判为造假,由 pr-block 把结论诚实降级为「需人工审查」。
-    const sentinelExpected = isComponentMode && readComponentInputsManifest(demoDir)?.entrySentinel === 'active';
+    // r3(终审 #1c):只有 spec 声明了 component.export、且**那个目标导出**被调用,才算证明。
+    // r2 给 entry 的每个导出套探针、任一被调用即 proved —— 终审实证 entry 同时导出组件
+    // Claimed() 与工具函数 utility()、bootstrap 只调 utility() 时照样 proved,「真组件直渲」
+    // 这句话就成了假话。现在:
+    //   entrySentinel='targeted'    → 目标导出被调用 = proved;目标可探测却从未被调用 = 硬失败
+    //   entrySentinel='active'      → 未声明目标导出:只保留「一个导出都没被调用」这条硬失败,
+    //                                 结论最高只到 'nontarget'(PR 块降级,不许宣称直渲)
+    //   entrySentinel='unavailable' → 探针完全套不上,不断言,结论 'unavailable'
+    const sentinelState = isComponentMode ? readComponentInputsManifest(demoDir)?.entrySentinel : null;
+    const sentinelExpected = sentinelState === 'targeted' || sentinelState === 'active';
     let sentinelChecked = false;
-    // 'proved' = 哨兵实测入口组件被调用;'unavailable' = 探针套不上(需人工审查);
-    // 'n/a' = 非组件模式。pr-block 据此决定附贴块写「真组件直渲」还是降级文案。
+    // 'proved' = 哨兵实测**目标导出**被调用;'nontarget' = 只证明了某个入口导出被调用,
+    // 是不是 UI 组件不知道;'unavailable' = 探针套不上;'n/a' = 非组件模式。
     let entryRenderProof = isComponentMode ? 'unavailable' : 'n/a';
     const assertSentinel = async (p) => {
       if (!sentinelExpected || sentinelChecked) return;
       sentinelChecked = true;
       const st = await p.evaluate(() => ({
         rendered: globalThis.__QA_ENTRY_RENDERED__ === true,
+        targetRendered: globalThis.__QA_ENTRY_TARGET_RENDERED__ === true,
         shape: globalThis.__QA_ENTRY_SHAPE__ ?? null,
       }));
-      if (st.rendered) { entryRenderProof = 'proved'; return; }
       if (!st.shape?.sentinel)
         throw new Error('运行期哨兵未在页面里出现——assets/component.bundle.js 不是当前 build.mjs 产出的(手改过 bundle?),重跑 node build.mjs');
+      if (sentinelState === 'targeted') {
+        if (st.targetRendered) { entryRenderProof = 'proved'; return; }
+        // 目标导出存在(build 已校验)但形态套不上探针(常量/纯数据):不判造假,诚实降级
+        if (!(st.shape.targetWrappable > 0)) return;
+        throw new Error(
+          `声明的目标导出从未被渲染——component.export="${st.shape.target}" 已打包,渲染期一次调用/实例化都没发生`
+          + (st.rendered ? '(entry 的**其它**导出被调用过:调工具函数不等于渲染组件)' : '(bootstrap 是不是只做了 side-effect import?)')
+          + '\n修法:让 bootstrap 真的渲染该目标组件;若真正渲染的是别的组件,把 component.entry/component.export 改成那一个。',
+        );
+      }
+      // 未声明目标导出:能证明的上限只有「入口的某个导出被调用过」
+      if (st.rendered) { entryRenderProof = 'nontarget'; return; }
       if (!(st.shape.wrappable > 0)) return; // 探针一个都套不上:不断言,由 pr-block 降级
       throw new Error(
         'entry 已打包但从未被渲染——bootstrap 是不是只做了 side-effect import?'
         + `(哨兵:探针 ${st.shape.wrappable}/${st.shape.total} 个导出已就位,渲染期一次调用都没发生)`
-        + '\n修法:让 bootstrap 真的 import 并渲染该入口组件;若 entry 只是被间接用到,把 component.entry 改成真正渲染的那个组件。',
+        + '\n修法:让 bootstrap 真的 import 并渲染该入口组件;若 entry 只是被间接用到,把 component.entry 改成真正渲染的那个组件。'
+        + '\n另:要在 PR 上拿到「真组件直渲」结论,必须在 spec.component.export 里声明目标组件导出名。',
       );
     };
     for (const testCase of cases) {

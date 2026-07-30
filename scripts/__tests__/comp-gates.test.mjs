@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -67,17 +67,17 @@ function baseHtml(truth) {
  * 造一个「demo 位于产品仓内」的 fixture:<repo>/.git + <repo>/src/*.tsx + <repo>/qa-demo/。
  * component=false 时不写 spec.component(回归用:非组件模式旧 demo)。
  */
-// build.mjs 测试替身:--check-inputs 时回显 demo 内现有 component.inputs.json。
-// 让「清单被改 → 复算不一致」这条新门在本文件里保持中性(本文件测的是 hash 链状态机),
-// 真正的复算对抗(缩清单 / 改 build.mjs / 改 tailwind config)在 comp-fix-r2.test.mjs。
-const STUB_BUILDER = [
-  "import { readFileSync } from 'node:fs';",
-  "import { dirname, join } from 'node:path';",
-  "import { fileURLToPath } from 'node:url';",
-  "const d = dirname(fileURLToPath(import.meta.url));",
-  "if (process.argv.includes('--check-inputs')) process.stdout.write(readFileSync(join(d, 'component.inputs.json'), 'utf8'));",
-  '',
-].join('\n');
+// r3 起本文件的 fixture 跑**真** esbuild 构建(canonical build.mjs + 构建核心)。
+// r2 时这里放的是一个「--check-inputs 就回显现有清单」的 build.mjs 测试替身 —— 终审 #2c-a
+// 证明那种自证 oracle 本身就是漏洞形状(demo 侧脚本当真相源),skill 侧复算上线后
+// 替身既不合法(hash 与 canonical 不等 → fail-closed)也不必要,直接删掉。
+const DEFAULT_PRODUCT_INPUTS = ['src/Entry.tsx', 'src/components/Button.tsx'];
+const BUILD_FILES = [
+  ['templates/component-build.mjs', 'build.mjs'],
+  ['scripts/lib/component-build-core.mjs', 'component-build-core.mjs'],
+  ['scripts/lib/extract-helpers.mjs', 'extract-helpers.mjs'],
+  ['scripts/lib/repo-glob.mjs', 'repo-glob.mjs'],
+];
 
 function makeRepoDemo({
   name = 'comp',
@@ -87,15 +87,16 @@ function makeRepoDemo({
   noGit = false,
   // component.inputs.json(build.mjs 从 esbuild metafile 生成的 bundle 真实输入清单)
   // 是代码层防伪链的真相源;本 fixture 不跑真 esbuild,直接手写等价清单。
-  productInputs = ['src/Entry.tsx', 'src/components/Button.tsx'],
+  productInputs = DEFAULT_PRODUCT_INPUTS,
   demoInputs = [],
   manifest = true,
 } = {}) {
   const repo = mkdtempSync(join(tmpdir(), `qa-hifi-comp-${name}-`));
   if (!noGit) execFileSync('git', ['init', '-q'], { cwd: repo });
   mkdirSync(join(repo, 'src/components'), { recursive: true });
-  writeFileSync(join(repo, 'src/Entry.tsx'), 'export const Entry = () => null;\n');
-  writeFileSync(join(repo, 'src/components/Button.tsx'), 'export const Button = () => null;\n');
+  // Entry 真 import Button:真构建后 productInputs 恰好是这两个文件(与本文件的断言一致)
+  writeFileSync(join(repo, 'src/Entry.tsx'), "import { Button } from './components/Button';\nexport const Entry = () => Button();\n");
+  writeFileSync(join(repo, 'src/components/Button.tsx'), 'export const Button = () => "button-v1";\n');
   writeFileSync(join(repo, 'src/notes.md'), 'not a source file\n');
 
   const dir = join(repo, 'qa-demo');
@@ -115,24 +116,43 @@ function makeRepoDemo({
       noClip: ['.box'],
     },
     bindings,
-    ...(component ? { component: { mode: 'component', entry: 'src/Entry.tsx', sources, bundle: 'assets/component.bundle.js' } } : {}),
+    // 故意**不**声明 component.export:本文件同时充当「未声明目标导出 → PR 结论必须降级」
+    // 这条 r3 语义的回归(声明并证明的阳性对照在 comp-fix-r2 / comp-fix-r3)。
+    ...(component ? { component: { mode: 'component', entry: 'src/Entry.tsx', sources, bundle: 'assets/component.bundle.js', bootstrap: 'src/bootstrap.tsx' } } : {}),
   };
   writeFileSync(join(dir, 'truth.json'), stableJson(truth));
   writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
   writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
   writeFileSync(join(dir, 'assets/component.bundle.js'), '/* bundle v1 */\n');
-  // 本 fixture 不跑真 esbuild,给一个只回显现有清单的 build.mjs 测试替身,
-  // 满足「组件 demo 必须带构建器供独立复算」这条门(复算本身的对抗覆盖在 comp-fix-r2.test.mjs)。
-  writeFileSync(join(dir, 'build.mjs'), STUB_BUILDER);
-  if (component && manifest) {
-    writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({
-      generator: 'qa-hifi-demo/component-build',
-      entry: 'src/Entry.tsx',
-      productInputs,
-      demoInputs,
-      skippedExternal: 0,
-    }, null, 2)}\n`);
+  if (component) {
+    // 构建期文件必须是 skill canonical 原版:门 A 会 hash 比对(改写 = 自定义构建器 → fail-closed)
+    for (const [from, to] of BUILD_FILES) copyFileSync(join(ROOT, from), join(dir, to));
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    writeFileSync(join(dir, 'src/bootstrap.tsx'), "import { Entry } from '../../src/Entry';\nglobalThis.__demo = Entry();\n");
+    // noGit fixture 不在任何 git 仓内 → 真构建无从进行(repoRoot 不可解析,这正是它要测的
+    // UNRESOLVED 场景),只落一份等价清单;其余 fixture 一律跑真 esbuild 出 bundle + 清单。
+    if (noGit) {
+      writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({
+        generator: 'qa-hifi-demo/component-build',
+        entry: 'src/Entry.tsx',
+        entryExport: null,
+        entrySentinel: 'active',
+        productInputs,
+        demoInputs,
+        buildInputs: { demo: [], product: [] },
+        skippedExternal: 0,
+      }, null, 2)}\n`);
+    } else {
+      const b = run(join(dir, 'build.mjs'), [], { cwd: dir, timeout: 120000 });
+      assert.equal(b.status, 0, `fixture 真构建失败(需要可解析的 esbuild):${b.stdout}${b.stderr}`);
+    }
+    if (!manifest) rmSync(join(dir, 'component.inputs.json'), { force: true });
+    // 只有显式传了非默认清单的用例才改写真清单(它们测的就是 MISSING/INVALID_PATH 这些状态)
+    else if (productInputs !== DEFAULT_PRODUCT_INPUTS || demoInputs.length) {
+      const m = JSON.parse(readFileSync(join(dir, 'component.inputs.json'), 'utf8'));
+      writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify({ ...m, productInputs, demoInputs }, null, 2)}\n`);
+    }
   }
   return { repo, dir, spec };
 }
@@ -327,10 +347,11 @@ test('回归:非组件模式旧 demo 门 D 文案与附贴块不变', async (t) 
 // componentSources 记的是 NO_MATCH/MISSING/UNRESOLVED,verify 仍绿、hash 也「一致」,
 // 旧 report 照样过 pr-block。fail-closed 要求 pr-block 一律拒并说清怎么修。
 
-function verifyThenPrBlock(dir, env) {
+function verifyThenPrBlock(dir, env, tamper = null) {
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `verify 必须先绿(fail-closed 只在 pr-block 侧):${v.stdout}${v.stderr}`);
   assetsGate(dir, env);
+  if (tamper) tamper(dir); // 篡改点放在 verify 之后:模拟「跑绿后再改」这条真实攻击顺序
   return run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
 }
 
@@ -356,8 +377,15 @@ test('fail-closed: 缺 manifest(NO_MANIFEST)→ pr-block 拒并要求先跑 buil
 test('fail-closed: manifest 里的源文件缺失(MISSING)→ pr-block 拒并点名文件', async (t) => {
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
-  const { dir } = makeRepoDemo({ name: 'fc-missing', productInputs: ['src/components/Button.tsx', 'src/deleted.tsx'] });
-  const pr = verifyThenPrBlock(dir, env);
+  // r3:清单被手改后 verify 自己就会被独立复算抓住(oracle 不再是 demo 侧脚本),
+  // 所以「verify 绿」只能在篡改**之前**成立。先健康跑绿,再往清单里塞一个不存在的文件,
+  // 断言 pr-block 侧的 fail-closed 仍然点名 MISSING(本用例要守的就是这条)。
+  const { dir } = makeRepoDemo({ name: 'fc-missing' });
+  const pr = verifyThenPrBlock(dir, env, (d) => {
+    const m = JSON.parse(readFileSync(join(d, 'component.inputs.json'), 'utf8'));
+    m.productInputs = [...m.productInputs, 'src/deleted.tsx'];
+    writeFileSync(join(d, 'component.inputs.json'), `${JSON.stringify(m, null, 2)}\n`);
+  });
   assert.equal(pr.status, 2, `缺源文件居然放行:${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout + pr.stderr, /MISSING/);
   assert.match(pr.stdout + pr.stderr, /src\/deleted\.tsx/);
@@ -367,7 +395,12 @@ test('fail-closed: demo 不在 git 仓内(UNRESOLVED)→ pr-block 拒并要求 d
   if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成');
   const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
   const { dir } = makeRepoDemo({ name: 'fc-nogit', noGit: true });
-  const pr = verifyThenPrBlock(dir, env);
+  // r3:demo 不在任何 git 仓内 → 清单根本无法独立复算(repoRoot 不可解析),verify 门 A
+  // 自己就会红。这里不再要求 verify 绿(要求它绿等于要求存在一个可自证的窄链),
+  // 只守住 pr-block 侧的 fail-closed:必须点名 UNRESOLVED 并说清 demo 该放哪。
+  run(VERIFY, ['--demo', dir], { env });
+  run(ASSETS_MANIFEST, ['--demo', dir], { env });
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 2, `demo 不在仓内居然放行:${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout + pr.stderr, /UNRESOLVED/);
   assert.match(pr.stdout + pr.stderr, /必须位于产品 git 仓内/);

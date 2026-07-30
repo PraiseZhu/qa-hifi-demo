@@ -83,6 +83,9 @@ const ENTRY_SRC = {
   // 只有类型导出:编译后无任何运行时内容 → 可被整体 tree-shake
   typeOnly: 'export type Claimed = string;\n',
 };
+/** 各 entry 形态对应的「目标组件导出名」(r3 起 proved 只认它)。typeOnly 没有运行时导出,
+    声明了会被 build 判为「声明的导出不存在」而 exit 2 —— 那不是本用例要测的 tree-shake 语义,故留空。 */
+const ENTRY_EXPORT = { fn: 'Claimed', data: 'CLAIMED', typeOnly: null };
 /** bootstrap 的几种形态:决定 entry 是「真被渲染」还是只被副作用导入。 */
 const BOOT_SRC = {
   render: "import { Claimed } from '../../src/components/Claimed';\nglobalThis.__demo = Claimed();\n",
@@ -91,7 +94,7 @@ const BOOT_SRC = {
   bareImport: "import '../../src/components/Claimed';\nglobalThis.__demo = 1;\n",
 };
 
-function makeFixture({ name, entry = 'fn', boot = 'render', extraAssetBytes = 0 } = {}) {
+function makeFixture({ name, entry = 'fn', boot = 'render', extraAssetBytes = 0, exportName = undefined } = {}) {
   const repo = mkdtempSync(join(tmpdir(), `qa-r2-${name}-`));
   execFileSync('git', ['init', '-q'], { cwd: repo });
   mkdirSync(join(repo, 'src/components'), { recursive: true });
@@ -104,6 +107,8 @@ function makeFixture({ name, entry = 'fn', boot = 'render', extraAssetBytes = 0 
   mkdirSync(join(dir, 'assets'), { recursive: true });
   copyFileSync(BUILD_TEMPLATE, join(dir, 'build.mjs'));
   copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
+  copyFileSync(join(ROOT, "scripts/lib/component-build-core.mjs"), join(dir, "component-build-core.mjs"));
+  copyFileSync(join(ROOT, "scripts/lib/repo-glob.mjs"), join(dir, "repo-glob.mjs"));
   writeFileSync(join(dir, 'src/bootstrap.ts'), BOOT_SRC[boot]);
   if (extraAssetBytes > 0) writeFileSync(join(dir, 'assets/hero.bin'), Buffer.alloc(extraAssetBytes, 7));
 
@@ -120,6 +125,8 @@ function makeFixture({ name, entry = 'fn', boot = 'render', extraAssetBytes = 0 
     component: {
       mode: 'component',
       entry: 'src/components/Claimed.ts',
+      // r3:声明目标组件导出名才可能拿到「真组件直渲」;不声明一律降级(见 comp-fix-r3.test.mjs)
+      ...((exportName === undefined ? ENTRY_EXPORT[entry] : exportName) ? { export: exportName === undefined ? ENTRY_EXPORT[entry] : exportName } : {}),
       sources: [],
       bundle: 'assets/component.bundle.js',
       bootstrap: 'src/bootstrap.ts',
@@ -149,14 +156,16 @@ test('#1c 复现样本: bootstrap 只做 side-effect import → 门 B 首项 fai
   const { dir } = makeFixture({ name: 'side-effect', boot: 'sideEffect' });
   // 审核实证:build 照旧 exit 0(entry 确实在 bundle 里),声明层抓不到
   assert.equal(buildDemo(dir).status, 0, 'side-effect import 下 build 仍应成功(这正是原漏洞)');
-  assert.equal(manifestOf(dir).entrySentinel, 'active', '常规函数组件导出必须能挂上哨兵');
+  // r3:fixture 声明了 component.export → 哨兵状态是 targeted(比 r2 的 active 更强:只认目标导出)
+  assert.equal(manifestOf(dir).entrySentinel, 'targeted', '常规函数组件导出必须能挂上目标哨兵');
   const v = verifyDemo(dir);
   assert.notEqual(v.status, 0, 'side-effect import 居然通过了 verify');
   const report = readJson(join(dir, 'report.json'));
   assert.equal(report.gateB.pass, false);
   assert.equal(report.gateB.entryRenderProof, 'unavailable');
   assert.equal(report.gateB.failures.length, 1, '哨兵只报一次(门 B 首项),不要 N 条重复失败');
-  assert.match(report.gateB.failures[0].error, /entry 已打包但从未被渲染/);
+  // r3 起报的是「声明的目标导出从未被渲染」(声明了 component.export;未声明的路径见 comp-fix-r3.test.mjs)
+  assert.match(report.gateB.failures[0].error, /声明的目标导出从未被渲染/);
   assert.match(report.gateB.failures[0].error, /side-effect import/);
   // 手搓的 UI 字节确实在 bundle 里、真组件也在——两者共存正是这条漏洞的形状
   const bundle = readFileSync(join(dir, 'assets/component.bundle.js'), 'utf8');
@@ -172,7 +181,7 @@ test('#1c 阳性对照: bootstrap 真调用入口组件 → 哨兵置位、门 B
   const pr = prBlock(dir);
   assert.equal(pr.status, 0, `阳性对照被误伤:${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout, /真组件直渲/);
-  assert.match(pr.stdout, /运行期哨兵实测入口组件被渲染/);
+  assert.match(pr.stdout, /运行期哨兵实测声明的目标组件导出被渲染/);
 });
 
 test('#1c 探针套不上的形态(导出全是纯数据)→ 不误判造假,附贴块降级为需人工审查', (t) => {

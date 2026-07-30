@@ -302,6 +302,12 @@ export function validateSpec(spec) {
       if (c.mode !== 'component') problems.push(`component.mode 必须是 "component"(当前 ${JSON.stringify(c.mode)})`);
       const relOk = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.includes('\\') && !v.split('/').includes('..');
       if (!relOk(c.entry)) problems.push('component.entry 必须是相对 repoRoot 的路径 string(不含 ".."/绝对路径/反斜杠)');
+      // export:目标组件的导出名(可选,但**不声明就永远拿不到「真组件直渲」结论**)。
+      // r3 起哨兵只给这个导出算「被渲染」;不声明 / 声明的导出不存在(build 直接 exit 2)/
+      // 该导出形态套不上探针 → PR 块一律降级为「需人工审查」。值的合法性(真有这个导出)
+      // 由 build.mjs 用 esbuild metafile 校验,schema 只拦空串/非字符串。
+      if (c.export !== undefined && (typeof c.export !== 'string' || !c.export.trim()))
+        problems.push('component.export 必须是非空 string(目标组件导出名;默认导出写 "default")——不需要就整个字段删掉');
       // sources 自 metafile 真相源上线后降级为**可选的人读声明**:代码层防伪链锁的是
       // build.mjs 从 esbuild metafile 落下的 component.inputs.json(bundle 真实输入),
       // 作者自报的窄集再也决定不了链的范围。声明了就必须 ⊆ 真实输入(report 侧校验)。
@@ -358,7 +364,7 @@ export function validateSpec(spec) {
       }
       // driver 段已下线:状态怎么被驱动统一写 states[].driver('inject'|'via'),
       // 单一真相源——两处声明必然漂移(2026-07-30 集成调和结论)。
-      const ALLOWED = ['mode', 'entry', 'sources', 'bundle', 'bootstrap', 'assetsDir', 'rendererRoot', 'packageRoots', 'shims', 'fixtures', 'themeVars', 'css', 'target'];
+      const ALLOWED = ['mode', 'entry', 'export', 'sources', 'bundle', 'bootstrap', 'assetsDir', 'rendererRoot', 'packageRoots', 'shims', 'fixtures', 'themeVars', 'css', 'target'];
       for (const key of Object.keys(c)) {
         if (key === 'driver') { problems.push('component.driver 已废弃——状态驱动方式写 states[].driver:"inject"|"via"(单一真相源)'); continue; }
         if (!ALLOWED.includes(key)) problems.push(`component.${key} 不是支持的字段(${ALLOWED.join('/')})`);
