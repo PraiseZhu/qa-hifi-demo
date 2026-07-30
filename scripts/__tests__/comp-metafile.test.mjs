@@ -20,6 +20,13 @@ import { validateReportIntegrity } from '../lib/report.mjs';
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const VERIFY = join(ROOT, 'scripts/verify.mjs');
 const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
+const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
+// 合并调和:审核 P1#5 后 pr-block 强制资产闸门报告(组件 demo 的 bundle 落在 assets/),
+// 集成用例在 verify 后补跑,否则被资产门拦下而非本用例想测的门。
+function assetsGate(dir, env) {
+  const r = run(ASSETS_MANIFEST, ['--demo', dir], { env });
+  assert.equal(r.status, 0, `资产闸门应通过:${r.stdout}${r.stderr}`);
+}
 const BUILD_TEMPLATE = join(ROOT, 'templates/component-build.mjs');
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
 
@@ -91,7 +98,7 @@ function makeFixture({ name, bootstrap = 'real', sources = [] } = {}) {
     meta: { name, summary: { what: 'what', how: 'how', accept: 'accept' } },
     matrix: { platforms: ['desk'], regions: ['cn'], systems: ['ios'], themes: ['light'], langs: ['zh-CN'] },
     states: [{ id: 'id', via: [{ expect: 'id' }] }],
-    verify: { cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [] }], noClip: ['.box'] },
+    verify: { cases: [{ id: 'desk-cn-light', prefs: { plat: 'desk', region: 'cn', os: 'ios', mode: 'light', lang: 'zh-CN' }, via: [{ expect: 'id' }] }], noClip: ['.box'] },
     bindings: [],
     component: {
       mode: 'component',
@@ -159,6 +166,7 @@ test('pr-block: 改未声明但真被 bundle 读到的源文件 → 旧 report �
   assert.equal(buildDemo(dir).status, 0);
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `verify 必须先绿:${v.stdout}${v.stderr}`);
+  assetsGate(dir, env);
   const ok = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(ok.status, 0, `未篡改时应放行:${ok.stdout}${ok.stderr}`);
   // 附贴块的 N 来自 manifest 真实输入(3 个),不是自报的 1 个
@@ -177,6 +185,7 @@ test('篡改 manifest(删掉真实输入)→ manifest 自身 hash 变,旧 report
   const { dir } = makeFixture({ name: 'tamper-manifest' });
   assert.equal(buildDemo(dir).status, 0);
   assert.equal(run(VERIFY, ['--demo', dir], { env }).status, 0);
+  assetsGate(dir, env);
   const m = manifestOf(dir);
   m.productInputs = ['src/components/Claimed.ts']; // 缩小链范围,想让改 Deep.ts 不被发现
   writeFileSync(join(dir, 'component.inputs.json'), `${JSON.stringify(m, null, 2)}\n`);
@@ -191,6 +200,7 @@ test('缺 manifest → NO_MANIFEST fail-closed(report 层直接拒并给修法)'
   const { dir } = makeFixture({ name: 'no-manifest' });
   assert.equal(buildDemo(dir).status, 0);
   assert.equal(run(VERIFY, ['--demo', dir], { env }).status, 0);
+  assetsGate(dir, env);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
   rmSync(join(dir, 'component.inputs.json'));
   const problems = validateReportIntegrity(dir, readSpec(dir), report);
@@ -244,6 +254,7 @@ test('阳性对照: manifest 齐全 + 未篡改 → verify 绿、pr-block 出块
   assert.equal(buildDemo(dir).status, 0);
   const v = run(VERIFY, ['--demo', dir], { env });
   assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
+  assetsGate(dir, env);
   const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env });
   assert.equal(pr.status, 0, `健康 demo 被误伤:${pr.stdout}${pr.stderr}`);
   assert.ok(!/防伪链未锁住/.test(pr.stdout + pr.stderr));
