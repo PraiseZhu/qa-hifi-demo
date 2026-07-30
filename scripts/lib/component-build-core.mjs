@@ -18,7 +18,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { findRepoRoot, resolveFrom } from './extract-helpers.mjs';
-import { expandRepoGlob } from './repo-glob.mjs';
+import { expandRepoGlob, restrictedGlobProblem } from './repo-glob.mjs';
 
 export const CORE_FILE_NAME = 'component-build-core.mjs';
 export const BUILDER_FILE_NAME = 'build.mjs';
@@ -361,17 +361,12 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
       );
     const out = new Set();
     for (const pattern of list) {
-      if (typeof pattern !== 'string' || !pattern.trim())
-        fail('component.css.content 每一项必须是非空 string(仓内相对 glob)', 2);
-      // 受限格式一律拒绝:本工具的 glob 只认 * / ** / ?,brace/否定/对象/require() 形式
-      // 展不开就等于「声明了却没入链」,那正是 #2c-b 的漏洞形状,不许静默跳过。
-      if (/[{}()!,]/.test(pattern) || pattern.startsWith('/') || pattern.includes('\\') || pattern.split('/').includes('..'))
-        fail(
-          `component.css.content["${pattern}"] 不是本工具可解析的标准 glob——只支持仓内相对路径 + * / ** / ?;`
-          + '不支持 {a,b} brace、! 否定、绝对路径、".."、逗号多值,以及 tailwind config 里的 require()/对象形式。'
-          + '\n修法:拆成多条标准 glob 写进 component.css.content。',
-          2,
-        );
+      /* 受限格式一律拒绝(r5 #2c-b 起改成**白名单**式字符扫描):本工具的 glob 只认
+         * / ** / ?。r4 的黑名单 /[{}()!,]/ 漏了字符类 —— 字面 `[ab].tsx` 在我们这边
+         零命中(不入链),Tailwind 的 micromatch 却实扫 a/b。判定统一交给
+         repo-glob.restrictedGlobProblem(与 expandRepoGlob 同一模块,语义不会漂移)。 */
+      const globProblem = restrictedGlobProblem(pattern);
+      if (globProblem) fail(`component.css.content ${globProblem}`, 2);
       const matched = expandRepoGlob(repoRoot, pattern).filter((rel) => existsSync(join(repoRoot, rel)));
       if (matched.length === 0)
         fail(

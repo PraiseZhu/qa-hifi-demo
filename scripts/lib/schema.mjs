@@ -4,6 +4,7 @@ import { hashFile, isPlainObject } from './fs-utils.mjs';
 // extract-helpers 是 demo 自包含拷贝件(只依赖 node 内建),这里正向 import 复用同一份
 // fixture locator / capturedFrom 判据——工厂函数与校验器双侧同代码,天然不会漂。
 import { validateCapturedFrom, validateFixtureValueBinding } from './extract-helpers.mjs';
+import { restrictedGlobProblem } from './repo-glob.mjs';
 
 // 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
 // 分端是「采集/存储」维度的命名空间,不是比对维度的白名单——不同 platform 的基准永不互比。
@@ -366,6 +367,13 @@ export function validateSpec(spec) {
               + '配了 component.css 就必须显式声明 content;省略会让 Tailwind 按 tailwind.config.js 的 content 隐式扫描,'
               + '那些样式源文件不进防伪链。不需要 tailwind 请把 component.css 设为 null',
             );
+          // 受限 glob 白名单(r5 #2c-b):字符类/brace/extglob 等元字符本工具不实现、
+          // Tailwind 的 micromatch 却会解释 —— 两边语义不一致 = 声明了却没入链。
+          else
+            for (const [i, g] of c.css.content.entries()) {
+              const gp = restrictedGlobProblem(g);
+              if (gp) problems.push(`component.css.content[${i}] ${gp}`);
+            }
         }
       }
       // driver 段已下线:状态怎么被驱动统一写 states[].driver('inject'|'via'),

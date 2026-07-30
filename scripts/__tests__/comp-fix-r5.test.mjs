@@ -25,6 +25,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildInputHashes, checkDemoNoNodeModules, hashFile, safeJsonForScript, stableJson, TOOL_VERSION } from '../lib/fs-utils.mjs';
 import { validateReportIntegrity } from '../lib/report.mjs';
+import { restrictedGlobProblem } from '../lib/repo-glob.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const CORE = join(ROOT, 'scripts/lib/component-build-core.mjs');
@@ -273,3 +274,51 @@ test('#2c-a 阳性对照(不 skip): 干净 demo 不误杀,node_modules 内部不
   assert.deepEqual(checkDemoNoNodeModules(dir), []);
 });
 
+// ==================== 条目 5 — #2c-b:字符类 glob ====================
+
+test('#2c-b 纯函数层(不 skip): 字符类/brace/否定/extglob 一律拒,标准 glob 放行', () => {
+  const rejected = [
+    '[ab].tsx', 'src/[ab]/*.tsx', 'src/x].tsx', '{a,b}/*.tsx', 'src/{a,b}.tsx',
+    '!src/skip.tsx', 'src/!(a).tsx', '+(a|b).tsx', '@(a|b).tsx', '(a|b).tsx',
+    '/abs/path.tsx', '../escape.tsx', 'src\\win.tsx', 'a,b.tsx',
+  ];
+  for (const p of rejected) assert.ok(restrictedGlobProblem(p), `未拒绝危险 pattern:${p}`);
+  const accepted = ['src/**/*.tsx', 'src/*.ts', 'src/a?c.ts', 'src/components/Button.tsx', 'src/中文目录/*.ts', 'a-b_c.1/*.js'];
+  for (const p of accepted) assert.equal(restrictedGlobProblem(p), null, `误杀合法 pattern:${p}`);
+});
+
+test('#2c-b 复现样本(不 skip): 字面 [ab].tsx 入链零命中 / Tailwind 实扫 a·b → 构建核心 fail-closed', () => {
+  // 攻击形状:仓里放字面文件名 `[ab].tsx`(入链零命中即放行),而 Tailwind 的
+  // fast-glob/micromatch 把它当字符类 → 实扫 a.tsx / b.tsx,改 a/b 不改 hash、旧 CSS 照过。
+  const { dir } = makeFixture({
+    name: 'charclass',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/[ab].tsx'] },
+    extraRepoFiles: {
+      'src/[ab].tsx': 'export const literal = "literal";\n',
+      'src/a.tsx': 'export const a = "bg-blue-500";\n',
+      'src/b.tsx': 'export const b = "bg-green-500";\n',
+    },
+  });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  const out = `${r.stdout}${r.stderr}`;
+  assert.equal(r.status, 2, `字符类 glob 被放行了(#2c-b 未修):${out}`);
+  assert.match(out, /不是本工具可解析的受限 glob/);
+  assert.match(out, /\[/, '报文应点出触发的元字符');
+});
+
+test('#2c-b verify/schema 层也拦得住(不 skip)', () => {
+  const { dir } = makeFixture({ name: 'charclass-verify', css: { tailwindConfig: 'tailwind.config.js', content: ['src/[ab].tsx'] } });
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0);
+  assert.match(`${v.stdout}${v.stderr}`, /component\.css\.content/);
+});
+
+test('#2c-b 阳性对照(不 skip): 标准 glob 仍能展开并逐一入 buildInputs.product', () => {
+  const { dir } = makeFixture({ name: 'charclass-ok', css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] } });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  if (r.status !== 0) {
+    assert.doesNotMatch(`${r.stdout}${r.stderr}`, /受限 glob/, '合法 glob 被误杀');
+    return;
+  }
+  assert.ok(JSON.parse(r.stdout).buildInputs.product.includes('src/StyleOnly.tsx'));
+});
