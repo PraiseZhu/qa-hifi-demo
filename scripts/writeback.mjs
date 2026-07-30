@@ -19,11 +19,12 @@
 //   2. 定位处当前内容必须 == truth 旧值(不等 = 源码已变,先重跑 truth.mjs 同步);
 //   3. 写回新值(--dry-run 只预览);
 //   4. 全部写完后重跑 extract.mjs:新 truth 里该叶子必须 == 新值(round-trip 证明),
-//      truth.json 落盘 + index.html qa-truth 块同步(--embed 同款逻辑)。
-// 任一步失败 → 整体 exit 2,已写的文件回滚(写回前留原文备份)。
+//      truth.json + index.html qa-truth 块先内存构造、再临时文件+rename 原子落盘。
+// 任一步失败 → 整体 exit 2,三类文件(源码/truth.json/index.html)全部恢复原文
+// (源码/两 JSON-HTML 各有备份;恢复本身失败会如实并列出,不谎报已回滚)。
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { failJson, failProblems, safeJsonForScript, stableJson } from './lib/fs-utils.mjs';
@@ -197,10 +198,25 @@ if (dryRun) {
   process.exit(0);
 }
 
-// 阶段 2:写回 + round-trip 验证;extract 不认账就整体回滚
+// 阶段 2:写回 + round-trip 验证——三类文件(源码/truth.json/index.html)同一事务:
+// 任一环节失败,catch 里三类全部恢复原文;恢复本身失败如实并列出,不谎报「已回滚」。
 // 同一文件多个 --set:按 start 降序累积应用(前面的位置不因后面的替换而移位),
-// 每个文件只写一次——否则后写的 plan 会拿原始内容覆盖先写的结果
-const written = [];
+// 每个文件只写一次——否则后写的 plan 会拿原始内容覆盖先写的结果。
+// truth.json/index.html 先在内存构造完整,再「临时文件 + rename」原子落盘:
+// 读取方永远只看到旧版或新版完整文件,不会看到写了一半的中间态。
+const indexPath = join(demoDir, 'index.html');
+const tmpOf = (file) => `${file}.qa-writeback-tmp`;
+function writeAtomic(file, text) {
+  const tmp = tmpOf(file);
+  writeFileSync(tmp, text);
+  renameSync(tmp, file);
+}
+const writtenFiles = new Set();
+const backups = new Map();
+let truthTouched = false;
+let indexTouched = false;
+let truthBackup = null;
+let indexBackup = null;
 try {
   const byFile = new Map();
   for (const p of plans) {
@@ -209,12 +225,13 @@ try {
     byFile.set(p.sourceFile, list);
   }
   for (const [file, filePlans] of byFile) {
+    if (!backups.has(file)) backups.set(file, filePlans[0].backup);
     let content = filePlans[0].backup;
     for (const p of [...filePlans].sort((a, b) => b.start - a.start)) {
       content = content.slice(0, p.start) + p.newText + content.slice(p.end);
     }
     writeFileSync(file, content);
-    written.push(...filePlans);
+    writtenFiles.add(file);
   }
   const extractor = join(demoDir, 'extract.mjs');
   if (!existsSync(extractor)) throw new Error('缺 extract.mjs,无法 round-trip 验证');
@@ -230,15 +247,18 @@ try {
   }
   if (failures.length) throw new Error(failures.join('; '));
 
-  // round-trip 通过:truth.json 落盘 + 同步 index.html 内嵌块(与 truth.mjs --embed 同一语义)
-  writeFileSync(truthPath, stableJson(freshTruth));
-  const indexPath = join(demoDir, 'index.html');
+  // round-trip 通过:truth.json 与 index.html 内嵌块(与 truth.mjs --embed 同一语义)原子落盘
+  truthBackup = existsSync(truthPath) ? readFileSync(truthPath, 'utf8') : null;
+  writeAtomic(truthPath, stableJson(freshTruth));
+  truthTouched = true;
   let embedded = false;
   if (existsSync(indexPath)) {
     const html = readFileSync(indexPath, 'utf8');
     const blockRe = /(<script[^>]*id=["']qa-truth["'][^>]*>)([\s\S]*?)(<\/script>)/;
     if (blockRe.test(html)) {
-      writeFileSync(indexPath, html.replace(blockRe, `$1${safeJsonForScript(freshTruth)}$3`));
+      indexBackup = html;
+      writeAtomic(indexPath, html.replace(blockRe, `$1${safeJsonForScript(freshTruth)}$3`));
+      indexTouched = true;
       embedded = true;
     }
   }
@@ -250,6 +270,24 @@ try {
     next: '重跑 verify.mjs 门 A-F 确认双边一致;结构级改动另走 agent 双改',
   }, null, 2));
 } catch (err) {
-  for (const p of written) writeFileSync(p.sourceFile, p.backup); // 回滚已写文件
-  failProblems([`写回失败已回滚:${String(err.message || err).slice(0, 400)}`]);
+  const restoreErrors = [];
+  for (const file of writtenFiles) {
+    try { writeFileSync(file, backups.get(file)); } catch (e) { restoreErrors.push(`源码 ${file}:${e.message}`); }
+  }
+  if (truthTouched) {
+    try {
+      if (truthBackup === null) unlinkSync(truthPath);
+      else writeFileSync(truthPath, truthBackup);
+    } catch (e) { restoreErrors.push(`truth.json:${e.message}`); }
+  }
+  if (indexTouched) {
+    try { writeFileSync(indexPath, indexBackup); } catch (e) { restoreErrors.push(`index.html:${e.message}`); }
+  }
+  for (const tmp of [tmpOf(truthPath), tmpOf(indexPath)]) {
+    try { unlinkSync(tmp); } catch {} // 残留原子写临时文件,清不掉不遮主错误
+  }
+  const suffix = restoreErrors.length
+    ? `;但恢复未完成:${restoreErrors.join('; ')}——三文件状态须人工核对`
+    : '';
+  failProblems([`写回失败已回滚:${String(err.message || err).slice(0, 400)}${suffix}`]);
 }

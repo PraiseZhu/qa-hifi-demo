@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -280,4 +280,58 @@ test('dom-ops: data-node-id 重复 = 违约,exit 2 列出肇事 id', () => {
   const res = run(DOM_OPS, ['--old', join(dir, 'a.html'), '--new', join(dir, 'b.html')]);
   assert.equal(res.status, 2);
   assert.match(res.stdout, /"x"|多次/);
+});
+
+// ============ writeback 事务完整性(审核 finding #3):三类文件同事务,失败全恢复 ============
+// 注入方式:原子写的临时路径(<file>.qa-writeback-tmp)预建同名目录 → writeFileSync(tmp) 必失败。
+// 这是确定性、跨平台的写失败注入;index/truth 目标文件本身的权限在 rename 语义下不影响落盘
+// (rename 只看目录可写),见第三个测试——审核人的「index.html chmod 444」场景现已整体成功。
+
+test('writeback 事务: index.html 原子写失败 → 源码+truth.json+index 三文件全恢复', tsOnly, () => {
+  const dir = writeKeyPathDemo();
+  const before = {
+    tokens: readFileSync(join(dir, 'tokens.ts'), 'utf8'),
+    truth: readFileSync(join(dir, 'truth.json'), 'utf8'),
+    index: readFileSync(join(dir, 'index.html'), 'utf8'),
+  };
+  // truth.json 先原子落盘成功、index.html 写失败——修复前:truth 留在新值、源码回滚 = 门 A 输入分裂
+  mkdirSync(join(dir, 'index.html.qa-writeback-tmp'));
+  const res = run(WRITEBACK, ['--demo', dir, '--set', 'geometry.heroSize=947', '--set', 'colors.panelBg=#FFFFFF']);
+  assert.equal(res.status, 2, res.stdout + res.stderr);
+  assert.match(res.stdout, /写回失败已回滚/);
+  assert.doesNotMatch(res.stdout, /恢复未完成/);
+  assert.equal(readFileSync(join(dir, 'tokens.ts'), 'utf8'), before.tokens); // 源码恢复
+  assert.equal(readFileSync(join(dir, 'truth.json'), 'utf8'), before.truth); // truth.json 恢复(本 finding 的核心)
+  assert.equal(readFileSync(join(dir, 'index.html'), 'utf8'), before.index); // index 无半写状态
+});
+
+test('writeback 事务: truth.json 原子写失败 → 源码恢复、truth.json 保持原值', tsOnly, () => {
+  const dir = writeKeyPathDemo();
+  const before = {
+    tokens: readFileSync(join(dir, 'tokens.ts'), 'utf8'),
+    truth: readFileSync(join(dir, 'truth.json'), 'utf8'),
+  };
+  mkdirSync(join(dir, 'truth.json.qa-writeback-tmp'));
+  const res = run(WRITEBACK, ['--demo', dir, '--set', 'geometry.heroSize=947']);
+  assert.equal(res.status, 2, res.stdout + res.stderr);
+  assert.match(res.stdout, /写回失败已回滚/);
+  assert.doesNotMatch(res.stdout, /恢复未完成/);
+  assert.equal(readFileSync(join(dir, 'tokens.ts'), 'utf8'), before.tokens);
+  assert.equal(readFileSync(join(dir, 'truth.json'), 'utf8'), before.truth);
+});
+
+test('writeback 事务: 审核人复现场景(index.html chmod 444)在 rename 语义下整体成功', tsOnly, () => {
+  const dir = writeKeyPathDemo();
+  const indexPath = join(dir, 'index.html');
+  chmodSync(indexPath, 0o444);
+  try {
+    const res = run(WRITEBACK, ['--demo', dir, '--set', 'geometry.heroSize=947']);
+    assert.equal(res.status, 0, res.stdout + res.stderr);
+    // 临时文件+rename 落盘只要求目录可写,目标文件只读不再制造半事务失败
+    assert.match(readFileSync(join(dir, 'tokens.ts'), 'utf8'), /size: 947/);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'truth.json'), 'utf8')).geometry.heroSize.value, '947');
+    assert.match(readFileSync(indexPath, 'utf8'), /947/);
+  } finally {
+    chmodSync(indexPath, 0o644);
+  }
 });
