@@ -22,6 +22,7 @@ import { convertDeclarations, validateEntry, isColorValue } from '../lib/style-c
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const WRITEBACK = join(ROOT, 'scripts/writeback.mjs');
 const STYLE_SYNC = join(ROOT, 'scripts/style-sync.mjs');
+const DOM_OPS = join(ROOT, 'scripts/dom-ops.mjs');
 
 function run(script, args, opts = {}) {
   return spawnSync(process.execPath, [script, ...args], {
@@ -220,3 +221,63 @@ test('style-sync CLI: --decl 输出 mechanical/rejected JSON', () => {
   assert.equal(out.summary.rejected, 1);
 });
 
+// ============ dom-ops 结构化操作集 ============
+
+const DOM_OLD = `<!doctype html>
+<html><head><title>t</title></head>
+<body>
+<div id="app">
+  <section data-node-id="panel" class="card" style="padding: 8px">
+    <h2 data-node-id="title">旧标题</h2>
+    <button data-node-id="ok-btn" disabled>确定</button>
+    <p>无锚点段落一</p>
+  </section>
+  <footer data-node-id="foot">v1</footer>
+</div>
+<script id="qa-truth" type="application/json">{"a":1}</script>
+</body></html>
+`;
+const DOM_NEW = `<!doctype html>
+<html><head><title>t</title></head>
+<body>
+<div id="app">
+  <section data-node-id="panel" class="card large" style="padding: 16px">
+    <span data-node-id="badge">新徽章</span>
+    <h2 data-node-id="title">新标题</h2>
+    <button data-node-id="ok-btn">确定</button>
+    <p>无锚点段落一改了</p>
+  </section>
+</div>
+<script id="qa-truth" type="application/json">{"a":2}</script>
+</body></html>
+`;
+
+test('dom-ops: 六类操作齐出 + unanchored 如实列出 + qa-truth 块不噪音', () => {
+  const dir = tmpDemo('dom-ops');
+  writeFileSync(join(dir, 'old.html'), DOM_OLD);
+  writeFileSync(join(dir, 'new.html'), DOM_NEW);
+  const res = run(DOM_OPS, ['--old', join(dir, 'old.html'), '--new', join(dir, 'new.html')]);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.ops.added[0].id, 'badge');
+  assert.equal(out.ops.added[0].parent.anchor, 'panel');
+  assert.equal(out.ops.removed[0].id, 'foot');
+  assert.ok(out.ops.moved.some((m) => m.id === 'title'));
+  assert.ok(out.ops.attrChanged.some((a) => a.id === 'panel' && a.attrs.class));
+  assert.ok(out.ops.attrChanged.some((a) => a.id === 'ok-btn' && a.attrs.disabled.to === null));
+  assert.ok(out.ops.textChanged.some((t) => t.id === 'title' && t.to === '新标题'));
+  assert.ok(out.ops.styleChanged.some((s) => s.id === 'panel' && s.style.padding.to === '16px'));
+  // unanchored:<p> 文本变化上榜;qa-truth 内嵌块变化不上榜
+  assert.ok(out.unanchored.some((u) => u.tag === 'p' && u.change === 'modified'));
+  assert.ok(!out.unanchored.some((u) => u.tag === 'script'), JSON.stringify(out.unanchored));
+});
+
+test('dom-ops: data-node-id 重复 = 违约,exit 2 列出肇事 id', () => {
+  const dir = tmpDemo('dom-dup');
+  const dup = `<!doctype html><html><body><div data-node-id="x">1</div><span data-node-id="x">2</span></body></html>`;
+  writeFileSync(join(dir, 'a.html'), dup);
+  writeFileSync(join(dir, 'b.html'), dup);
+  const res = run(DOM_OPS, ['--old', join(dir, 'a.html'), '--new', join(dir, 'b.html')]);
+  assert.equal(res.status, 2);
+  assert.match(res.stdout, /"x"|多次/);
+});

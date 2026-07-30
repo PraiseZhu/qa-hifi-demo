@@ -201,6 +201,12 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
   又改 demo（HTML 与 React/RN 无同构映射，机械直译不存在，诚实走人智），然后 `truth.mjs --embed`
   + `verify.mjs` 闭环——门 A（extractor drift）+ 门 D（渲染绑定）+ 门 F（适配采样）就是
   「两边真的一致」的验收器。无定位锚的叶子 writeback 会明确拒绝并提示走本档。
+  **双改的结构化输入**：界面关键元素按约定带 `data-node-id`（稳定、语义化、不复用，见
+  templates/demo-shell.html 头注释）时，改动前后两份 index.html 可过
+  `node scripts/dom-ops.mjs --old <旧> --new <新>` 产出结构化操作清单
+  （added/removed/moved/attrChanged/textChanged/styleChanged，含锚点坐标与前置状态；
+  无锚点节点归入 unanchored 段如实列出、须人工核对）。清单是 agent 双改的输入，
+  **不自动应用**——它替代「两份全文自由读」，不替代「映射到产品组件树」的人智判断。
 
 ### P6 定稿 = PR ready（用户确认最终 HTML 后的收口）
 
