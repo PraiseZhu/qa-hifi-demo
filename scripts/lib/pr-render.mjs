@@ -34,9 +34,14 @@ const GATE_ROWS = {
     if (!px) return '| 像素基准（vs 真沙盒截图） | ⚠️ 未运行 pixel-compare |';
     if (px.skipped) return '| 像素基准（vs 真沙盒截图） | ⚠️ 未采基准，像素级未比对 |';
     const worst = Math.max(...px.results.map((r) => r.diffRatio ?? 1));
-    const anyWarn = px.results.some((r) => r.status === 'WARN');
-    return `| 像素基准（${px.compared}/${px.declared} 组合，最大 diff ${(worst * 100).toFixed(2)}%） | `
-      + `${anyWarn ? '⚠️ WARN 已附人工裁决（裁决绑定可信侧三图 hash，属人工声明非机械测量）' : '✅'} |`;
+    const warns = px.results.filter((r) => r.status === 'WARN');
+    /* r7 条目 8:WARN 的裁决人与理由必须在 PR 里可见 —— 裁决是**人工声明、不是机械测量**,
+       reviewer 得能看见"是谁、以什么理由放过了这处像素差异"才能判断接不接受。 */
+    const warnNote = warns.length
+      ? `⚠️ WARN 已附人工裁决（绑定可信侧三图 sha256；属人工声明非机械测量）：`
+        + warns.map((r) => `${r.key} 由 ${r.adjudication?.reviewer ?? '(未署名)'} 裁决 —— ${r.adjudication?.reason ?? '(无理由)'}`).join('；')
+      : '✅';
+    return `| 像素基准（${px.compared}/${px.declared} 组合，最大 diff ${(worst * 100).toFixed(2)}%） | ${warnNote} |`;
   },
 };
 

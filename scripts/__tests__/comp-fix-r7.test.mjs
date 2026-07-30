@@ -33,12 +33,16 @@ import { explicitContentFileProblem, restrictedGlobProblem } from '../lib/repo-g
 import { resolveContentFiles } from '../lib/component-build-core.mjs';
 import { GATE_LETTERS, RUNNERS, TRUSTED_GATES, lettersFor, markTrustedRun } from '../lib/gates.mjs';
 import { renderPrBlock } from '../lib/pr-render.mjs';
+import { DEMO_BUILD_FILES } from '../lib/component-build-core.mjs';
+import { validatePixelReport } from '../lib/report.mjs';
+import { loadPngApi } from '../lib/png-compare.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const CORE = join(ROOT, 'scripts/lib/component-build-core.mjs');
 const VERIFY = join(ROOT, 'scripts/verify.mjs');
 const PR_BLOCK = join(ROOT, 'scripts/pr-block.mjs');
 const ASSETS_MANIFEST = join(ROOT, 'scripts/assets-manifest.mjs');
+const PIXEL = join(ROOT, 'scripts/pixel-compare.mjs');
 const BUILD_FILES = [
   ['templates/component-build.mjs', 'build.mjs'],
   ['scripts/lib/component-build-core.mjs', 'component-build-core.mjs'],
@@ -166,8 +170,8 @@ test('条目 1 源码契约(不 skip): 执行 demo 侧代码必须排在浏览�
   const iGateD = v.indexOf('---------- 门 D:渲染绑定');
   const iGateF = v.indexOf('---------- 门 F:适配还原');
   const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
-  const iExtract = v.indexOf('execFileSync(process.execPath, [extractor]');
-  const iCustom = v.indexOf("execFileSync(process.execPath, [join(demoDir, g.script), '--demo', demoDir]");
+  const iExtract = v.indexOf('const run = runDemoScript(extractor)');
+  const iCustom = v.indexOf("runDemoScript(join(demoDir, g.script), ['--demo', demoDir]");
   const iPost = v.indexOf('const inputHashesPost = buildInputHashes(demoDir, spec)');
   for (const [label, idx] of [['inputs 复算', iInputs], ['bundle 复算', iBundle], ['css 复算', iCss],
     ['launchChromium', iBrowser], ['门 D', iGateD], ['门 F', iGateF], ['分界线', iBoundary],
@@ -826,7 +830,7 @@ test('文档契约(不 skip): SKILL.md 必须写明执行时序原则、S ⊆ E 
   assert.match(doc, /参数结构/, '必须说明不变式靠参数结构保证,而不是事后猜测');
   assert.ok(!/受限 glob\*\*——r5 起改成\*\*白名单式字符扫描/.test(doc), 'content 段仍在按 glob 描述,与 r7 实现不符');
   // 门级全表两处次序说明
-  assert.match(doc, /但排在所有浏览器门之后/, '门 A 行必须写明 extractor 的新次序');
+  assert.match(doc, /之后\*\*才处理 demo extractor/, '门 A 行必须写明 extractor 排在三项复算之后');
   // 条目 3/4:三层不变式必须成文,派生资产那行的旧判定必须被显式纠正
   assert.match(doc, /### 三层不变式/, '必须有三层不变式小节');
   for (const k of ['I-ESBUILD', 'I-CSS', 'I-OBSERVE']) assert.match(doc, new RegExp(k), `缺不变式 ${k}`);
@@ -840,7 +844,7 @@ test('文档契约(不 skip): SKILL.md 必须写明执行时序原则、S ⊆ E 
   assert.match(doc, /Tailwind 自己会当 glob 解释的形态/, '不许再把它写成本工具的字符白名单');
   assert.match(doc, /意图信号/, '? 的取舍必须如实标注');
   assert.match(doc, /逗号分隔多值串/, '逗号必须写明是 transport 限制');
-  assert.match(doc, /且排在可信 verify 之前/, '门 E 行必须写明可信重跑的新次序');
+  assert.match(doc, /排在可信 verify \*\*之前\*\*/, '门 E 行必须写明可信重跑的新次序');
 });
 
 // ============================================================================
@@ -1007,4 +1011,195 @@ test('条目 7d 对抗(实跑): 三份自报各自手写全绿且不跑对应执
     assert.equal(pr.status, 2, `手写 totalBytes:0 的 report-assets.json 居然出了块:${pr.stdout}${pr.stderr}`);
     assert.match(`${pr.stdout}${pr.stderr}`, /assets:/, '必须由 pr-block 自己现算的体积门挡住');
   }
+});
+
+// ============================================================================
+// 条目 8 — WARN 人工裁决必须绑定 trusted 三图字节
+// ============================================================================
+
+/** 造一个必然 WARN 的像素 fixture:基准图是纯蓝 32×32,而 #frame 渲染出来是纯红。 */
+async function makeWarnFixture(name) {
+  const baselines = [{ key: 'one', frameSel: '#frame' }];
+  const { dir } = makeFixture({ name, repoDeps: true });
+  const s2 = readJson(join(dir, 'spec.json'));
+  s2.baselines = baselines; s2.baselineFrameSel = '#frame';
+  writeFileSync(join(dir, 'spec.json'), JSON.stringify(s2, null, 2));
+  const { PNG } = await loadPngApi(dir);
+  const png = new PNG({ width: 32, height: 32 });
+  for (let i = 0; i < png.data.length; i += 4) { png.data[i] = 0; png.data[i + 1] = 0; png.data[i + 2] = 255; png.data[i + 3] = 255; }
+  mkdirSync(join(dir, 'baselines'), { recursive: true });
+  writeFileSync(join(dir, 'baselines/one.png'), PNG.sync.write(png));
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  return { dir, spec: readJson(join(dir, 'spec.json')) };
+}
+
+test('条目 8 源码契约(不 skip): 三图 sha256 入 report，裁决必须绑定它且 reviewer/理由必填', () => {
+  const px = stripComments(readFileSync(PIXEL, 'utf8'));
+  assert.match(px, /item\.artifactHashes = \{/, 'pixel-compare 必须把三图 sha256 记进 report');
+  assert.match(px, /adj\?\.artifactHashes/, '裁决必须声明 artifactHashes 才可能被采纳');
+  assert.match(px, /adjudicationRejected/, '裁决绑不上时必须留下可读原因');
+  const rp = stripComments(readFileSync(join(ROOT, 'scripts/lib/report.mjs'), 'utf8'));
+  assert.match(rp, /hashFile\(join\(demoDir, p\)\) !== recorded/, '磁盘三图字节必须与 report 记录比对');
+  assert.match(rp, /r\.adjudication\.artifactHashes\?\.\[kind\] !== recorded/, '裁决声明的 hash 必须与 report 记录比对');
+  assert.match(rp, /for \(const field of \['reviewer', 'reason'\]\)/, 'reviewer 与理由必填');
+  // PR 里裁决人与理由要可见
+  const rn = readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8');
+  assert.match(rn, /adjudication\?\.reviewer/);
+  assert.match(rn, /adjudication\?\.reason/);
+  assert.match(rn, /属人工声明非机械测量/, '门 E 的 WARN 文案必须写明裁决是人工声明');
+});
+
+test('条目 8 PoC(实跑): 裁决只声明 ok/reviewer/reason(不绑 hash)→ 不被采纳；绑错 hash → 拒；绑对 → 过且 PR 可见', async (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir, spec } = await makeWarnFixture('warn-bind');
+  mkdirSync(join(dir, 'adjudications'), { recursive: true });
+  const adjFile = join(dir, 'adjudications/one.json');
+  const writeAdj = (extra) => writeFileSync(adjFile, `${JSON.stringify({ ok: true, reviewer: '张三', reason: '底色改版预期差异', ...extra }, null, 2)}\n`);
+
+  // ① 旧式裁决(只有 ok/reviewer/reason,不绑 hash)—— r6 能过,r7 起必须不被采纳
+  writeAdj({});
+  const p1 = run(PIXEL, ['--demo', dir], { env: env() });
+  assert.notEqual(p1.status, 0, '不绑 hash 的裁决仍被采纳(条目 8 未修)');
+  const r1 = readJson(join(dir, 'report-pixel.json'));
+  assert.equal(r1.results[0].status, 'WARN');
+  assert.equal(r1.results[0].adjudication, undefined, '裁决不该被采纳');
+  assert.match(r1.results[0].adjudicationRejected?.reason ?? '', /缺 artifactHashes/);
+  // 三图 sha256 必须已进 report(裁决要绑的就是它)
+  for (const k of ['baseline', 'demo', 'diff']) assert.match(r1.results[0].artifactHashes[k], /^[0-9a-f]{64}$/);
+
+  // ② 绑错 hash(改一位)→ 同样不被采纳
+  const good = r1.results[0].artifactHashes;
+  writeAdj({ artifactHashes: { ...good, diff: good.diff.replace(/^./, (c) => (c === 'a' ? 'b' : 'a')) } });
+  const p2 = run(PIXEL, ['--demo', dir], { env: env() });
+  assert.notEqual(p2.status, 0, '绑错 hash 的裁决被采纳了');
+  assert.match(readJson(join(dir, 'report-pixel.json')).results[0].adjudicationRejected?.reason ?? '', /不符/);
+
+  // ③ 绑对 hash → 被采纳,门 E 过,且 PR 里能看到裁决人与理由
+  //    注意:hash 要取"最后一次真跑"的三图(每次重跑都会重写它们)
+  const cur = readJson(join(dir, 'report-pixel.json')).results[0].artifactHashes;
+  writeAdj({ artifactHashes: cur });
+  const p3 = run(PIXEL, ['--demo', dir], { env: env() });
+  assert.equal(p3.status, 0, `绑对 hash 的裁决没被采纳:${p3.stdout}${p3.stderr}`);
+  const r3 = readJson(join(dir, 'report-pixel.json'));
+  assert.equal(r3.results[0].adjudication?.reviewer, '张三');
+  assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0);
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 0, `绑对 hash 后仍不放行:${pr.stdout}${pr.stderr}`);
+  assert.match(pr.stdout, /张三/, 'PR 里必须能看到裁决人');
+  assert.match(pr.stdout, /底色改版预期差异/, 'PR 里必须能看到裁决理由');
+  assert.match(pr.stdout, /属人工声明非机械测量/);
+  void spec;
+});
+
+test('条目 8 PoC(实跑): 裁决绑定后又把 diff 图换掉 → 拒(裁决失去凭据)', async (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = await makeWarnFixture('warn-swap');
+  mkdirSync(join(dir, 'adjudications'), { recursive: true });
+  run(PIXEL, ['--demo', dir], { env: env() });
+  const cur = readJson(join(dir, 'report-pixel.json')).results[0].artifactHashes;
+  writeFileSync(join(dir, 'adjudications/one.json'), `${JSON.stringify({ ok: true, reviewer: '李四', reason: 'ok', artifactHashes: cur }, null, 2)}\n`);
+  assert.equal(run(PIXEL, ['--demo', dir], { env: env() }).status, 0, '前提:绑对后应放行');
+  // 攻击:比对完成后把 diff 图换成别的字节(report 里的 hash 不动)
+  const rep = readJson(join(dir, 'report-pixel.json'));
+  writeFileSync(join(dir, rep.results[0].artifacts.diff), Buffer.from('SWAPPED-NOT-A-PNG'));
+  const v = validatePixelReport(dir, readJson(join(dir, 'spec.json')), rep);
+  assert.ok(
+    v.problems.some((p) => /字节与 report 记录不符/.test(p)),
+    `换掉 artifact 图后仍认这份裁决:${JSON.stringify(v.problems)}`,
+  );
+});
+
+// ============================================================================
+// 条目 10 — 门 X 的降准 / 后置 / 隔离
+// ============================================================================
+
+test('条目 10 契约(不 skip): 降准表述 + 后置 + 整组回收 + 脚本字节绑定', () => {
+  const v = readFileSync(VERIFY, 'utf8');
+  // ③ 新进程组 + 整组回收
+  assert.match(v, /detached: true/, '门 X / extractor 必须在新进程组里跑');
+  assert.match(v, /process\.kill\(-res\.pid, 'SIGKILL'\)/, '返回后必须整组回收子进程');
+  // ⑤ 脚本 hash 与实际执行字节绑定
+  assert.match(v, /entry\.scriptSha256 = run\.scriptSha256/);
+  assert.match(v, /inputHashes\.customGates\?\.\[g\.script\]/, '实际执行的字节必须与观察前入链的那份比对');
+  // ② 后置(与条目 1 的时序一致)—— 由条目 1 的时序契约测试覆盖,这里只钉门 X 在分界线之后
+  assert.ok(v.indexOf('分界线:以下开始执行 demo 侧代码') < v.indexOf('runDemoScript(join(demoDir, g.script)'));
+  // ① 降准表述:PR 文案 + SKILL.md 都不许暗示脚本语义可信
+  const rn = readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8');
+  assert.match(rn, /已由可信 runner 执行且 exit 0/);
+  assert.match(rn, /其业务判断是否正确需人工审查/);
+  const doc = readFileSync(join(ROOT, 'SKILL.md'), 'utf8');
+  assert.match(doc, /只能声称「精确 hash 的注册脚本被可信 runner 执行且 exit 0」这个执行事件/);
+  assert.match(doc, /### 门 X 的隔离与残余风险/, '未做 OS 沙箱这条降级必须成文');
+  assert.match(doc, /孙进程会拿到自己的新进程组/, '整组回收的局限必须如实写明');
+});
+
+test('条目 10 实跑: 注册后替换脚本字节 → 门 X 红并点名字节不一致', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeFixture({
+    name: 'gatex-swap', repoDeps: true,
+    customGates: [{ id: 'oracle', script: 'oracle-gate.mjs' }],
+  });
+  writeFileSync(join(dir, 'oracle-gate.mjs'), "process.stdout.write('ok');\n");
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v0 = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.equal(v0.status, 0, `合法自定义门初次就红了:${v0.stdout}${v0.stderr}`);
+  const rep0 = readJson(join(dir, 'report.json'));
+  assert.match(rep0.gateX.gates[0].scriptSha256, /^[0-9a-f]{64}$/, '门 X 必须记下实际执行的脚本字节');
+  assert.equal(rep0.gateX.gates[0].scriptSha256, rep0.inputHashes.customGates['oracle-gate.mjs'], '执行字节应等于入链字节');
+});
+
+// ============================================================================
+// 条目 12 / 13 — index.html 定位；canonical 文件集合与实际依赖一致
+// ============================================================================
+
+test('条目 12 文档契约(不 skip): 不声称 adapter/chrome 段是 canonical，只声称 hash + 浏览器实测', () => {
+  const doc = readFileSync(join(ROOT, 'SKILL.md'), 'utf8');
+  assert.match(doc, /\*\*init 生成后可编辑的运行输入\*\*，不是可信产物/, 'index.html 的定位必须写清');
+  assert.match(doc, /没有做逐段字节全等校验/, '做不到逐段校验就必须明说,不许含糊');
+  assert.match(doc, /渲染结论由 canonical 浏览器从 immutable snapshot 实测/);
+  // 反向:全文不许出现「index.html/adapter/chrome 段是 canonical」这类声明
+  for (const line of doc.split('\n')) {
+    if (!/canonical/.test(line)) continue;
+    // 否定式表述(「不声称…是 canonical」)是我们要的那句,不能被反向断言误判
+    const positive = line.replace(/不声称[^，。|]*canonical[^，。|]*/g, '');
+    assert.ok(
+      !/(adapter|chrome)\s*(段|块)?[^|]{0,20}(是|必须是)\s*canonical/.test(positive),
+      `SKILL.md 声称 adapter/chrome 段是 canonical 但没有逐段字节校验:${line.trim().slice(0, 120)}`,
+    );
+  }
+});
+
+test('条目 13 契约(不 skip): DEMO_BUILD_FILES 恰等于 demo 侧构建期文件的实际 import 闭包', () => {
+  /* 钉死"钉字节的集合"与"真实依赖"一致:
+     - 少了 → 有文件在安全路径上却没被钉字节(真漏洞);
+     - 多了 → 钉着一个已经不在安全路径上的文件,制造"看起来有保护其实无关"的假象。
+     r7 条目 2/5 把 content 改成显式列表、删掉字符白名单之后,repo-glob.mjs 仍在安全路径上
+     (构建核心从它取 explicitContentFileProblem 与 findDemoNodeModules,--suggest-content 另有
+     动态 import),所以集合不变 —— 这条测试是为了让"不变"也有据可查、并拦住未来的漂移。 */
+  const LOCAL = {
+    'build.mjs': join(ROOT, 'templates/component-build.mjs'),
+    'component-build-core.mjs': join(ROOT, 'scripts/lib/component-build-core.mjs'),
+    'extract-helpers.mjs': join(ROOT, 'scripts/lib/extract-helpers.mjs'),
+    'repo-glob.mjs': join(ROOT, 'scripts/lib/repo-glob.mjs'),
+    'fs-utils.mjs': join(ROOT, 'scripts/lib/fs-utils.mjs'),
+    'schema.mjs': join(ROOT, 'scripts/lib/schema.mjs'),
+    'gates.mjs': join(ROOT, 'scripts/lib/gates.mjs'),
+  };
+  const seen = new Set();
+  const queue = ['build.mjs'];
+  while (queue.length) {
+    const name = queue.shift();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const file = LOCAL[name];
+    assert.ok(file, `demo 侧构建期依赖 ${name} 不在已知文件表里 —— 新增本地依赖必须同步 DEMO_BUILD_FILES 与本测试`);
+    const src = readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/from '\.\/([A-Za-z0-9._-]+\.mjs)'/g)) queue.push(m[1]);
+    for (const m of src.matchAll(/import\('\.\/([A-Za-z0-9._-]+\.mjs)'\)/g)) queue.push(m[1]);
+  }
+  assert.deepEqual([...seen].sort(), [...DEMO_BUILD_FILES].sort(),
+    'DEMO_BUILD_FILES 与 demo 侧构建期文件的实际 import 闭包不一致 —— 要么漏钉、要么钉了无关文件');
+  // 每个被钉的文件都必须真有 canonical 源可比(否则 checkDemoBuilderIntegrity 会静默跳过它)
+  for (const name of DEMO_BUILD_FILES) assert.ok(existsSync(LOCAL[name]), `${name} 没有 canonical 源文件`);
 });

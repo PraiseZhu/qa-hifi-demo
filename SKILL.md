@@ -78,10 +78,10 @@ r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_R
 `defineProperty` 抛错、verify 又不听 `pageerror`，于是读到的是假证据。r5 起多层叠加、r6 再加一层，全部落在可信侧（真正的安全锚是前三条字节/异常层，
 第四条只是形态检查）：
 
-* **bundle 字节全等复算**：门 A 跑 skill 仓自己那份 `component-build-core.mjs --check-bundle`
+* **全部 esbuild outputs 字节全等复算（I-ESBUILD）**：门 A 跑 skill 仓自己那份 `component-build-core.mjs --check-outputs`
   （`write:false`，不落产物、不执行 demo 目录里的任何代码）现算一遍期望产物，与磁盘上的
-  `assets/component.bundle.js` 做 sha256 全等比对。伪造方要过这关就得提供一份**字节全等的真
-  bundle**，而真 bundle 里的哨兵是真的；顺带堵死一切手改 bundle（塞手写 UI / 摘哨兵）。
+  `assets/component.bundle.js` **以及每一个 file-loader 派生产物**（图片 / 字体，`[name]-[hash]`）做「路径 → 字节」逐项全等比对。伪造方要过这关就得提供一份**字节全等的真
+  bundle**，而真 bundle 里的哨兵是真的；顺带堵死一切手改 bundle（塞手写 UI / 摘哨兵）与**派生资产同名换字节**（r7 条目 3：`[hash]` 是 esbuild 的内容指纹**不是密码学校验**，只复算 JS 时它字节全等）。
 * **`pageerror` fail-closed**：verify 监听页面未捕获异常，哨兵断言处非空即硬失败——预占封印
   导致真 bundle 初始化抛错的场景在这里直接暴露（bundle 初始化**故意不 try/catch**）。
 * **CSS 字节全等复算（r6 条目 1）**：同型的一条 —— 门 A 跑 `component-build-core.mjs
@@ -97,8 +97,8 @@ r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_R
   回显**：nonce 由 verify 通过页面求值传进去，页面里的任何函数都能收到并原样返回，
   所以它**不构成 secret**，也不构成「哨兵是真的」的证明 —— 审核人与 r5 修复者独立得出同一结论。
   它的实际作用只是把「静态预置一份冻结对象」抬高成「必须写一个真函数」，而真函数躲不过
-  上面的字节复算与 `pageerror`。**真正的锚是 bundle 字节复算 + CSS 字节复算 + `pageerror`
-  fail-closed 这三条。**
+  上面的字节复算与 `pageerror`。**真正的锚是「全部 esbuild outputs 字节复算 + CSS 字节复算 + `pageerror`
+  fail-closed」这三条。**
 
 封印形态校验与 `prove` 回应仍在（不可写 / 只读访问器 / `prove` 形态 / 对象已冻结），
 但它们只是形态检查，**不是安全锚，也不是结论强度的来源**。
@@ -385,16 +385,60 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 
 | 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
 |---|---|---|---|
-| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-outputs`（**bundle + 所有 file-loader 派生资产**的路径→字节，r7 条目 3）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对，**但排在所有浏览器门之后**（r7 条目 1）；执行完 demo 代码再复算一次 `inputHashes` 作纵深 | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并 |
-| B 状态覆盖 | ✅ 进（`passed/total`） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | 哨兵结论同门 |
-| C 交互鲁棒 | ✅ 进（checks 列表） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
-| D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
-| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 标注） | **pr-block 亲自 spawn canonical `pixel-compare.mjs`**（r6 条目 2；不在 verify 的门集合里），**且排在可信 verify 之前**（r7 条目 1：verify 末段会执行 demo 代码） | 未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
-| F 适配还原 | ✅ 进（点数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
-| X 自定义门 | ✅ 进（gate id 列表） | pr-block 重跑 canonical `verify.mjs`；门脚本字节进 `inputHashes.customGates`，verify 后改脚本即 hash 不符 | 体外门不游离于完整性校验之外 |
-| 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 体积） | pr-block **自己**从 `assets/` 重算体积与阀值比对；`report-assets.json` 自报数字仅对账 | 见下表 |
-| 部署一致性（`--require-deployed`） | ❌ 不进附贴块（只作为出块前置条件） | pr-block 自己 fetch 线上字节与本地逐文件 sha256 比对 | |
-| 入库检查（`--require-committed`） | ❌ 不进附贴块 | pr-block 自己跑 `git ls-files` / `git status` | |
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`。顺序写死：demo `node_modules` fail-fast → 建立 immutable snapshot → `--check-inputs`（esbuild 输入图）+ `--check-outputs`（**bundle 与全部 file-loader 产物**的路径→字节，I-ESBUILD）+ `--check-css`（I-CSS）→ **之后**才处理 demo extractor | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并（`gateAHardFail` 一票否决）；执行完 demo 代码再比 `inputHashes` 与 snapshot 偏离 |
+| B 状态覆盖 | ✅ 进（`passed/total`） | canonical 浏览器重跑，**在任何 demo Node 脚本之前**、从同一 immutable snapshot 加载 | 哨兵结论同门 |
+| C 交互鲁棒 | ✅ 进（checks 列表） | 同 B（canonical 浏览器 + snapshot + 先于 demo 脚本） | |
+| D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | 同 B | |
+| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 的裁决人与理由） | **pr-block 亲自 spawn canonical `pixel-compare --report-out <demo 外>`**，真实解码/截图/odiff；trusted report 出块、自报只对账；artifact 三图被 trusted 运行覆盖，WARN 裁决必须绑定这三图的 sha256（r7 条目 8） | 排在可信 verify **之前**（verify 末段会执行 demo 代码）；未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
+| F 适配还原 | ✅ 进（点数；未配置则降级声明） | 同 B | |
+| X 自定义门 | ✅ 进（gate id 列表，**降准表述**） | canonical verify 亲自执行注册脚本、记真实 exit code；执行前就地算脚本 sha256 并与观察前入链的那份比对 | **只能声称「精确 hash 的注册脚本被可信 runner 执行且 exit 0」这个执行事件** —— 脚本本身是 demo 代码，不证明它实现了正确的业务 oracle（r7 条目 10）。排在 A-D/F/E 核心观察之后；执行完整组回收子进程；隔离程度见下方残余风险 |
+| 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 可信侧现算体积） | pr-block **自己**枚举 `assets/` 现算体积并与阀值比对；`report-assets.json` 自报数字仅对账 | 抬闸阀与理由是**作者的政策输入**、不是测量证据（见「资产抬闸的定性」） |
+| 部署一致性（`--require-deployed`） | ❌ 不进附贴块（只作为出块前置条件） | pr-block 自己 fetch 线上字节与本地逐文件 sha256 全等比对（可信侧直接观察） | |
+| 入库检查（`--require-committed`） | ❌ 不进附贴块 | pr-block 自己跑 `git ls-files` / `git status`（可信侧直接观察） | |
+
+**原则（写死）：所有进入 PR 附贴块的字母门都必须来自 canonical 运行或等价可信复算，没有一门可以只靠 demo JSON。**
+
+门字母 ⟷ runner 的映射是**唯一机读真相源**（`scripts/lib/gates.mjs` 的 `TRUSTED_GATES`）：
+verify 的门过滤、pr-block 的投影门集合、PR 门表渲染都只遍历它，**不许再手写第二份门列表** ——
+门 E 那个 CRITICAL 的根因就是两份手写清单各自漏了它（r7 条目 7a）。渲染器另加 taint 保护：
+只接受 `markTrustedRun` 打过标记的结果，拿到未标记对象直接 throw（r7 条目 7b）。
+
+### 报告型 JSON 的定位表（谁能当证据、谁只是声明）
+
+**审核人确认：没有第四个"报告型"放行 JSON。** `package.json` 只用于模块解析根，不参与验收判定。
+
+| JSON | 定位 | 凭什么 |
+|---|---|---|
+| `spec.json` | **验收声明 / 输入**，不是证据 | 它是被验对象本身：schema 校验 + 进 `inputHashes`，且 canonical 重跑读的是同一份 |
+| `report.json` | **不能作放行依据**，仅对账 | 放行取 canonical verify 重跑结果；自报与可信结论投影不一致即阻断 |
+| `report-pixel.json` | **不能作放行依据**，仅对账 | 放行取 canonical `pixel-compare` 重跑结果（写到 demo 之外） |
+| `report-assets.json` | 测量数字**不能**作依据；抬闸理由可作**作者声明** | 体积/阀值由 pr-block 自己现算；`overrideReason` 原样印进 PR 供 reviewer 判断 |
+| `component.inputs.json` | **不能单独信** | 必须 `--check-inputs` 与 esbuild 现算结果全等 + 清单内每项逐文件 hash + 产物字节复算（I-ESBUILD / I-CSS） |
+| `truth.json` | **待证明的声明** | 每个叶子带 provenance + canonical verify 现跑 `extract.mjs` 比对（extractor drift） |
+| `adjudications/*.json`（WARN 人工裁决） | **人工裁决声明，不是机械测量** | 必须绑定 trusted E 产出的 baseline/demo/diff 三图 sha256；裁决人与理由印进 PR（r7 条目 8） |
+| `index.html` | **init 生成后可编辑的运行输入**，不是可信产物 | 不声称 adapter/chrome 段是 canonical（没有逐段字节全等校验）：只保证「相对上次 build 未被改动」（进 `inputHashes`）+ 内嵌 `qa-truth` ≡ `truth.json` + **渲染结论由 canonical 浏览器从 immutable snapshot 实测**（门 B/C/D）（r7 条目 12） |
+
+### 资产抬闸的定性（r7 条目 11，别把它写成机械保证）
+
+`effectiveLimitMb` / `overrideReason` 是**作者请求的显式抬闸政策输入，不是测量证据**。
+pr-block 会自己现算体积并把抬闸阀与理由原样印进 PR 附贴块，但**机械重跑无法阻止作者把阀抬到
+999MB** —— 若产品不希望如此，需要**外部 reviewer approval / sign-off 这一人工环节**来兜。
+工具这一侧只承诺三件事：体积数字是可信侧现算的、抬闸必须署名理由、理由会出现在 PR 上。
+
+### 门 X 的隔离与残余风险（r7 条目 10，如实标注）
+
+已做：① 表述降准到「精确 hash 的注册脚本被可信 runner 执行且 exit 0」；② 排在 A-D/F/E
+核心观察之后（与执行时序原则一致）；③ 用 `detached` 起**新进程组**跑脚本，返回后整组
+`SIGKILL` 回收；④ 执行前就地算脚本 sha256，与观察前 `inputHashes.customGates` 里的那份比对
+（"注册 A 脚本、跑 B 脚本"在这里落地）；⑤ 脚本字节进防伪链。
+
+**未做（残余风险）**：没有把门 X 放进 OS 级只写隔离的沙箱。原因如实说明 —— 门 X 是 demo 自带
+脚本，需要读 demo 目录与产品仓（`--demo <dir>` 就是为此传的），一刀切的 FS 隔离会让正常的
+自定义门直接跑不起来；Node `vm` 不是安全边界，不拿它假装隔离。因此：脚本仍可写磁盘，但
+① 它跑在所有核心观察之后，② 浏览器观察用的是 immutable snapshot，③ 它对 demo 输入的任何
+改写都会被事后 `inputHashes` 复算与 snapshot 偏离比对抓出来并判门 A 红。同组子进程会被回收，
+但脚本若刻意用 `detached` 再起孙进程，孙进程会拿到自己的新进程组、这一招杀不到它 ——
+那条路由「核心观察全部早于执行 demo 代码」兜住。
 
 ### 产物全表（组件模式下"由外部工具生成"的产物）
 
@@ -408,17 +452,20 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 | `assets/` 下 esbuild 派生资产（图片/字体 `[name]-[hash]`） | esbuild file loader | **需可信侧复算** ✅ r7 条目 3 补上（此前判「间接达成」是**错的**） | `--check-outputs` 逐产物路径+字节全等。r6 之前的理由「文件名含内容 hash 且被 bundle 引用」不成立：`[hash]` 是 esbuild 的内容指纹不是校验和，**同名换字节** JS 侧毫无变化，`inputHashes.assets` 又是对攻击后字节现算的 → 全链绿（审核人实测，我已复现） |
 | `component.inputs.json` | build.mjs（esbuild metafile） | **需可信侧复算** ✅ 已做（r3） | `--check-inputs` 全等比对；清单自身也进 hash |
 | `truth.json` | demo `extract.mjs` | **需可信侧复算** ✅ 已做 | 门 A 现跑 `extract.mjs`，结果必须 ≡ `truth.json`（extractor drift）；且每个叶子带 provenance |
-| `index.html`（init 生成的组件壳 / adapter / chrome 模板产物） | `init.mjs` 模板 | **hash 输入已足够** | 进 `inputHashes['index.html']`；内嵌 `qa-truth` 块必须 ≡ `truth.json`（门 A）；渲染结论由门 B/C/D 在真浏览器里实测，不靠模板可信 |
+| `index.html`（init 生成的组件壳 / adapter / chrome 模板产物） | `init.mjs` 模板 | **hash 输入已足够**（**不声称 canonical**） | 它是 init 生成后**可编辑的运行输入**:`--update-adapter` / `--update-chrome` 只替换标记段，仓里那份随后可被作者改动，而我们**没有做逐段字节全等校验** —— 所以只声称「进 `inputHashes['index.html']`，相对上次 build 未被改动」+ 内嵌 `qa-truth` ≡ `truth.json`（门 A）+ **渲染结论由 canonical 浏览器从 immutable snapshot 实测**（门 B/C/D），不靠模板可信（r7 条目 12） |
 | `build.mjs` / `component-build-core.mjs` / `extract-helpers.mjs` / `repo-glob.mjs`（demo 侧拷贝） | init 拷贝 | **需可信侧复算**（更强：钉死） | `checkDemoBuilderIntegrity` 要求与 skill canonical 逐字节全等；且复算一律跑 skill 那份，不执行 demo 拷贝 |
 | `baselines/**.png`（像素基准图） | `capture-baseline.mjs` / 人工采集 | **hash 输入已足够 + 门 E 可信重跑** | 基准图进 `inputHashes.baselines`（换图 → report 失效）；比对本身由 pr-block 重跑 pixel-compare 亲自做。**基准图的"来源真实性"（是否真是产品沙盒截图）工具无法机械证明——这一条如实降级为需人工审查** |
 | `pixel-artifacts/*.png`（baseline/demo/diff 三图） | pixel-compare | **需可信侧复算** ✅ r6 起 | 被可信重跑覆盖成我们生成的那份，WARN 人工裁决判的是这份 |
-| `adjudications/*.json`（WARN 人工裁决） | 人工 | **不影响机械结论 / 如实标注** | 人工裁决的性质决定它由作者署名；工具只保证它判的**图**是可信生成的，并把裁决印在 PR 上让 reviewer 看见 |
+| `adjudications/*.json`（WARN 人工裁决） | 人工 | **人工裁决声明，不是机械测量** | r7 条目 8 起必须**绑定 trusted E 产出的三图 sha256**（不再是「路径存在」就算数:路径可以指向后来被换掉的图）。三层都要对上——report 记了三图 hash、磁盘现算等于它、裁决声明的 hash 等于它;`reviewer` / `reason` 必填并印进 PR。工具只保证「它判的是可信侧生成的那三张图」，保证不了「判断本身对」 |
 | `report.json` | verify | **不作为放行依据** | pr-block 重跑 canonical verify，自报仅对账（r5） |
 | `report-pixel.json` | pixel-compare | **不作为放行依据** | pr-block 重跑 canonical pixel-compare，自报仅对账（r6） |
 | `report-assets.json` | assets-manifest | **不作为放行依据** | 体积/阀值由 pr-block 自己重算，自报仅对账（r5 #5c） |
 | `verify-artifacts/*.png`（失败截图） | verify | **不影响验收结论** | 只为人读复现，不进任何判定 |
 
 **pr-block 直接读 demo 目录文件的位置（逐个核过，无第四第五处放行依据）**：
+
+> r7 条目 9 起 pr-block **在出块阶段不再读取任何 demo 侧可变文件** —— 渲染所需的一切都来自
+> 打过 taint 标记的 canonical 产出（见上表「报告型 JSON 的定位表」与 `scripts/lib/pr-render.mjs`）。
 
 | 位置 | 读什么 | 是放行依据还是仅对账 |
 |---|---|---|
@@ -427,7 +474,7 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 | 经 `validatePixelForPr` 读 `report-pixel.json` | 作者自报的门 E 结论 | **仅对账**（结论取可信重跑） |
 | 读 `report-assets.json` | 作者自报的体积数字 | **仅对账**（阀值与体积由 pr-block 自己从 `assets/` 重算） |
 | 读 `index.html` + `assets/**` 字节 | `--require-deployed` 的本地侧 | 比对对象本身（拿它与线上字节比） |
-| 读 `truth.json`（`countFixtureLeaves`） | fixture 叶子计数 | 只用于生成"⚠️ N 个叶子来自录制 fixture"的**诚实降级声明**；内容已被门 A 的 extractor 复算锚住 |
+| ~~读 `truth.json`（`countFixtureLeaves`）~~ | —— | **r7 条目 9 起 pr-block 不再读它**:在流程末尾重读可变文件属 TOCTOU 变体(demo 代码可能已在中途改过它)。fixture 叶子计数改由 canonical verify 在**观察前**统计进 `report.truthStats`，渲染器取可信 payload |
 | `component.inputs.json` | —— | pr-block **不直接读**；由 verify / `report.mjs` 经复算与逐文件 hash 处理 |
 
 > **Tailwind content 入链集（r7 条目 2：从 glob 降级为显式文件列表）**：`component.css.content`
