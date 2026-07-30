@@ -20,6 +20,22 @@ export function validateReportIntegrity(demoDir, spec, report) {
   const actualHashes = buildInputHashes(demoDir, spec);
   if (!report.inputHashes) problems.push('report 缺 inputHashes');
   else if (!sameInputHashes(report.inputHashes, actualHashes)) problems.push('report 输入 hash 与当前 spec/truth/index/baselines/customGates 不一致,请重跑 verify/pixel');
+  // 组件模式代码层防伪链 fail-closed:hash 值只要不是真 sha256(缺文件/glob 零命中/仓根不可解析),
+  // 这条链就没锁住任何东西——改产品源码旧 report 照样过。一律阻断,并明示怎么修。
+  if (spec?.component?.mode === 'component') {
+    const FIX = {
+      MISSING: '源文件不存在——检查 spec.component.entry/sources 路径,或该文件已被删/改名',
+      NO_MATCH: 'glob 零命中——该 pattern 在产品仓内匹配不到任何文件,修正 spec.component.sources',
+      UNRESOLVED: 'demo 所在目录不在任何 git 仓内——demo 必须位于产品 git 仓内,代码层 hash 才能锁源',
+    };
+    const cs = actualHashes.componentSources ?? {};
+    for (const [group, entries] of [['sources', cs.sources], ['bundle', cs.bundle]]) {
+      for (const [name, value] of Object.entries(entries ?? {})) {
+        if (FIX[value]) problems.push(`component 防伪链未锁住 ${group} "${name}"(状态 ${value}):${FIX[value]}`);
+      }
+    }
+    if (cs.repoRoot === 'UNRESOLVED') problems.push(`component 防伪链未锁住 repoRoot(状态 UNRESOLVED):${FIX.UNRESOLVED}`);
+  }
   for (const key of ['gateA', 'gateB', 'gateC', 'gateD', 'gateF', 'gateX']) {
     const s = summarizeGate(report[key]);
     if (!s.ok) problems.push(`${key} 未通过或统计不一致:${s.reason}`);

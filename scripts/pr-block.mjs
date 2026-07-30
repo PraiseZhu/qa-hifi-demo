@@ -174,6 +174,11 @@ lines.push(`| 状态覆盖（实际执行 ${report.gateB.passed}/${report.gateB.
 lines.push(`| 交互鲁棒（${report.gateC.checks.map((c) => c.id).join(' / ')}） | ✅ |`);
 if (report.gateD.total > 0) lines.push(`| 渲染绑定（${report.gateD.total} 条 computed-style ≡ truth） | ✅ |`);
 else lines.push('| 渲染绑定 | ⚠️ 未配置 bindings，还原承诺仅到数据层 |');
+// 组件模式:声明「真组件直渲」并给出进链的源文件数——读者一眼看出渲染不是手搓复刻
+if (spec.component?.mode === 'component') {
+  const srcCount = Object.keys(report.inputHashes?.componentSources?.sources ?? {}).length;
+  lines.push(`| 真组件直渲（${srcCount} 个源文件 hash 入链） | ✅ |`);
+}
 if (report.gateF.total > 0) lines.push(`| 适配还原（${report.gateF.total} 点） | ✅ |`);
 else lines.push('| 适配还原（窗口拉伸行为） | ⚠️ 未配置 adaptive，拉伸未验证 |');
 if (report.gateX?.total > 0) lines.push(`| 自定义门（${report.gateX.gates.map((g) => g.id).join(' / ')}） | ✅ |`);
