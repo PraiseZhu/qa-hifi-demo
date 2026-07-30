@@ -170,7 +170,7 @@ test('条目 1 源码契约(不 skip): 执行 demo 侧代码必须排在浏览�
   const iGateD = v.indexOf('---------- 门 D:渲染绑定');
   const iGateF = v.indexOf('---------- 门 F:适配还原');
   const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
-  const iExtract = v.indexOf('const run = runDemoScript(extractor)');
+  const iExtract = v.indexOf("const run = runDemoScript(extractor, ['--demo', demoDir])");
   const iCustom = v.indexOf("runDemoScript(join(demoDir, g.script), ['--demo', demoDir]");
   const iPost = v.indexOf('const inputHashesPost = buildInputHashes(demoDir, spec)');
   for (const [label, idx] of [['inputs 复算', iInputs], ['bundle 复算', iBundle], ['css 复算', iCss],
@@ -224,7 +224,9 @@ test('条目 1 PoC: extract.mjs 派 detached worker 在观察窗口把 index.htm
   const extractor = [
     "import { spawn } from 'node:child_process';",
     "import { join } from 'node:path';",
-    "const here = new URL('.', import.meta.url).pathname;",
+    // r8 条目 C:extractor / 门 X 执行的是**可信副本**(住在 demo 之外的 output root),
+    // 所以脚本必须用 `--demo` argv 定位 demo。攻击者同样拿得到这个路径,PoC 的攻击力不变。
+    "const argv = process.argv.slice(2); const here = argv[argv.indexOf('--demo') + 1];",
     "const child = spawn(process.execPath, [join(here, 'toctou-worker.mjs'), join(here, 'index.html')], { detached: true, stdio: 'ignore' });",
     'child.unref();',
     // 同步返回正确 truth:门 A 的 extractor drift 这一段照常绿
@@ -294,7 +296,8 @@ test('条目 1 事后 hash 纵深(实跑): 自定义门改写 index.html → 门
     [
       "import { appendFileSync } from 'node:fs';",
       "import { join } from 'node:path';",
-      "appendFileSync(join(new URL('.', import.meta.url).pathname, 'index.html'), '<!-- mutated -->');",
+      "const argv = process.argv.slice(2); const here = argv[argv.indexOf('--demo') + 1];",
+      "appendFileSync(join(here, 'index.html'), '<!-- mutated -->');",
       "process.stdout.write('ok');\n",
     ].join('\n'),
   );
@@ -704,10 +707,10 @@ test('条目 3 阳性对照(实跑): 正常多资产 bundle(JS+PNG+WOFF)全链�
 test('条目 4 源码契约(不 skip): 快照在前置门之后、任何 demo 代码之前建立，浏览器从快照加载', () => {
   const v = readFileSync(VERIFY, 'utf8');
   const iNm = v.indexOf('checkDemoNoNodeModules(demoDir)');
-  const iSnap = v.indexOf('snapshotDir = makeObservationSnapshot()');
+  const iSnap = v.indexOf('snapshotDir = makeObservationSnapshot(demoDir)');
   const iServe = v.indexOf('createSafeStaticServer(snapshotDir)');
   const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
-  const iDrift = v.indexOf('const drift = snapshotDrift()');
+  const iDrift = v.indexOf("manifestCheckpoint('post-run')");   // r8:单向 drift → 双向 manifest
   for (const [l, i] of [['node_modules 前置门', iNm], ['快照建立', iSnap], ['从快照起服务', iServe],
     ['分界线', iBoundary], ['快照偏离比对', iDrift]]) assert.ok(i > 0, `verify.mjs 里找不到 ${l}`);
   assert.ok(iNm < iSnap, '快照必须建立在 demo node_modules fail-fast 之后');
@@ -715,12 +718,12 @@ test('条目 4 源码契约(不 skip): 快照在前置门之后、任何 demo �
   assert.ok(iBoundary < iDrift, '快照偏离比对必须排在执行 demo 代码之后');
   assert.ok(!/createSafeStaticServer\(demoDir\)/.test(v), 'verify 仍在从 demo 原地提供文件(I-OBSERVE 不成立)');
   assert.match(v, /I-OBSERVE/, '不变式名必须写进源码');
-  // 快照要整树复制以保住相对路径依赖,只豁免生成物/取证目录
-  // (r8 条目 A:豁免清单更名为 EXEMPT_TOP_FILES/EXEMPT_TOP_DIRS,并与 drift/页面可达性共用一份)
-  assert.match(v, /EXEMPT_TOP_FILES/);
-  assert.match(v, /EXEMPT_TOP_DIRS/);
-  assert.match(v, /isExemptRel/);
-  assert.match(v, /recursive: true/);
+  /* 快照要整树复制以保住相对路径依赖。r8 条目 A:排除表被取消 —— 实现移到 lib/observe.mjs,
+     只跳 node_modules / .git(前置门已拒 / 不属交付产物),工具输出改写 output root。
+     详细契约见 comp-fix-r8 的「条目 A 源码契约」。 */
+  const ob = readFileSync(join(ROOT, 'scripts/lib/observe.mjs'), 'utf8');
+  assert.match(ob, /recursive: true/);
+  assert.match(ob, /SNAPSHOT_SKIP_TOP = \['node_modules', '\.git'\]/);
 });
 
 test('条目 4 PoC(实跑): 页面脚本在观察窗口内改写 index.html —— 观察对象仍是快照，且偏离被抓', (t) => {
@@ -737,7 +740,8 @@ test('条目 4 PoC(实跑): 页面脚本在观察窗口内改写 index.html —�
   writeFileSync(join(dir, 'rewrite-gate.mjs'), [
     "import { readFileSync, writeFileSync } from 'node:fs';",
     "import { join } from 'node:path';",
-    "const f = join(new URL('.', import.meta.url).pathname, 'index.html');",
+    "const argv = process.argv.slice(2);",
+    "const f = join(argv[argv.indexOf('--demo') + 1], 'index.html');",
     "writeFileSync(f, readFileSync(f, 'utf8').replace('width:16px', 'width:99px'));",
     "process.stdout.write('rewritten');\n",
   ].join('\n'));

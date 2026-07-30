@@ -824,7 +824,11 @@ test('failShot: 门 B 失败自动留现场截图', (t) => {
   const failure = report.gateB.failures.find((f) => f.state === 'ghost');
   assert.ok(failure, 'gateB 应有 ghost 失败');
   assert.ok(failure.screenshot, 'failure 应带 screenshot 字段');
-  assert.ok(existsSync(join(dir, failure.screenshot)), '截图文件应存在');
+  /* r8 条目 A:失败取证不再写进 demo 树(那会让运行期写入落在快照比对范围里),改落 demo 之外的
+     output root;绝对根记在 report.artifactRoot,screenshot 是相对它的路径。 */
+  assert.ok(report.artifactRoot, 'report 必须给出 artifactRoot(取证产物的根)');
+  assert.ok(existsSync(join(report.artifactRoot, failure.screenshot)), '截图文件应存在于 artifactRoot 下');
+  assert.ok(!existsSync(join(dir, 'verify-artifacts')), 'demo 树里不得再出现运行期写入的 verify-artifacts/');
 });
 
 test('evolution-note: add 去重 + md 再生成 + proposal 永不降档(QA_HIFI_SKILL_ROOT 隔离)', () => {
