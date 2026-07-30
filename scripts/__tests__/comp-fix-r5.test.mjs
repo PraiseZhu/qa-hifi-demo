@@ -352,8 +352,8 @@ test('#1c 源码契约(不 skip): 封印之外必须叠加 bundle 字节全等 +
   assert.match(verify, /pageerror/);
   assert.match(verify, /bundle 初始化期页面抛错/);
   // (a) 可信侧重算 bundle 字节
-  assert.match(verify, /recheckComponentBundle|checkComponentBundleBytes/);
-  assert.match(readFileSync(join(ROOT, 'scripts/lib/fs-utils.mjs'), 'utf8'), /--check-bundle/);
+  assert.match(verify, /recheckComponentOutputs|recheckComponentBundle/);
+  assert.match(readFileSync(join(ROOT, 'scripts/lib/fs-utils.mjs'), 'utf8'), /--check-outputs|--check-bundle/);
 });
 
 test('#1c bundle 字节全等(不 skip 逻辑层): 手改 bundle 一个字节 → 可信侧复算不等,门 A 红', (t) => {
@@ -364,7 +364,7 @@ test('#1c bundle 字节全等(不 skip 逻辑层): 手改 bundle 一个字节 �
   writeFileSync(bundle, `${readFileSync(bundle, 'utf8')}\n/* tampered */\n`);
   const v = run(VERIFY, ['--demo', dir], { env: env() });
   assert.notEqual(v.status, 0, '手改 bundle 居然还能过 verify');
-  assert.match(`${v.stdout}${v.stderr}`, /bundle 字节与可信侧复算结果不一致/);
+  assert.match(`${v.stdout}${v.stderr}`, /字节与可信侧复算结果不一致/);
 });
 
 test('#1c 复现样本: index.html 预占精确同形假封印(含 prove)+ 目标不调用 → verify 必红、非 proved、无「真组件直渲」', (t) => {
@@ -418,7 +418,7 @@ test('#2c-b 复现样本(不 skip): 字面 [ab].tsx 入链零命中 / Tailwind �
   const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
   const out = `${r.stdout}${r.stderr}`;
   assert.equal(r.status, 2, `字符类 glob 被放行了(#2c-b 未修):${out}`);
-  assert.match(out, /含 glob\/元字符|不是本工具可解析的受限 glob/);
+  assert.match(out, /会被 Tailwind 当 glob 解释|字符类/);
   assert.match(out, /\[/, '报文应点出触发的元字符');
 });
 

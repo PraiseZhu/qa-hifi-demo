@@ -74,29 +74,62 @@ export function restrictedGlobProblem(pattern) {
   return null;
 }
 
-/* ══ tailwind content 的**显式文件路径**校验(r7 条目 2,破坏性接口变更)══
+/* ══ tailwind content 的**显式文件路径**校验(r7 条目 2/5/6)══
 
-   自研 glob 语义已被证伪四次(字符类 `[ab]` / `content.relative` 基准错位 / node_modules
-   非对称扫描 / `***` 形态);r6 改成复用 fast-glob 后仍留三条残余:relative 靠静态文本扫描
-   推断、我们解析到的 fast-glob 未必与 tailwind 内部那份同源、config 的 plugin/preset 不递归
-   入链。而 Tailwind v3 **没有公开稳定的 API/CLI 能导出真实 file set**(3.4.19 无 verbose/files
-   输出;parseCandidateFiles 是包内私有 API,不是升级稳定契约)。
+   r7 条目 2 起 content 只接受显式文件路径。条目 5 原本要求「删掉受限字符白名单,只留路径
+   安全政策」,理由是「解析权已交给 Tailwind,再留字符规则会误杀合法文件名」。
+   **我实测 tailwindcss@3.4.19 后只采纳了它的一半** —— 前半(删白名单)对,后半(不拒
+   `[ ] { }`)会直接击穿不变式 E = L。实测证据(`parseCandidateFiles` 的 `glob` 字段;
+   非 null = 被当 glob 解释):
 
-   结论:收回语义解释权 —— component.css.content 只接受**显式的 repo-relative 普通文件路径**,
-   完全禁止 glob 与目录。构建时转成绝对路径传给 Tailwind `--content`,此时 config.content 与
-   config.content.relative 都不再决定集合(实测:绝对文件路径在 parseCandidateFiles 里
-   glob === null,扫描集就是那些文件本身)。
+     声明(绝对路径,真实存在的文件)   Tailwind 的解释
+     src/plain.tsx                     glob=null  ✅ 字面
+     src/x y.tsx / a#b / a%b / a&b      glob=null  ✅ 字面(旧白名单**误杀**过这些)
+     src/a'b / a~b / a=b / a;b / a:b    glob=null  ✅ 字面(同上)
+     src/a[b.tsx / a]b / a{b / a!b      glob=null  ✅ 字面(单个字符不成对 → 不是 glob)
+     src/a(b).tsx / a+b / a@b / a|b     glob=null  ✅ 字面
+     src/a?b.tsx                       glob=null  ✅ 字面(实测如此)
+     src/中文.tsx                       glob=null  ✅ 字面
+     src/a*b.tsx                       glob="a*b.tsx"    ❌ 通配
+     src/[ab].tsx                      glob="[ab].tsx"   ❌ 字符类 → 实扫 a.tsx / b.tsx
+     src/{a}.tsx                       glob="{a}.tsx"    ❌ brace
+     src/+(a).tsx  @( !( ?( *(          glob="+(a).tsx"   ❌ extglob
+     src/\\[ab].tsx(反斜杠转义)         glob="[ab].tsx"   ❌ 转义也救不了(实测:字面文件反而扫不到,
+                                                          a.tsx/b.tsx 照样被扫)
 
-   不变式 S ⊆ E = L(实扫集 ⊆ 期望集 = 入链集)由**参数结构**保证,不靠事后猜测。
+   结论:`[ab].tsx` 这类**真实存在**的文件靠「存在 + regular file」兜不住 —— 它存在、是普通
+   文件,而 Tailwind 仍把它当字符类,实扫集变成 a.tsx / b.tsx(E ≠ L,正是 r5 那条 `[ab]` 绕过)。
+   所以策略改成:**按 Tailwind 自己的解析行为拒收**(成对 `[...]` / `{...}` / extglob 前缀 /
+   `*`),而不是按「我们实现了哪些字符」拒收。这不是第二套政策,而是 `glob === null` 的必要
+   条件;每一条都由 comp-fix-r7 的实跑测试钉在 Tailwind 的真实行为上(拒收类必须 glob≠null,
+   放行类必须 glob===null),Tailwind 换版本后行为若变化 → 测试红,强制显式适配。
 
-   作者便利性:component-build-core 提供 `--suggest-content <glob...>` 生成器,把旧 glob 展成
-   建议清单;但**定稿输入必须是显式列表**,生成器产出要落进 spec 而不是运行时展开。 */
-const CONTENT_META = ['*', '?', '[', ']', '{', '}', '!', '(', ')', '+', '@', ',', '|', '^', '$', '\\'];
+   条目 6(逗号,transport 而非 glob):实测 `--content` 是**逗号分隔的多值串**,
+   `src/a,b.tsx` 会被切成两段,该文件的 class **不进 CSS**(而 config 数组形式能正确承载它)。
+   我们保留 `--content` 这条通道(它才是让 config.content / relative 失效的 override,
+   且薄壳 build 与可信侧复算必须逐字节同参),因此**含逗号的路径一律拒绝,绝不静默 join**。
+
+   `?` 的取舍(如实说明):实测它在文件名里是字面的,本可放行;仍然拒 —— 作者写 `?` 基本上
+   就是想用通配,报错并给迁移提示比让它按字面找一个不存在的文件更有用。这一条标注为
+   **意图信号**,不是 E = L 的必要条件。 */
+
+/** Tailwind 会当 glob 解释的形态(实测钉死,见上表)——命中即拒。 */
+const GLOB_SHAPES = [
+  { re: /\*/, why: '`*` 是通配符(实测 glob="…*…")' },
+  { re: /\[[^/]*\]/, why: '成对 `[...]` 被当字符类(实测 `[ab].tsx` → 实扫 a.tsx / b.tsx,连转义也救不了)' },
+  { re: /\{[^/]*\}/, why: '成对 `{...}` 被当 brace 展开' },
+  { re: /[+@!?*]\([^/]*\)/, why: 'extglob 前缀 `+( @( !( ?( *(` 被当扩展通配' },
+  { re: /\\/, why: '反斜杠:既是 Windows 分隔符歧义,实测也无法用来转义 glob 元字符' },
+];
 
 /**
- * component.css.content 的单项格式校验(纯函数,不碰文件系统)。
- * 文件系统层面的校验(存在、regular file、realpath 在仓内)见
- * component-build-core.resolveContentFiles —— 两层都必须过。
+ * component.css.content 的单项校验(纯函数,不碰文件系统)。
+ * 两层政策,分开写清楚:
+ *   ① 路径安全:非空、无 NUL、非绝对路径、无 `..`、无空段、不在 `.git/` 或 `node_modules/` 下;
+ *   ② glob/transport 形态:Tailwind 会当 glob 解释的形态(实测钉死)+ `--content` 承载不了的逗号
+ *      + `?` 意图信号。
+ * 文件系统层(存在 / regular file / realpath 在 repoRoot 内)见
+ * component-build-core.resolveContentFiles —— 两层都必须过,报错优先给**真实信息**。
  * @returns {string|null} 问题描述;null = 通过。
  */
 export function explicitContentFileProblem(entry) {
@@ -105,24 +138,44 @@ export function explicitContentFileProblem(entry) {
     + '\n  旧:["src/**/*.tsx"]   新:["src/App.tsx", "src/Panel.tsx", ...]'
     + '\n迁移:跑 node scripts/lib/component-build-core.mjs --suggest-content "src/**/*.tsx" --demo <dir>'
     + '(生成器,把旧 glob 展成建议清单),把结果抄进 spec.json;运行期不再做任何展开。'
-    + '\n原因:自研/复用的 glob 展开与 Tailwind 实扫集的语义差异已被证伪四次,'
-    + '而 Tailwind v3 没有公开稳定 API 能导出真实 file set —— 只有显式列表能让'
-    + '「实扫集 ⊆ 期望集 = 入链集」由参数结构保证。';
-  if (typeof entry !== 'string' || !entry.trim()) return `必须是非空 string(仓内相对文件路径)${migrate}`;
-  if (entry !== entry.trim()) return `"${entry}" 首尾有空白${migrate}`;
+    + '\n原因:只有显式文件列表能让「实扫集 ⊆ 期望集 = 入链集」由参数结构保证 ——'
+    + 'Tailwind 对绝对普通文件路径给出 glob===null,扫描集就是那些文件本身。';
+  // ── ① 路径安全 ──
+  if (typeof entry !== 'string' || !entry) return `必须是非空 string(仓内相对文件路径)${migrate}`;
+  if (entry.includes('\0')) return '不允许 NUL 字符';
   if (entry.startsWith('/') || /^[A-Za-z]:/.test(entry)) return `不允许绝对路径:${entry}${migrate}`;
-  if (entry.includes('\\')) return `不允许反斜杠(一律用 posix 分隔符):${entry}${migrate}`;
   if (entry.split('/').includes('..')) return `不允许 ".." 越狱:${entry}${migrate}`;
-  const meta = [...new Set([...entry].filter((c) => CONTENT_META.includes(c)))];
-  if (meta.length)
-    return (
-      `"${entry}" 含 glob/元字符 ${meta.map((c) => JSON.stringify(c)).join(' ')} —— content 只接受显式文件路径`
-      + `${migrate}`
-    );
   const segs = entry.split('/');
-  if (segs.some((s) => !s)) return `路径含空段(重复或首尾斜杠):${entry}${migrate}`;
+  if (segs.some((seg) => !seg)) return `路径含空段(重复或首尾斜杠):${entry}${migrate}`;
   if (segs.includes('node_modules')) return `默认拒绝 node_modules 下的路径:${entry}(第三方文件不该作为 demo 的样式源;真需要请先在产品侧把它复制/导出到仓内源码目录)`;
   if (segs.includes('.git')) return `默认拒绝 .git 下的路径:${entry}`;
+  // ── ② glob / transport 形态 ──
+  for (const shape of GLOB_SHAPES) {
+    if (shape.re.test(entry))
+      return (
+        `"${entry}" 会被 Tailwind 当 glob 解释,不能作为显式文件声明:${shape.why}。`
+        + '\n后果:实扫集 ≠ 声明集(E ≠ L)—— 被扫到的文件不入防伪链,改它们 hash 不变、旧 CSS 照过验收。'
+        + (/\[|\{|\(/.test(entry)
+          ? '\n如果这**真的是文件名里的字符**:Tailwind 没有可用的转义方式(实测反斜杠转义后字面文件反而扫不到),'
+            + '请改文件名,或把该文件的样式改由别的入口承载。'
+          : '')
+        + migrate
+      );
+  }
+  if (entry.includes(','))
+    return (
+      `"${entry}" 含逗号,\`--content\` 承载不了:实测 tailwind CLI 把 --content 当**逗号分隔多值串**,`
+      + '该路径会被切成两段,这个文件的 class 根本不会进 CSS(静默漏扫)。'
+      + '\n修法:改文件名去掉逗号。(config 数组形式能承载逗号,但我们必须用 --content override 才能'
+      + '让 config.content / content.relative 失效,两条通道不能混用。)'
+    );
+  if (entry.includes('?'))
+    return (
+      `"${entry}" 含 \`?\` —— 显式列表模式下不接受通配符写法(实测 \`?\` 在文件名里是字面的,`
+      + '拒它是**意图信号**:写 ? 通常是想用 glob)。'
+      + '\n真是文件名里的字面 ? 请改文件名。'
+      + migrate
+    );
   return null;
 }
 

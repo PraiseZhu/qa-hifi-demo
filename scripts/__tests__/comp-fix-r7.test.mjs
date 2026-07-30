@@ -22,11 +22,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import zlib from 'node:zlib';
 import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
 import { explicitContentFileProblem, restrictedGlobProblem } from '../lib/repo-glob.mjs';
 import { resolveContentFiles } from '../lib/component-build-core.mjs';
@@ -157,7 +158,7 @@ test('条目 1 源码契约(不 skip): 执行 demo 侧代码必须排在浏览�
   const v = readFileSync(VERIFY, 'utf8');
   // 三项可信侧字节复算 + 浏览器启动 + 门 D 实测,全部必须早于「执行 demo 侧脚本」
   const iInputs = v.indexOf('recheckComponentInputs(demoDir)');
-  const iBundle = v.indexOf('recheckComponentBundle(demoDir, spec.component)');
+  const iBundle = v.indexOf('recheckComponentOutputs(demoDir, spec.component)');
   const iCss = v.indexOf('recheckComponentCss(demoDir, spec.component)');
   const iBrowser = v.indexOf('launchChromium(demoDir');
   const iGateD = v.indexOf('---------- 门 D:渲染绑定');
@@ -300,20 +301,76 @@ test('条目 1 事后 hash 纵深(实跑): 自定义门改写 index.html → 门
 // 条目 2 — content 改「显式文件路径列表」
 // ============================================================================
 
-test('条目 2 纯函数(不 skip): 显式文件校验拒 glob/越狱/绝对路径/.git/node_modules', () => {
+test('条目 2/5 纯函数(不 skip): 只拒「Tailwind 会当 glob 解释的形态 + 路径不安全 + --content 承载不了」', () => {
+  /* r7 条目 5:删掉旧的受限**字符白名单**(它误杀了空格 / # / % / & / ' / ~ / = / ; / : /
+     单个中括号等一堆合法文件名字符),改成按 Tailwind 的真实解析行为拒收。
+     每一条拒收都在下一条测试里被钉在 parseCandidateFiles 的实测结果上。 */
   const rejected = [
-    'src/**/*.tsx', 'src/*.tsx', 'src/?.tsx', 'src/[ab].tsx', 'src/{a,b}.tsx', '!src/a.tsx',
-    'src/+(a).tsx', 'src/@(a).tsx', 'src/a,b.tsx', 'src/a|b.tsx', 'src/a^.tsx', 'src/a$.tsx',
-    'src\\a.tsx', '/abs/a.tsx', '../outside.tsx', 'src/../../x.tsx', '', '   ',
+    'src/**/*.tsx', 'src/*.tsx', 'src/[ab].tsx', 'src/{a,b}.tsx', 'src/{a}.tsx',
+    'src/+(a).tsx', 'src/@(a).tsx', 'src/!(a).tsx', 'src/?(a).tsx', 'src/*(a).tsx',
+    'src/a,b.tsx',       // transport:--content 是逗号分隔多值串(条目 6)
+    'src/?.tsx',         // 意图信号(实测 ? 在文件名里是字面的,但写 ? 通常是想用 glob)
+    'src\\a.tsx',        // 反斜杠:分隔符歧义 + 实测无法用来转义 glob 元字符
+    '/abs/a.tsx', '../outside.tsx', 'src/../../x.tsx', '', 'src//a.tsx',
     '.git/config', 'node_modules/pkg/a.tsx', 'src/node_modules/vendor/a.tsx',
   ];
   for (const p of rejected) assert.ok(explicitContentFileProblem(p), `未拒绝非法 content 条目:${JSON.stringify(p)}`);
-  const accepted = ['src/a.tsx', 'apps/desktop/src/Foo.tsx', 'src/中文文件.tsx', 'src/a-b_c.1.tsx'];
+  /* 旧白名单误杀过的合法文件名字符,现在必须放行(这才是条目 5 的实质:少一套自造政策)。
+     单个不成对的 [ ] { } ! ( ) + @ 同样放行 —— 实测 Tailwind 对它们给出 glob===null。 */
+  const accepted = [
+    'src/a.tsx', 'apps/desktop/src/Foo.tsx', 'src/中文文件.tsx', 'src/a-b_c.1.tsx',
+    'src/x y.tsx', 'src/a#b.tsx', 'src/a%b.tsx', 'src/a&b.tsx', "src/a'b.tsx",
+    'src/a~b.tsx', 'src/a=b.tsx', 'src/a;b.tsx', 'src/a:b.tsx',
+    'src/a[b.tsx', 'src/a]b.tsx', 'src/a{b.tsx', 'src/a}b.tsx',
+    'src/a!b.tsx', 'src/a(b).tsx', 'src/a+b.tsx', 'src/a@b.tsx', 'src/a|b.tsx', 'src/a^b.tsx', 'src/a$b.tsx',
+  ];
   for (const p of accepted) assert.equal(explicitContentFileProblem(p), null, `误杀合法显式文件:${p}`);
   // 报错文案必须写清迁移方式(破坏性变更)
   assert.match(explicitContentFileProblem('src/**/*.tsx'), /显式|glob/);
-  // r5 的受限 glob 白名单保留(仍服务 component.sources 等其它路径)
+  assert.match(explicitContentFileProblem('src/a,b.tsx'), /逗号/, '逗号必须点名 --content 的承载问题');
+  assert.match(explicitContentFileProblem('src/[ab].tsx'), /字符类/, '中括号必须点名 Tailwind 的字符类解释');
+  // 受限 glob 白名单仍在,但只服务 component.sources 等其它 glob 用途(不再管 content)
   assert.equal(typeof restrictedGlobProblem, 'function');
+  const rg = stripComments(readFileSync(join(ROOT, 'scripts/lib/repo-glob.mjs'), 'utf8'));
+  assert.ok(!/GLOB_ALLOWED\.test\(entry\)/.test(rg), 'content 校验不该再走字符白名单(条目 5)');
+});
+
+test('条目 5 证据钉死(实跑真 tailwind): 拒收类必须 glob≠null,放行类必须 glob===null', () => {
+  /* 这条是条目 5 的关键:证明我们的拒收**不是自造政策**,而是 Tailwind 自己的解析行为。
+     用当前安装版本的 parseCandidateFiles 逐类核对;版本升级后行为若变化 → 本测试红,
+     强制显式适配(不许悄悄放宽或收紧)。两个例外单独标注:',' 是 CLI transport、'?' 是意图信号。 */
+  const req = createRequire(join(ROOT, 'package.json'));
+  let parseCandidateFiles;
+  let resolveConfig;
+  try {
+    ({ parseCandidateFiles } = req('tailwindcss/lib/lib/content.js'));
+    resolveConfig = req('tailwindcss/resolveConfig');
+  } catch (err) {
+    assert.fail(`tailwindcss 内部 API 不可加载(${err.message})——必须显式适配,不许把字符政策留成无据之谈`);
+  }
+  const globOf = (name) => {
+    const abs = `/tmp/qa-hifi-probe/${name}`;
+    const cfg = resolveConfig({ content: [abs] });
+    const e = parseCandidateFiles({ tailwindConfig: cfg }, cfg);
+    return e.length ? e[0].glob : 'DROPPED';
+  };
+  // 拒收类:Tailwind 确实把它们当 glob(glob≠null)⇒ 我们的拒收是 E = L 的必要条件
+  for (const n of ['a*b.tsx', '[ab].tsx', '{a}.tsx', '+(a).tsx', '@(a).tsx', '!(a).tsx', '?(a).tsx', '*(a).tsx']) {
+    assert.notEqual(globOf(n), null, `${n} 在当前 tailwind 上已不是 glob —— 拒收理由需重新评估`);
+    assert.ok(explicitContentFileProblem(`src/${n}`), `${n} 被 Tailwind 当 glob 却没被我们拒`);
+  }
+  // 放行类:Tailwind 当字面(glob===null)⇒ 拒它们就是误杀,必须放行
+  for (const n of ['plain.tsx', 'x y.tsx', 'a#b.tsx', 'a%b.tsx', 'a&b.tsx', "a'b.tsx", 'a~b.tsx', 'a=b.tsx',
+    'a;b.tsx', 'a:b.tsx', 'a[b.tsx', 'a]b.tsx', 'a{b.tsx', 'a}b.tsx', 'a!b.tsx', 'a(b).tsx', 'a+b.tsx',
+    'a@b.tsx', 'a|b.tsx', 'a^b.tsx', 'a$b.tsx', '中文.tsx']) {
+    assert.equal(globOf(n), null, `${n} 在当前 tailwind 上变成 glob 了 —— 必须改成拒收`);
+    assert.equal(explicitContentFileProblem(`src/${n}`), null, `${n} 是字面文件名却被误杀(条目 5 要修的正是这个)`);
+  }
+  // 两个例外:拒收但**不是**因为 Tailwind 当 glob —— 报文里必须说清真实理由
+  assert.equal(globOf('a?b.tsx'), null, '前提:? 在文件名里是字面的(所以拒它是意图信号,不是必要条件)');
+  assert.match(explicitContentFileProblem('src/a?b.tsx'), /意图信号/);
+  assert.equal(globOf('a,b.tsx'), null, '前提:逗号在 config 数组形式里是字面的(问题出在 --content 的 transport)');
+  assert.match(explicitContentFileProblem('src/a,b.tsx'), /--content/);
 });
 
 test('条目 2 源码契约(不 skip): content 路径不再做任何 glob 展开;--content 传绝对路径', () => {
@@ -502,6 +559,250 @@ test('条目 2 版本联动(不 skip): tailwindcss/fast-glob/micromatch 版本�
   }
 });
 
+
+// ============================================================================
+// 条目 3 — esbuild file-loader 派生资产的字节复算（新 P0）
+// ============================================================================
+
+/** 真 `import hero.png` 的组件 + 派生字体：产出 JS + PNG + WOFF 三类 output。 */
+function makeAssetFixture(name) {
+  const { repo, dir } = makeFixture({ name, repoDeps: true });
+  // 8x8 纯色 PNG（最小合法字节）与一份假字体：内容不同、扩展名走 file loader
+  const png = (r, g, b) => {
+    const raw = [];
+    for (let y = 0; y < 8; y += 1) { raw.push(0); for (let x = 0; x < 8; x += 1) raw.push(r, g, b, 255); }
+    const idat = zlib.deflateSync(Buffer.from(raw));
+    const crcT = [...Array(256).keys()].map((n) => { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+    const crc = (b2) => { let c = 0xffffffff; for (const x of b2) c = crcT[(c ^ x) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+    const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const td = Buffer.concat([Buffer.from(type), data]); const cr = Buffer.alloc(4); cr.writeUInt32BE(crc(td)); return Buffer.concat([len, td, cr]); };
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(8, 0); ihdr.writeUInt32BE(8, 4); ihdr[8] = 8; ihdr[9] = 6;
+    return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))]);
+  };
+  writeFileSync(join(repo, 'src/components/hero.png'), png(255, 0, 0));
+  writeFileSync(join(repo, 'src/components/face.woff'), Buffer.from('wOFF-fake-font-v1'));
+  // entry 真 import 两个资产并用上（不能被 tree-shake）
+  writeFileSync(join(repo, 'src/components/Claimed.ts'), [
+    "import { helper } from './Helper';",
+    "import hero from './hero.png';",
+    "import face from './face.woff';",
+    'export function Claimed(){ return `CLAIMED-${helper()}-${hero}-${face}`; }',
+    '',
+  ].join('\n'));
+  return { repo, dir, png };
+}
+/** demo 里 esbuild 派生出的资产（不含 bundle 与 CSS）。 */
+const derivedAssets = (dir) => readdirSync(join(dir, 'assets'))
+  .filter((f) => !f.startsWith('component.'));
+
+test('条目 3 源码契约(不 skip): 复算覆盖全部 esbuild 产物，而不只是 JS 字节', () => {
+  const core = stripComments(readFileSync(CORE, 'utf8'));
+  assert.match(core, /export async function computeExpectedEsbuildOutputs/, '必须有全产物复算入口');
+  assert.match(core, /outputFiles/, '必须遍历 write:false 的 outputFiles');
+  assert.match(core, /--check-outputs/, 'CLI 必须支持 --check-outputs');
+  const fsu = stripComments(readFileSync(join(ROOT, 'scripts/lib/fs-utils.mjs'), 'utf8'));
+  assert.match(fsu, /export function recheckComponentOutputs/);
+  assert.match(fsu, /'--check-outputs'/, '复算必须跑 skill canonical 的 --check-outputs');
+  assert.match(fsu, /缺产物/, '缺失产物必须报错(不能只比存在的那些)');
+  const v = stripComments(readFileSync(VERIFY, 'utf8'));
+  assert.match(v, /recheckComponentOutputs\(demoDir, spec\.component\)/, '门 A 必须调全产物复算');
+  // I-ESBUILD 的表述必须落在代码注释里
+  assert.match(readFileSync(join(ROOT, 'scripts/lib/fs-utils.mjs'), 'utf8'), /I-ESBUILD/);
+});
+
+test('条目 3 PoC: 派生 PNG 原地换字节但保留 [hash] 文件名 → 必须门红 + pr-block exit 2', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir, png } = makeAssetFixture('asset-swap');
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0, 'build 失败');
+  const assets = derivedAssets(dir);
+  const hero = assets.find((f) => f.endsWith('.png'));
+  assert.ok(hero, `没产出派生 PNG,PoC 前提不成立:${JSON.stringify(assets)}`);
+  assert.match(hero, /-[A-Z0-9]{8}\.png$/, '派生资产文件名应含 esbuild 的 [hash] 指纹');
+  // 初次 verify 必须绿(证明 PoC 起点是合法状态)
+  assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0, '合法多资产 bundle 初次 verify 就红了');
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+
+  // 攻击:同名覆盖成另一张图(蓝色),不改文件名
+  writeFileSync(join(dir, 'assets', hero), png(0, 0, 255));
+  // 攻击者照常重跑资产闸门(它对当前字节现算,天然自洽)
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0, '资产闸门本身不该拦(它不是这条的防线)');
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  const out = `${v.stdout}${v.stderr}`;
+  assert.notEqual(v.status, 0, `派生资产换字节后 verify 仍全绿(条目 3 未修):${out}`);
+  assert.match(out, /字节与可信侧复算结果不一致/);
+  assert.match(out, new RegExp(hero.replace(/[.[\]]/g, '\\$&')), '报文必须点名是哪个派生资产');
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 2, `派生资产被换字节居然出了块:${pr.stdout}${pr.stderr}`);
+  assert.ok(!/真组件直渲.*✅/.test(pr.stdout), '不许贴「真组件直渲 ✅」');
+});
+
+test('条目 3 变体(实跑): 删除派生资产 / 换名 / 改字体字节 → 一律门红', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeAssetFixture('asset-variants');
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const assets = derivedAssets(dir);
+  const hero = assets.find((f) => f.endsWith('.png'));
+  const font = assets.find((f) => f.endsWith('.woff'));
+  assert.ok(hero && font, `多资产前提不成立:${JSON.stringify(assets)}`);
+  const heroAbs = join(dir, 'assets', hero);
+  const fontAbs = join(dir, 'assets', font);
+  const heroBytes = readFileSync(heroAbs);
+  const fontBytes = readFileSync(fontAbs);
+  const expectRed = (label) => {
+    run(ASSETS_MANIFEST, ['--demo', dir], { env: env() });
+    const v = run(VERIFY, ['--demo', dir], { env: env() });
+    assert.notEqual(v.status, 0, `${label} 之后 verify 仍绿`);
+    assert.match(`${v.stdout}${v.stderr}`, /字节与可信侧复算结果不一致|缺产物/, `${label} 的报错不是产物复算不符`);
+  };
+  // ① 删除派生资产
+  rmSync(heroAbs);
+  expectRed('删除派生 PNG');
+  writeFileSync(heroAbs, heroBytes);
+  // ② 换名(内容不动,只改文件名)
+  const renamed = join(dir, 'assets', hero.replace(/-([A-Z0-9]{8})\.png$/, '-ZZZZZZZZ.png'));
+  renameSync(heroAbs, renamed);
+  expectRed('派生 PNG 换名');
+  renameSync(renamed, heroAbs);
+  // ③ 改字体字节
+  writeFileSync(fontAbs, Buffer.from('wOFF-fake-font-v2-TAMPERED'));
+  expectRed('改派生字体字节');
+  writeFileSync(fontAbs, fontBytes);
+  // 复原后必须回绿(证明上面三次红不是被别的门顺带带红的)
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0, '复原后没回绿 → 上面的判定不精确');
+});
+
+test('条目 3 阳性对照(实跑): 正常多资产 bundle(JS+PNG+WOFF)全链绿，额外手工资产只列出不阻断', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeAssetFixture('asset-ok');
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  // 作者手工放进 assets/ 的额外图片:不在 expected 集合里,按产品策略**不阻断**
+  writeFileSync(join(dir, 'assets/manual-note.png'), Buffer.from('not-an-esbuild-output'));
+  assert.equal(run(ASSETS_MANIFEST, ['--demo', dir], { env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.equal(v.status, 0, `正常多资产 + 手工资产被误杀:${v.stdout}${v.stderr}`);
+  const rep = readJson(join(dir, 'report.json'));
+  assert.equal(rep.gateA.outputsRecheck.status, 'ok');
+  assert.ok(rep.gateA.outputsRecheck.checked >= 3, `应至少复算 JS+PNG+WOFF 三个产物:${JSON.stringify(rep.gateA.outputsRecheck)}`);
+  assert.ok(
+    (rep.gateA.outputsRecheck.extraAssets ?? []).includes('assets/manual-note.png'),
+    `额外资产必须被如实列出以便人核对:${JSON.stringify(rep.gateA.outputsRecheck)}`,
+  );
+  const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+  assert.equal(pr.status, 0, `正常多资产路径被误杀:${pr.stdout}${pr.stderr}`);
+});
+
+// ============================================================================
+// 条目 4 — 不可变 snapshot（I-OBSERVE）
+// ============================================================================
+
+test('条目 4 源码契约(不 skip): 快照在前置门之后、任何 demo 代码之前建立，浏览器从快照加载', () => {
+  const v = readFileSync(VERIFY, 'utf8');
+  const iNm = v.indexOf('checkDemoNoNodeModules(demoDir)');
+  const iSnap = v.indexOf('snapshotDir = makeObservationSnapshot()');
+  const iServe = v.indexOf('createSafeStaticServer(snapshotDir)');
+  const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
+  const iDrift = v.indexOf('const drift = snapshotDrift()');
+  for (const [l, i] of [['node_modules 前置门', iNm], ['快照建立', iSnap], ['从快照起服务', iServe],
+    ['分界线', iBoundary], ['快照偏离比对', iDrift]]) assert.ok(i > 0, `verify.mjs 里找不到 ${l}`);
+  assert.ok(iNm < iSnap, '快照必须建立在 demo node_modules fail-fast 之后');
+  assert.ok(iSnap < iBoundary, '快照必须建立在执行任何 demo 代码之前');
+  assert.ok(iBoundary < iDrift, '快照偏离比对必须排在执行 demo 代码之后');
+  assert.ok(!/createSafeStaticServer\(demoDir\)/.test(v), 'verify 仍在从 demo 原地提供文件(I-OBSERVE 不成立)');
+  assert.match(v, /I-OBSERVE/, '不变式名必须写进源码');
+  // 快照要整树复制以保住相对路径依赖,只排除生成物/取证目录
+  assert.match(v, /SNAPSHOT_EXCLUDE/);
+  assert.match(v, /recursive: true/);
+});
+
+test('条目 4 PoC(实跑): 页面脚本在观察窗口内改写 index.html —— 观察对象仍是快照，且偏离被抓', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  /* 只靠时序挡不住这一类:改写发生在**浏览器观察进行中**(自定义门里模拟一个与观察并发的
+     写入者)。快照让观察对象固定,所以测量结果不受影响;偏离本身仍要如实报出来 ——
+     磁盘上的 demo 已不是被观察的那一份,PR 会带走另一个版本。 */
+  const { dir } = makeFixture({
+    name: 'snapshot-drift',
+    repoDeps: true,
+    bindings: [{ sel: '.box', prop: 'width', truth: 'geometry.width', kind: 'length' }],
+    customGates: [{ id: 'rewriter', script: 'rewrite-gate.mjs' }],
+  });
+  writeFileSync(join(dir, 'rewrite-gate.mjs'), [
+    "import { readFileSync, writeFileSync } from 'node:fs';",
+    "import { join } from 'node:path';",
+    "const f = join(new URL('.', import.meta.url).pathname, 'index.html');",
+    "writeFileSync(f, readFileSync(f, 'utf8').replace('width:16px', 'width:99px'));",
+    "process.stdout.write('rewritten');\n",
+  ].join('\n'));
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  const rep = readJson(join(dir, 'report.json'));
+  // 门 D 在快照上测的是正确值 → 它自己是绿的(证明观察对象没被换掉)
+  assert.equal(rep.gateD.pass, true, `门 D 应在快照上测到正确值:${JSON.stringify(rep.gateD.failures)}`);
+  // 但偏离必须被抓,整体判红
+  assert.notEqual(v.status, 0, '磁盘与快照偏离却仍全绿');
+  assert.notEqual(rep.gateA.snapshotDrift, 'none', '快照偏离没被记录');
+  assert.match(`${v.stdout}${v.stderr}`, /与观察快照发生偏离/);
+});
+
+test('条目 4 阳性对照(实跑): 快照不误杀带子目录/中文名/相对路径依赖的 demo', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  const { dir } = makeFixture({ name: 'snapshot-ok', repoDeps: true });
+  // 额外静态依赖:子目录 + 中文文件名,由 index.html 相对引用
+  mkdirSync(join(dir, 'static/子目录'), { recursive: true });
+  writeFileSync(join(dir, 'static/子目录/额外.css'), '.extra{color:#00ff00}\n');
+  writeFileSync(
+    join(dir, 'index.html'),
+    readFileSync(join(dir, 'index.html'), 'utf8').replace('<head>', '<head><link rel="stylesheet" href="static/子目录/额外.css">'),
+  );
+  assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.equal(v.status, 0, `快照方案误杀了带子目录/中文名相对依赖的 demo:${v.stdout}${v.stderr}`);
+  assert.equal(readJson(join(dir, 'report.json')).gateA.snapshotDrift, 'none');
+  /* 快照必须跑完即删。这里**不去数 tmpdir 里的残留**:全套测试并发跑时别的 verify 进程
+     正好持有自己的快照,数出来的非零是别人的,那是条 flaky 断言(实测在全量运行下会红)。
+     清理由 verify 的 finally 分支保证,断言放在上一条源码契约里(rmSync(snapshotDir…))。 */
+  assert.match(readFileSync(VERIFY, 'utf8'), /rmSync\(snapshotDir, \{ recursive: true, force: true \}\)/, '快照必须在 finally 里删掉');
+});
+
+// ============================================================================
+// 条目 6 — 逗号文件名的传参边界
+// ============================================================================
+
+test('条目 6 实测前提(实跑真 tailwind): --content 是逗号分隔多值串，含逗号的路径无法承载', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要 skill 侧真 tailwind CLI');
+  /* 这条钉住「为什么必须拒逗号」的实测事实本身:直接调 tailwind CLI,把含逗号的文件与一个
+     普通文件 join 成一个 --content 串 —— 含逗号那个文件的 class 不会进 CSS(静默漏扫)。
+     若某天 CLI 支持了引号/重复 --content,这条测试会红,届时可以重新评估是否放开。 */
+  const repo = mkdtempSync(join(tmpdir(), 'qa-r7-comma-'));
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'tailwind.config.js'), 'module.exports = { content: [], theme: {} };\n');
+  writeFileSync(join(repo, 'src/a,b.tsx'), 'export const c = "bg-teal-500";\n');
+  writeFileSync(join(repo, 'src/plain.tsx'), 'export const d = "bg-amber-500";\n');
+  writeFileSync(join(repo, 'in.css'), '@tailwind utilities;\n');
+  const bin = join(ROOT, 'node_modules/.bin/tailwindcss');
+  const r = spawnSync(bin, ['-c', join(repo, 'tailwind.config.js'), '-i', join(repo, 'in.css'),
+    '-o', join(repo, 'out.css'), '--content', `${join(repo, 'src/a,b.tsx')},${join(repo, 'src/plain.tsx')}`],
+  { cwd: repo, encoding: 'utf8' });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const css = readFileSync(join(repo, 'out.css'), 'utf8');
+  assert.match(css, /bg-amber-500/, '普通文件应被扫到(对照)');
+  assert.ok(!css.includes('bg-teal-500'), '前提变了:--content 现在能承载含逗号的路径了,拒逗号的理由需重新评估');
+});
+
+test('条目 6 fixture(实跑): 声明含逗号的文件 → 入口拒绝，不静默 join', (t) => {
+  if (!MODULE_ROOT) return t.skip('需要真 esbuild 走到 content 校验');
+  const { dir } = makeFixture({
+    name: 'comma-content',
+    repoDeps: 'skill',
+    css: { tailwindConfig: 'tailwind.config.js', content: ['src/a,b.tsx'] },
+    extraRepoFiles: { 'src/a,b.tsx': 'export const c = "bg-teal-500";\n' },
+  });
+  const b = run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() });
+  assert.notEqual(b.status, 0, '含逗号的 content 声明必须被拒(否则静默漏扫)');
+  assert.match(`${b.stdout}${b.stderr}`, /逗号/);
+  assert.match(`${b.stdout}${b.stderr}`, /--content/, '报文必须点名真实理由(transport 而非 glob)');
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, 'verify 侧同样必须拒');
+});
 // ============================================================================
 // 文档校准
 // ============================================================================
@@ -524,5 +825,18 @@ test('文档契约(不 skip): SKILL.md 必须写明执行时序原则、S ⊆ E 
   assert.ok(!/受限 glob\*\*——r5 起改成\*\*白名单式字符扫描/.test(doc), 'content 段仍在按 glob 描述,与 r7 实现不符');
   // 门级全表两处次序说明
   assert.match(doc, /但排在所有浏览器门之后/, '门 A 行必须写明 extractor 的新次序');
+  // 条目 3/4:三层不变式必须成文,派生资产那行的旧判定必须被显式纠正
+  assert.match(doc, /### 三层不变式/, '必须有三层不变式小节');
+  for (const k of ['I-ESBUILD', 'I-CSS', 'I-OBSERVE']) assert.match(doc, new RegExp(k), `缺不变式 ${k}`);
+  assert.match(doc, /要么是可信工具当前输入的确定性输出、要么验收失败/, '三者同时成立后的总表述必须原样在文档里');
+  assert.match(doc, /内容指纹不是密码学校验|内容指纹\*\*不是密码学校验/, '必须写明 [hash] 不是校验和');
+  assert.match(doc, /此前判「间接达成」是\*\*错的\*\*/, '产物全表里派生资产的旧判定必须被显式纠正,而不是悄悄改掉');
+  assert.match(doc, /不可变 snapshot/, 'I-OBSERVE 的快照必须写进时序小节');
+  assert.match(doc, /snapshotDrift/, '快照偏离的报告字段必须可查');
+  // 条目 5/6:两层政策与实测理由
+  assert.match(doc, /① 路径安全/, 'content 校验必须分「路径安全」与「glob/transport 形态」两层');
+  assert.match(doc, /Tailwind 自己会当 glob 解释的形态/, '不许再把它写成本工具的字符白名单');
+  assert.match(doc, /意图信号/, '? 的取舍必须如实标注');
+  assert.match(doc, /逗号分隔多值串/, '逗号必须写明是 transport 限制');
   assert.match(doc, /且排在可信 verify 之前/, '门 E 行必须写明可信重跑的新次序');
 });
