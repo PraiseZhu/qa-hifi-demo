@@ -343,10 +343,13 @@ test('#2c-b content 非显式文件形态(glob / brace / 否定 / 绝对路径 /
     assert.equal(r.status, 2, `${JSON.stringify(pattern)} 居然被接受:${r.stdout}${r.stderr}`);
     // r5 #2c-b:黑名单改成白名单式字符扫描,报文措辞随之改为「受限 glob」
     // (拒收范围只扩大不缩小:brace/否定/绝对路径依旧拒,另新增字符类等元字符)
-    // r7:报文统一为「content 只接受显式文件路径」+ 迁移指引(目录/越狱/依赖目录另有专门措辞)
+    /* r7 条目 2/5:报文按**真实原因**分流 —— glob 形态说「会被 Tailwind 当 glob 解释」,
+       路径不安全说对应政策,而 `!src/skip.css` 这类既不是 glob 形态、路径也安全的写法
+       会走到 fs 层落成「文件不存在」(条目 5 要的就是「用真实信息报错,不要用字符规则猜」)。
+       无论走哪条,exit 2 这一点不变。 */
     assert.match(
       r.stdout + r.stderr,
-      /含 glob\/元字符|不允许绝对路径|不是普通文件|越狱|默认拒绝 node_modules/,
+      /会被 Tailwind 当 glob 解释|不允许绝对路径|不是普通文件|越狱|默认拒绝 node_modules|含逗号|文件不存在|意图信号/,
     );
   }
 });

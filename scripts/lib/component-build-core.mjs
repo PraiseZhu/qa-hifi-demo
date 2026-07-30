@@ -13,8 +13,9 @@
 // CLI(仅供 skill 侧复算与薄壳 build.mjs 使用):
 //   node component-build-core.mjs --check-inputs --demo <demoDir>
 //     → 只重算输入图,把规范化清单打到 stdout,不落任何产物。
-//   node component-build-core.mjs --check-bundle --demo <demoDir>
-//     → write:false 现算一遍,给出「应该得到的 bundle」sha256(可信侧字节复算)。
+//   node component-build-core.mjs --check-outputs --demo <demoDir>   (旧名 --check-bundle 仍可用)
+//     → write:false 现算一遍,给出 esbuild **全部产物**的「路径→字节」可信映射
+//       (JS bundle + file loader 派生的图片/字体/…);r7 条目 3 前只复算 JS 字节。
 //   node component-build-core.mjs --check-css --demo <demoDir>
 //     → 用产品 tailwind config 重编一遍 CSS 到临时目录,给出「应该得到的
 //       assets/component.css」sha256(r6 条目 1;未配 tailwind 时给占位字节的期望值)。
@@ -647,22 +648,59 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
 }
 
 /**
- * 可信侧复算 bundle 字节(r5 #1c 第一层)。write:false 现算一遍,返回**期望的**
- * bundle 内容 sha256。调用方与磁盘上的 assets/component.bundle.js 做全等比对:
- * 手改 bundle、以及「预占同形封印 + 让真 bundle 初始化失败」这类伪造,都必须先能
- * 提供一份字节全等的真 bundle,而那份真 bundle 的哨兵是真的。
+ * 可信侧复算 **esbuild 全部产物字节**(r5 #1c 第一层 → r7 条目 3 升级)。
+ *
+ * r5 只复算 JS bundle 字节(computeExpectedBundleSha),而组件真实 `import hero.png` 时
+ * esbuild 的 file loader 会把资产落成 `assets/hero-XMUUP4P7.png` 这类**派生产物**。
+ * 审核人实测的 P0:把该 PNG **原地覆盖成另一张图但保留原文件名** —— JS 里引用的还是同一个
+ * 名字,所以 bundle 字节仍全等;`inputHashes.assets` 是对攻击后的当前字节现算的,天然自洽;
+ * 文件名里的 `[hash]` 只是 esbuild 的内容指纹、**不是密码学校验**,改内容不改名照样过。
+ * 结果:verify exit 0、pr-block exit 0,仍贴「真组件直渲」。
+ *
+ * 修法(不变式 I-ESBUILD):磁盘上 bundle + 所有 file-loader 产物的「路径 → 字节」映射,
+ * 必须等于 canonical write:false 现算映射。缺失 / 字节不等 / 换名一律门红。
+ *
+ * @returns {{bundle: string, outputs: {path: string, sha256: string, bytes: number}[]}}
+ *   path 一律是**相对 demoDir 的 posix 路径**(产物都落在 demo 内)。
  */
-export async function computeExpectedBundleSha(demoDir) {
+export async function computeExpectedEsbuildOutputs(demoDir) {
   const { outputFiles, bundleOut, comp } = await computeComponentBuild({ demoDir, checkOnly: true });
-  const wanted = realpathish(bundleOut);
-  const hit = (outputFiles ?? []).find((f) => realpathish(f.path) === wanted)
-    ?? (outputFiles ?? []).find((f) => f.path.endsWith('.js'));
-  if (!hit) fail('可信侧复算未产出 bundle 输出文件(esbuild write:false 无 outputFiles)', 1);
-  return {
-    bundle: comp.bundle ?? 'assets/component.bundle.js',
-    sha256: createHash('sha256').update(Buffer.from(hit.contents)).digest('hex'),
-    bytes: hit.contents.length,
+  if (!outputFiles || !outputFiles.length) fail('可信侧复算未产出任何 esbuild 输出文件(write:false 无 outputFiles)', 1);
+  const demoReal = realpathish(demoDir);
+  const demoPlain = resolve(demoDir);
+  /* demo 相对路径:macOS 的 /var → /private/var symlink 会让同一个文件有两种绝对路径,
+     两种基准都要试,否则会算出一串 ../../.. 的假路径(实测踩过)。 */
+  const relToDemo = (p) => {
+    for (const base of [demoReal, demoPlain]) {
+      for (const abs of [resolve(p), realpathish(p)]) {
+        if (abs === base || abs.startsWith(base + sep)) return toPosix(relative(base, abs));
+      }
+    }
+    return null;
   };
+  const outputs = [];
+  for (const f of outputFiles) {
+    // 产物必须落在 demo 内 —— 落到别处说明 spec 把输出路径指到了 demo 之外,不许当作可信产物
+    const rel = relToDemo(f.path);
+    if (rel === null) fail(`esbuild 产物落在 demo 目录之外,拒绝:${f.path}`, 2);
+    outputs.push({
+      path: rel,
+      sha256: createHash('sha256').update(Buffer.from(f.contents)).digest('hex'),
+      bytes: f.contents.length,
+    });
+  }
+  outputs.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const bundleRel = relToDemo(bundleOut);
+  if (!outputs.some((o) => o.path === bundleRel))
+    fail(`可信侧复算的产物集合里没有声明的 bundle(${bundleRel}):${outputs.map((o) => o.path).join(', ')}`, 1);
+  return { bundle: comp.bundle ?? 'assets/component.bundle.js', outputs };
+}
+
+/** @deprecated r7 起用 computeExpectedEsbuildOutputs;保留一层薄封装供只关心 JS 字节的调用方。 */
+export async function computeExpectedBundleSha(demoDir) {
+  const { bundle, outputs } = await computeExpectedEsbuildOutputs(demoDir);
+  const hit = outputs.find((o) => o.path === bundle) ?? outputs.find((o) => o.path.endsWith('.js'));
+  return { bundle, sha256: hit.sha256, bytes: hit.bytes };
 }
 function realpathish(p) { try { return realpathSync(p); } catch { return resolve(p); } }
 
@@ -672,11 +710,11 @@ function real0(p) { try { return realpathSync(p); } catch { return resolve(p); }
 if (invokedDirectly) {
   const argv = process.argv.slice(2);
   const wantInputs = argv.includes('--check-inputs');
-  const wantBundle = argv.includes('--check-bundle');
+  const wantBundle = argv.includes('--check-bundle') || argv.includes('--check-outputs');
   const wantCss = argv.includes('--check-css');
   const suggestIdx = argv.indexOf('--suggest-content');
   if (!wantInputs && !wantBundle && !wantCss && suggestIdx === -1) {
-    process.stderr.write('用法: node component-build-core.mjs --check-inputs|--check-bundle|--check-css|--suggest-content <glob...> [--demo <demoDir>]\n');
+    process.stderr.write('用法: node component-build-core.mjs --check-inputs|--check-outputs(=--check-bundle)|--check-css|--suggest-content <glob...> [--demo <demoDir>]\n');
     process.exit(2);
   }
   const i = argv.indexOf('--demo');
@@ -714,7 +752,8 @@ if (invokedDirectly) {
       process.exit(0);
     }
     if (wantBundle) {
-      process.stdout.write(`${JSON.stringify(await computeExpectedBundleSha(demoDir), null, 2)}\n`);
+      // r7 条目 3:输出的是**全部产物**的路径→字节映射(不再只有 JS bundle 的 sha256)
+      process.stdout.write(`${JSON.stringify(await computeExpectedEsbuildOutputs(demoDir), null, 2)}\n`);
       process.exit(0);
     }
     const { manifest } = await computeComponentBuild({ demoDir, checkOnly: true });

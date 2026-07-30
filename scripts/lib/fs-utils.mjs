@@ -285,24 +285,32 @@ export function recheckComponentInputs(demoDir) {
 }
 
 /**
- * 可信侧复算 bundle 字节(r5 #1c 第一层):跑 **skill 仓自己那份**构建核心的
- * `--check-bundle`(write:false,不落产物、不执行 demo 目录里的任何代码),
- * 拿到「按当前 spec/源码应该得到的 bundle」的 sha256,与磁盘上的 bundle 全等比对。
+ * 可信侧复算 **esbuild 全部产物字节**(r5 #1c 第一层 → r7 条目 3 升级):跑 **skill 仓自己那份**
+ * 构建核心的 `--check-outputs`(`write:false`,不落产物、不执行 demo 目录里的任何代码),
+ * 拿到「按当前 spec/源码应该得到的每一个 esbuild 产物」的路径→字节映射,与磁盘逐个全等比对。
  *
- * 堵两件事:
+ * 不变式 **I-ESBUILD**:磁盘上 bundle + 所有 file-loader 产物的「路径 → 字节」映射,必须等于
+ * canonical write:false 现算映射。
+ *
+ * 堵三件事:
  *   ① 手改 bundle(往产物里塞手写 UI / 删哨兵);
  *   ② 「index.html 预占同形假封印 + 让真 bundle 的 defineProperty 抛错」这类伪造——
- *      伪造方无法同时提供一份字节全等的**真** bundle,而真 bundle 里的哨兵是真的。
+ *      伪造方无法同时提供一份字节全等的**真** bundle,而真 bundle 里的哨兵是真的;
+ *   ③ **r7 条目 3(P0)**:派生资产原地换字节但保留 `[hash]` 文件名。r5 只复算 JS 字节,
+ *      而 JS 里引用的还是同一个名字 → bundle 字节仍全等;`inputHashes.assets` 对攻击后的
+ *      当前字节现算 → 天然自洽;文件名里的 `[hash]` 是 esbuild 的内容指纹**不是密码学校验**。
+ *      审核人实测:覆盖 `assets/hero-XMUUP4P7.png` 后 verify=0 / pr-block=0,仍贴「真组件直渲」。
  *
- * 返回 { status: 'ok'|'mismatch'|'error'|'n/a', problems }。
+ * 额外文件的处理(产品策略):不在 expected 集合里的 demo 侧 assets **不阻断**(作者可能有
+ * 手工放进去的图),但会在报文里列出来供人核对 —— 拦它会误杀合法用法,不列出来则无从发现。
+ *
+ * 返回 { status: 'ok'|'mismatch'|'error', problems }。
  */
-export function recheckComponentBundle(demoDir, component) {
-  const rel = typeof component?.bundle === 'string' && component.bundle ? component.bundle : 'assets/component.bundle.js';
-  const abs = join(demoDir, rel);
-  if (!existsSync(abs)) return { status: 'error', problems: [`component.bundle 不存在:${rel}——先跑 node build.mjs`] };
+export function recheckComponentOutputs(demoDir, component) {
+  const declaredBundle = typeof component?.bundle === 'string' && component.bundle ? component.bundle : 'assets/component.bundle.js';
   let fresh;
   try {
-    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-bundle', '--demo', demoDir], {
+    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-outputs', '--demo', demoDir], {
       cwd: demoDir,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
@@ -311,20 +319,51 @@ export function recheckComponentBundle(demoDir, component) {
   } catch (err) {
     return {
       status: 'error',
-      problems: [`可信侧复算 bundle 字节失败(skill 侧 component-build-core --check-bundle):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
+      problems: [`可信侧复算 esbuild 产物字节失败(skill 侧 component-build-core --check-outputs):${String(err.stdout || err.stderr || err.message).slice(0, 400)}`],
     };
   }
-  const actual = hashFile(abs);
-  if (fresh?.sha256 === actual) return { status: 'ok', problems: [] };
+  const expected = Array.isArray(fresh?.outputs) ? fresh.outputs : null;
+  if (!expected || expected.length === 0)
+    return { status: 'error', problems: ['可信侧复算没给出任何 esbuild 产物(--check-outputs 输出异常),fail-closed'] };
+
+  const problems = [];
+  for (const want of expected) {
+    if (!relSafe(want.path)) { problems.push(`可信侧复算给出的产物路径非法:${want.path}`); continue; }
+    const abs = join(demoDir, want.path);
+    if (!existsSync(abs) || !statSync(abs).isFile()) {
+      problems.push(`缺产物 ${want.path}——可信侧复算说应该有它(${want.bytes} 字节),磁盘上没有;先跑 node build.mjs`);
+      continue;
+    }
+    const actual = hashFile(abs);
+    if (actual !== want.sha256)
+      problems.push(
+        `${want.path} 的字节与可信侧复算结果不一致——产物不是当前 spec/源码用 canonical 构建规范生成的。`
+        + `\n  磁盘 sha256:${actual}\n  可信侧复算:${want.sha256}`
+        + (want.path === declaredBundle
+          ? '\n可能原因:手改过 bundle(塞手写 UI / 摘哨兵)、改完源码没重跑 build、或用了别的构建器。'
+          : '\n可能原因:**派生资产被原地换了字节但保留了 [hash] 文件名**(r7 条目 3 的 P0 形态),'
+            + '或改完源图没重跑 build。注意文件名里的 [hash] 只是 esbuild 的内容指纹,不是校验和。')
+        + '\n修法:node build.mjs 重新产出,再重跑 verify。',
+      );
+  }
+  if (problems.length) return { status: 'mismatch', problems };
+
+  // 额外文件只列出、不阻断(见函数头注的产品策略说明)
+  const expectedPaths = new Set(expected.map((o) => o.path));
+  const extras = buildAssetsManifest(demoDir).files
+    .map((f) => f.path)
+    .filter((p) => !expectedPaths.has(p) && p !== `${component?.assetsDir ?? 'assets'}/component.css`);
   return {
-    status: 'mismatch',
-    problems: [
-      `${rel} 的 bundle 字节与可信侧复算结果不一致——产物不是当前 spec/源码用 canonical 构建规范生成的。`
-      + `\n  磁盘 sha256:${actual}\n  可信侧复算:${fresh?.sha256 ?? '(无)'}`
-      + '\n可能原因:手改过 bundle(塞手写 UI / 摘哨兵)、改完源码没重跑 build、或用了别的构建器。'
-      + '\n修法:node build.mjs 重新产出,再重跑 verify。',
-    ],
+    status: 'ok',
+    problems: [],
+    checked: expected.length,
+    extraAssets: extras,
   };
+}
+
+/** @deprecated r7 起用 recheckComponentOutputs(它把 file-loader 派生资产也纳入字节复算)。 */
+export function recheckComponentBundle(demoDir, component) {
+  return recheckComponentOutputs(demoDir, component);
 }
 
 /**

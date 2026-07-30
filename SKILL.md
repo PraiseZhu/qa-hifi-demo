@@ -139,8 +139,10 @@ import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bun
 > 直接被拒并附迁移指引。迁移方式：
 > `node scripts/lib/component-build-core.mjs --suggest-content "src/**/*.tsx" --demo <dir>`
 > 把旧 glob 展成建议清单，**抄进 spec.json**（生成器只是便利工具，运行期一律不做展开）。
-> 逐项校验：非空且无首尾空白、不含 `* ? [ ] { } ! ( ) + @ , | ^ $ \\`、非绝对路径、无反斜杠、
-> 无 `..`、无空段、默认拒 `node_modules/` 与 `.git/` 下的路径；再加 fs 层的「存在 + 必须是
+> 逐项校验分两层（r7 条目 5 修正）：**① 路径安全** —— 非空、无 NUL、非绝对路径、无 `..`、无空段、默认拒 `node_modules/` 与 `.git/` 下的路径；**② glob/transport 形态** —— 只拒
+> 「Tailwind 自己会当 glob 解释的形态」：`*`、成对 `[...]`、成对 `{...}`、extglob 前缀
+> `+( @( !( ?( *(`、反斜杠；外加 `,`（`--content` 是逗号分隔多值串，承载不了）与 `?`
+> （**意图信号**，实测它在文件名里是字面的）。再加 fs 层的「存在 + 必须是
 > regular file + realpath 落在 repoRoot 内」（挡 symlink 越狱）。声明不存在的文件 = exit 2
 > （等价于旧「glob 零命中」：CSS 会按更小的集合编译却不被发现）。
 > **为什么收紧到这个程度**：自研 glob 展开已被证伪四次（字符类 `[ab]` → `content.relative`
@@ -318,6 +320,27 @@ artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自�
 （`ok`/`skipped`/`declared`/`threshold` + 每个基准的 `status`；`bad`/`total` 因重新渲染有
 像素级抖动，不做全等以免假阴性）。
 
+### 三层不变式（r7 收口，写死）
+
+组件模式的验收结论只建立在这三条上。**三者同时成立**才可以表述：所有影响组件渲染的构建产物，
+要么是可信工具当前输入的确定性输出、要么验收失败；demo 自报与磁盘最终 hash 不再充当
+"发生过可信构建 / 观察"的证明。
+
+| 不变式 | 内容 | 落地位置 |
+|---|---|---|
+| **I-ESBUILD** | 磁盘上 bundle + **所有 file-loader outputs** 的「路径 → 字节」映射，必须等于 canonical `write:false` 现算映射 | `component-build-core --check-outputs` + `recheckComponentOutputs`（门 A） |
+| **I-CSS** | 磁盘 `component.css` 字节必须等于 canonical 临时重编字节（同一 Tailwind 实现 / config / cwd / input / content / 受控 env） | `--check-css` + `recheckComponentCss`（门 A） |
+| **I-OBSERVE** | 上述复算与**所有核心浏览器观察**，都发生在 demo `node_modules` fail-fast 之后、**任何 demo 可执行脚本之前**，并从**同一不可变 snapshot** 提供文件 | verify 的快照 + 执行时序（见下节） |
+
+**I-ESBUILD 为什么必须覆盖派生资产（r7 条目 3，实测 P0）**：r5 只复算 JS 字节。组件真实
+`import hero.png` 时 esbuild 的 file loader 会落出 `assets/hero-XMUUP4P7.png`；审核人实测把它
+**原地覆盖成另一张图但保留原文件名** → JS 里引用的还是同一个名字（bundle 字节仍全等）、
+`inputHashes.assets` 是对攻击后字节现算的（天然自洽）、文件名里的 `[hash]` 只是 esbuild 的
+**内容指纹不是密码学校验** ⇒ `verify=0`、`pr-block=0`，仍贴「真组件直渲」。我在 256dff4 上
+复现了这一结果，修后同一攻击 `verify=2` / `pr-block=2` 并点名具体产物。
+缺失 / 字节不等 / 换名一律门红；**不在 expected 集合里的额外 assets 不阻断**（作者可能手工放图），
+但会列进 `gateA.outputsRecheck.extraAssets` 供人核对 —— 拦它会误杀合法用法，不列出来则无从发现。
+
 ### 执行时序原则（r7 条目 1 CRITICAL，写死）
 
 **「可信侧重跑」成立的前提是：canonical runner 自己不能在核心观察之前执行被审方的代码。**
@@ -329,13 +352,20 @@ r5/r6 一直漏了这一条 —— r6 的 verify 次序是「跑 demo `extract.m
 
 r7 起的次序（**禁止调换，由 `comp-fix-r7` 源码契约测试锁死**）：
 
+0. demo `node_modules` fail-fast 之后、执行任何 demo 代码之前，把 demo 验证输入整树复制成
+   **demo 之外的不可变 snapshot**，浏览器一律从 snapshot 加载（**I-OBSERVE**）。只靠时序仍有
+   缺口：能改文件的不止 `extract.mjs` / 自定义门 —— 页面自身脚本、上一轮遗留的 detached 进程，
+   都可能在浏览器观察窗口内换掉 `index.html` / `assets`。快照把观察对象固定下来，且它的路径
+   不在 demo 内，demo 侧代码既不知道也碰不到；
 1. 观察前算一次 `inputHashes`；
 2. 门 A 的纯静态段（内嵌 `qa-truth` ≡ `truth.json`）+ 三项可信侧字节复算
    （`--check-inputs` / `--check-bundle` / `--check-css`；它们跑 skill canonical，不执行 demo 代码）；
 3. 浏览器门 B/C/D/F（全部核心测量）；
 4. **之后**才执行 demo 侧代码：门 A 的 extractor drift 段 + 门 X 自定义门。门 A 的结论**延后
    合并**（`gateAHardFail` 一票否决），extractor drift 这项检查不丢不降级；
-5. 再算一次 `inputHashes` 与第 1 步比对，不等即门 A 红。
+5. 再算一次 `inputHashes` 与第 1 步比对，不等即门 A 红；并把 **snapshot ⟷ 磁盘逐字节比对**
+   （`gateA.snapshotDrift`），偏离即门 A 红 —— 此时测量结果本身仍可信（观察对象是快照），
+   但磁盘上的 demo 已不是被观察的那一份，PR 会带走另一个版本，必须报出来。
 
 **pr-block 侧同理**：门 E 的可信重跑必须排在可信 verify **之前** —— verify 末段会执行 demo
 代码，排在其后的那次真实渲染观察正好落在攻击窗口里。
@@ -343,7 +373,8 @@ r7 起的次序（**禁止调换，由 `comp-fix-r7` 源码契约测试锁死**�
 **第 5 步是纵深，不是主防线**：攻击可以在父进程退出后才恢复原文件，让前后两次 hash 都自洽；
 真正挡住它的是「核心观察全部早于执行 demo 代码」。
 
-**残余风险（如实标注）**：demo 侧代码在第 4 步之后仍能改磁盘（只是核心观察已完成）。**没有**把
+**残余风险（如实标注）**：demo 侧代码在第 4 步之后仍能改磁盘（只是核心观察已完成，且偏离会被
+第 5 步报出来）。**没有**把
 extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本都不合适，且 Node `vm` 不是安全
 边界，不拿它假装隔离。因此：**任何在第 4 步之后新增的观察性检查都会重新打开这个窗口**，
 新增检查必须放在分界线之前（源码契约测试会拦）。
@@ -354,7 +385,7 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 
 | 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
 |---|---|---|---|
-| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-bundle`（bundle 字节）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对，**但排在所有浏览器门之后**（r7 条目 1）；执行完 demo 代码再复算一次 `inputHashes` 作纵深 | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并 |
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`；门 A 内部再叠三层字节复算：`--check-inputs`（esbuild 输入图）、`--check-outputs`（**bundle + 所有 file-loader 派生资产**的路径→字节，r7 条目 3）、`--check-css`（CSS 字节，r6 新增）。extractor 由 verify 现跑 `extract.mjs` 比对，**但排在所有浏览器门之后**（r7 条目 1）；执行完 demo 代码再复算一次 `inputHashes` 作纵深 | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并 |
 | B 状态覆盖 | ✅ 进（`passed/total`） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | 哨兵结论同门 |
 | C 交互鲁棒 | ✅ 进（checks 列表） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
 | D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | pr-block 重跑 canonical `verify.mjs`（真浏览器） | |
@@ -372,9 +403,9 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 
 | 产物 | 生成者 | 判定 | 依据 |
 |---|---|---|---|
-| `assets/component.bundle.js` | esbuild（build.mjs） | **需可信侧复算** ✅ 已做（r5） | `--check-bundle` 字节全等 |
+| `assets/component.bundle.js` | esbuild（build.mjs） | **需可信侧复算** ✅ 已做（r5） | `--check-outputs` 字节全等（r7 起与派生资产同一张映射） |
 | `assets/component.css` | tailwindcss CLI（build.mjs） | **需可信侧复算** ✅ r6 补上 | `--check-css` 字节全等；未配 tailwind 时对 `CSS_PLACEHOLDER` 字节复算 |
-| `assets/` 下 esbuild 派生资产（图片/字体 `[name]-[hash]`） | esbuild file loader | **需可信侧复算**（间接达成） | 它们是 bundle 输入图的产物：文件名含内容 hash 且被 bundle 引用，bundle 字节复算 + `inputHashes.assets` 逐文件 sha256 双向锁死；换图不重跑 = report hash 不符 |
+| `assets/` 下 esbuild 派生资产（图片/字体 `[name]-[hash]`） | esbuild file loader | **需可信侧复算** ✅ r7 条目 3 补上（此前判「间接达成」是**错的**） | `--check-outputs` 逐产物路径+字节全等。r6 之前的理由「文件名含内容 hash 且被 bundle 引用」不成立：`[hash]` 是 esbuild 的内容指纹不是校验和，**同名换字节** JS 侧毫无变化，`inputHashes.assets` 又是对攻击后字节现算的 → 全链绿（审核人实测，我已复现） |
 | `component.inputs.json` | build.mjs（esbuild metafile） | **需可信侧复算** ✅ 已做（r3） | `--check-inputs` 全等比对；清单自身也进 hash |
 | `truth.json` | demo `extract.mjs` | **需可信侧复算** ✅ 已做 | 门 A 现跑 `extract.mjs`，结果必须 ≡ `truth.json`（extractor drift）；且每个叶子带 provenance |
 | `index.html`（init 生成的组件壳 / adapter / chrome 模板产物） | `init.mjs` 模板 | **hash 输入已足够** | 进 `inputHashes['index.html']`；内嵌 `qa-truth` 块必须 ≡ `truth.json`（门 A）；渲染结论由门 B/C/D 在真浏览器里实测，不靠模板可信 |

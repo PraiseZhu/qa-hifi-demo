@@ -31,23 +31,32 @@
 //   ④ **之后**才执行 demo 侧代码:门 A 的 extractor drift 段 + 门 X 自定义门;
 //   ⑤ 再算一次 inputHashes,与 ① 比对,不等即门 A 红(纵深防御,不是主防线 ——
 //      攻击可以恢复原文件让前后 hash 都自洽,主防线是 ③ 早于 ④)。
+//
+// r7 条目 4 追加(不变式 I-OBSERVE):③ 的浏览器观察**不从 demo 原地加载**,而是从验证开始时
+// 复制出去的**不可变 snapshot**(demo 之外的临时目录)提供文件。只靠时序还有一个缺口:
+// demo 侧代码不止 extract.mjs / 自定义门 —— 页面自身的脚本、以及上一轮遗留的 detached
+// 进程,都可能在浏览器观察窗口内换掉 index.html / assets。快照在「demo node_modules
+// fail-fast 之后、执行任何 demo 代码之前」建立,观察对象从此固定;快照路径不在 demo 内,
+// demo 侧代码既不知道也碰不到。分界线之后再拿快照与磁盘逐字节比对(⑤)。
 // 门 E(像素)的可信重跑在 pr-block 里,必须排在可信 verify **之前**(同一理由)。
 // 残余风险(诚实标注):demo 代码在 ④ 之后仍能改磁盘,只是核心观察已完成;没有把
 // extractor/custom gate 放进 OS 级 sandbox(Node vm 不是安全边界,不拿它假装隔离)。
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   buildInputHashes,
   checkDemoNoNodeModules,
   failJson,
   failProblems,
   readComponentInputsManifest,
-  recheckComponentBundle,
+  recheckComponentOutputs,
   recheckComponentCss,
   recheckComponentInputs,
+  hashFile,
   sameInputHashes,
   sha256Buffer,
   stableJson,
@@ -171,14 +180,20 @@ else {
       gateAHardFail = true;
       gateA.detail = [gateA.detail, ...recheck.problems].filter(Boolean).join('\n');
     }
-    // r5 #1c 第一层:bundle 字节必须等于可信侧 write:false 复算结果
-    // (堵手改 bundle,也堵「预占同形假封印 + 让真 bundle 初始化失败」——
-    //  伪造方拿不出一份字节全等的真 bundle)。
-    const bundleCheck = recheckComponentBundle(demoDir, spec.component);
-    gateA.bundleRecheck = bundleCheck.status;
-    if (bundleCheck.problems.length) {
+    /* r5 #1c 第一层 → r7 条目 3 升级(不变式 I-ESBUILD):
+       esbuild **全部产物**(JS bundle + file loader 派生的图片/字体/…)的「路径→字节」映射
+       必须等于可信侧 write:false 现算映射。
+       堵手改 bundle、堵「预占同形假封印 + 让真 bundle 初始化失败」(伪造方拿不出一份字节
+       全等的真 bundle),也堵 r7 条目 3 那条 P0:**派生资产原地换字节但保留 [hash] 文件名**
+       —— 只复算 JS 时它字节全等、assets hash 又是对攻击后字节现算的,全链绿。 */
+    const outputsCheck = recheckComponentOutputs(demoDir, spec.component);
+    gateA.bundleRecheck = outputsCheck.status;          // 字段名保持兼容(旧 report 可读)
+    gateA.outputsRecheck = { status: outputsCheck.status, checked: outputsCheck.checked ?? null };
+    // 额外资产只如实列出、不阻断(作者可能手工放图);列出来才有人能核对
+    if (outputsCheck.extraAssets?.length) gateA.outputsRecheck.extraAssets = outputsCheck.extraAssets;
+    if (outputsCheck.problems.length) {
       gateAHardFail = true;
-      gateA.detail = [gateA.detail, ...bundleCheck.problems].filter(Boolean).join('\n');
+      gateA.detail = [gateA.detail, ...outputsCheck.problems].filter(Boolean).join('\n');
     }
     /* r6 条目 1:CSS 字节必须等于可信侧重编结果(与 bundle 同型)。
        原先 assets/component.css 全仓没有任何字节复算 —— 合法构建后手改它,
@@ -194,6 +209,48 @@ else {
 }
 
 const needBrowser = runGate('B') || runGate('C') || runGate('D') || runGate('F');
+
+/* ── 不可变 snapshot(r7 条目 4,不变式 I-OBSERVE) ──
+   把 demo 的验证输入整树复制到 demo 之外的临时目录,浏览器一律从这里加载。
+   整树复制(而不是挑几个文件)是为了保住 index.html 里的相对路径依赖;排除的只有
+   「生成物 / 报告 / 取证目录」—— 它们不参与渲染,复制它们只会让快照变大并把
+   本轮自己写的截图也算进比对。node_modules 已在前置门无条件拒过,不可能存在。
+   失败即 fail-closed:拿不到不可变观察对象就不许继续(不静默退回原地加载)。 */
+const SNAPSHOT_EXCLUDE = new Set([
+  'report.json', 'report-pixel.json', 'report-assets.json',
+  'verify-artifacts', 'pixel-artifacts', 'node_modules', '.git',
+]);
+let snapshotDir = null;
+function makeObservationSnapshot() {
+  const dir = mkdtempSync(join(tmpdir(), 'qa-hifi-snapshot-'));
+  cpSync(demoDir, dir, {
+    recursive: true,
+    dereference: true,
+    filter: (src) => {
+      if (resolve(src) === resolve(demoDir)) return true;
+      const rel = resolve(src).slice(resolve(demoDir).length + 1).split(/[\\/]/);
+      return !rel.some((seg) => SNAPSHOT_EXCLUDE.has(seg));
+    },
+  });
+  return dir;
+}
+/** 快照 ⟷ 磁盘的逐字节比对(分界线之后跑):不等 = 观察对象在验收期间被换过。 */
+function snapshotDrift() {
+  const drift = [];
+  const walk = (rel) => {
+    const snapAbs = rel ? join(snapshotDir, rel) : snapshotDir;
+    for (const name of readdirSync(snapAbs)) {
+      const childRel = rel ? `${rel}/${name}` : name;
+      const sAbs = join(snapshotDir, childRel);
+      const dAbs = join(demoDir, childRel);
+      if (statSync(sAbs).isDirectory()) { walk(childRel); continue; }
+      if (!existsSync(dAbs)) { drift.push(`${childRel}(验收期间被删除)`); continue; }
+      if (hashFile(sAbs) !== hashFile(dAbs)) drift.push(`${childRel}(字节被改写)`);
+    }
+  };
+  walk('');
+  return drift;
+}
 let safeServer;
 let browser;
 let page = null;
@@ -238,7 +295,9 @@ async function failShot(label) {
 try {
   let base = null;
   if (needBrowser) {
-    safeServer = createSafeStaticServer(demoDir);
+    snapshotDir = makeObservationSnapshot();
+    // I-OBSERVE:服务的是快照,不是 demo 原地
+    safeServer = createSafeStaticServer(snapshotDir);
     base = await safeServer.listen();
     ({ browser } = await launchChromium(demoDir, { headless: !headed }));
   }
@@ -750,6 +809,23 @@ try {
      诚实标注:攻击可以在父进程退出后才恢复原文件,从而让前后两次 hash 都自洽 ——
      所以这一条**不是**主防线,主防线是「核心观察全部排在执行 demo 代码之前」。 */
   const inputHashesPost = buildInputHashes(demoDir, spec);
+  if (!gateA.skipped && snapshotDir) {
+    /* I-OBSERVE 的收口比对:快照(观察对象)与磁盘逐字节比对。比单纯的 hash-vs-hash 更强 ——
+       快照住在 demo 之外,demo 侧代码碰不到它,所以「改了又恢复」在这里同样无处可藏的前提是
+       改动发生在快照建立之后且未复原;真正的保证仍来自「观察对象一开始就固定了」。 */
+    const drift = snapshotDrift();
+    gateA.snapshotDrift = drift.length ? drift.slice(0, 10) : 'none';
+    if (drift.length) {
+      gateA.pass = false;
+      gateA.detail = [
+        gateA.detail,
+        `验收期间 demo 侧文件与观察快照发生偏离(${drift.length} 项):${drift.slice(0, 5).join('、')}`
+        + '\n浏览器观察用的是验证开始时的不可变快照,所以本次测量结果本身仍然可信;'
+        + '但磁盘上的 demo 已不是被观察的那一份,PR 带走的会是另一个版本。'
+        + '\n修法:extract.mjs 与自定义门必须只读,不得改写 demo 输入。',
+      ].filter(Boolean).join('\n');
+    }
+  }
   if (!gateA.skipped) {
     const same = sameInputHashes(inputHashes, inputHashesPost);
     gateA.postRunHashRecheck = same ? 'ok' : 'mismatch';
@@ -798,4 +874,6 @@ try {
   try { if (page) await page.close(); } catch {}
   try { if (browser) await browser.close(); } catch {}
   try { if (safeServer) await safeServer.close(); } catch {}
+  // 快照是临时观察对象,跑完即删(留着只会在 tmp 里堆垃圾)
+  try { if (snapshotDir) rmSync(snapshotDir, { recursive: true, force: true }); } catch {}
 }
