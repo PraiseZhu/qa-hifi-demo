@@ -94,7 +94,7 @@ export function resolveModule(name, startDir = process.cwd()) {
   throw e;
 }
 
-export async function loadChromium(startDir = process.cwd()) {
+export async function loadPlaywrightApi(startDir = process.cwd()) {
   let modPath;
   let mod;
   try {
@@ -105,6 +105,11 @@ export async function loadChromium(startDir = process.cwd()) {
     mod = await import(modPath);
   }
   const api = mod.chromium ? mod : (mod.default ?? mod);
+  return { api, modulePath: modPath };
+}
+
+export async function loadChromium(startDir = process.cwd()) {
+  const { api, modulePath: modPath } = await loadPlaywrightApi(startDir);
   const chromium = api.chromium;
   if (!chromium) throw new Error(`模块 ${modPath} 未导出 chromium`);
   let executablePath = null;

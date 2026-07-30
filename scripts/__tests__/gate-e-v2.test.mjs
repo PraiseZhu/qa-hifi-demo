@@ -205,3 +205,136 @@ test('mask 护栏(面积上限/未遮罩下限)在 odiff 路径同样先于引�
   assert.equal(res.status, 'ERROR');
   assert.match(res.detail, /mask 面积|超上限/);
 });
+
+// ============ ② 分端基准(platform) ============
+
+test('manifest 覆盖分端子目录:平铺 + <platform>/<key>.png 混合,declared 同构', async () => {
+  const { PNG } = await pngApi();
+  const dir = tmpDemo('manifest');
+  const png = PNG.sync.write(solidPng(PNG, 4, 4, [255, 0, 0]));
+  mkdirSync(join(dir, 'baselines/web'), { recursive: true });
+  mkdirSync(join(dir, 'baselines/ios'), { recursive: true });
+  writeFileSync(join(dir, 'baselines/legacy.png'), png);
+  writeFileSync(join(dir, 'baselines/web/login.png'), png);
+  writeFileSync(join(dir, 'baselines/ios/login.png'), png);
+  const spec = {
+    baselines: [
+      { key: 'legacy' },
+      { key: 'login', platform: 'web' },
+      { key: 'login', platform: 'ios' },
+    ],
+  };
+  const m = buildBaselineManifest(dir, spec);
+  assert.deepEqual(m.declared.sort(), ['ios/login', 'legacy', 'web/login']);
+  assert.deepEqual(m.files.map((f) => f.key).sort(), ['ios/login', 'legacy', 'web/login']);
+  assert.ok(m.files.every((f) => /^[0-9a-f]{64}$/.test(f.sha256)));
+});
+
+test('schema: 非法 platform 拒绝;同一 key 跨 platform 允许、同端重复拒绝', () => {
+  const bad = writePixelDemo({ name: 'bad-platform', baselines: [{ key: 'one', platform: 'webos' }] });
+  const r1 = run(STATES, ['--demo', bad]);
+  assert.equal(r1.status, 2);
+  assert.match(r1.stdout, /platform 必须是/);
+
+  const dup = writePixelDemo({
+    name: 'dup-platform',
+    baselines: [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'ios' }],
+  });
+  const r2 = run(STATES, ['--demo', dup]);
+  assert.equal(r2.status, 2);
+  assert.match(r2.stdout, /platform\+key 组合重复/);
+
+  const crossOk = writePixelDemo({
+    name: 'cross-ok',
+    baselines: [{ key: 'one', platform: 'ios' }, { key: 'one', platform: 'android' }, { key: 'one' }],
+  });
+  const r3 = run(STATES, ['--demo', crossOk]);
+  assert.equal(r3.status, 0, r3.stdout + r3.stderr);
+});
+
+test('分端目录解析:platform=web 命中 baselines/web/;旧式无 platform 命中平铺;声明了端却没图=MISSING', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright)');
+  const { PNG } = await pngApi();
+  // 16x16 CSS 帧 × dpr2 = 32x32 纯红基准(与 fixture HTML 渲染一致)
+  const framePng = PNG.sync.write(solidPng(PNG, 32, 32, [255, 0, 0]));
+  const env = { QA_HIFI_MODULE_ROOT: MODULE_ROOT };
+
+  // ① 分端:platform=web,图在 baselines/web/one.png → PASS 且走 odiff
+  const d1 = writePixelDemo({ name: 'plat-web', baselines: [{ key: 'one', platform: 'web', frameSel: '#frame' }] });
+  mkdirSync(join(d1, 'baselines/web'), { recursive: true });
+  writeFileSync(join(d1, 'baselines/web/one.png'), framePng);
+  const r1 = run(PIXEL, ['--demo', d1], { env, timeout: 90000 });
+  assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+  const rep1 = JSON.parse(readFileSync(join(d1, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep1.results[0].status, 'PASS');
+  assert.equal(rep1.results[0].platform, 'web');
+  assert.equal(rep1.results[0].engine, 'odiff');
+  assert.equal(rep1.results[0].bad, 0);
+
+  // ② 旧式兼容:无 platform,图在平铺 baselines/one.png → PASS(行为与旧版一致)
+  const d2 = writePixelDemo({ name: 'plat-legacy', baselines: [{ key: 'one', frameSel: '#frame' }] });
+  mkdirSync(join(d2, 'baselines'), { recursive: true });
+  writeFileSync(join(d2, 'baselines/one.png'), framePng);
+  const r2 = run(PIXEL, ['--demo', d2], { env, timeout: 90000 });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  const rep2 = JSON.parse(readFileSync(join(d2, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep2.results[0].status, 'PASS');
+  assert.equal(rep2.results[0].platform, undefined);
+
+  // ③ 声明 platform=ios 但图只在平铺位置 → 必须 MISSING(分端不 fallback 到平铺,防张冠李戴)
+  const d3 = writePixelDemo({ name: 'plat-missing', baselines: [{ key: 'one', platform: 'ios', frameSel: '#frame' }] });
+  mkdirSync(join(d3, 'baselines'), { recursive: true });
+  writeFileSync(join(d3, 'baselines/one.png'), framePng);
+  const r3 = run(PIXEL, ['--demo', d3], { env, timeout: 90000 });
+  assert.equal(r3.status, 2);
+  const rep3 = JSON.parse(readFileSync(join(d3, 'report-pixel.json'), 'utf8'));
+  assert.equal(rep3.results[0].status, 'MISSING');
+  assert.match(rep3.results[0].detail, /baselines\/ios\/one\.png/);
+});
+
+// ============ ③ Electron 真壳采集 ============
+
+function writeMinimalElectronApp() {
+  const dir = tmpDemo('electron-app');
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'qa-hifi-min-app', version: '0.0.0', main: 'main.js' }));
+  // 20 行最小 app:强制 DPR2(截图尺寸可断言),加载带 .frame 的极简页
+  writeFileSync(join(dir, 'main.js'), `const { app, BrowserWindow } = require('electron');
+app.commandLine.appendSwitch('force-device-scale-factor', '2');
+app.whenReady().then(() => {
+  const win = new BrowserWindow({
+    width: 320, height: 240,
+    webPreferences: { backgroundThrottling: false },
+  });
+  const html = '<!doctype html><html><head><style>body{margin:0}.frame{width:16px;height:16px;background:#f00}</style></head><body><div class="frame"></div></body></html>';
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+});
+app.on('window-all-closed', () => app.quit());
+`);
+  return dir;
+}
+
+test('--electron-app 最小 Electron app 截图成功并落分端目录', async (t) => {
+  if (!MODULE_ROOT) return t.skip('QA_HIFI_MODULE_ROOT 未设置,跳过集成(需 playwright + electron)');
+  const { PNG } = await pngApi();
+  const appDir = writeMinimalElectronApp();
+  const demo = writePixelDemo({
+    name: 'electron-cap',
+    baselines: [{ key: 'electron-one', platform: 'electron-mac', frameSel: '.frame' }],
+  });
+  const res = run(
+    CAPTURE,
+    ['--demo', demo, '--key', 'electron-one', '--electron-app', appDir],
+    { env: { QA_HIFI_MODULE_ROOT: MODULE_ROOT }, timeout: 120000 },
+  );
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.mode, 'electron-capture');
+  assert.equal(out.out, 'baselines/electron-mac/electron-one.png');
+  const outFile = join(demo, 'baselines/electron-mac/electron-one.png');
+  assert.ok(existsSync(outFile), `基准未落盘:${outFile}`);
+  const { readPng } = await import('../lib/png-compare.mjs');
+  const png = readPng(PNG, outFile);
+  // .frame = 16x16 CSS × force-device-scale-factor 2 = 32x32(容差 2×dpr)
+  assert.ok(Math.abs(png.width - 32) <= 4 && Math.abs(png.height - 32) <= 4, `截图尺寸异常:${png.width}x${png.height}`);
+});

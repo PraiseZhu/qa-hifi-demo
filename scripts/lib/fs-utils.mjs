@@ -66,15 +66,29 @@ export function findPackageRoot(startDir) {
 
 export function buildBaselineManifest(demoDir, spec = null) {
   const dir = join(demoDir, 'baselines');
-  const declared = Array.isArray(spec?.baselines) ? spec.baselines.map((b) => b.key) : [];
-  const files = existsSync(dir)
-    ? readdirSync(dir).filter((name) => name.endsWith('.png')).sort()
+  // declared 与 files 同构:分端基准(gate-e-v2)统一写成 <platform>/<key>,旧式平铺仍是 <key>
+  const declared = Array.isArray(spec?.baselines)
+    ? spec.baselines.map((b) => (b?.platform ? `${b.platform}/${b.key}` : b?.key))
     : [];
-  const records = files.map((name) => ({
-    key: name.replace(/\.png$/, ''),
-    file: `baselines/${name}`,
-    sha256: hashFile(join(dir, name)),
-    size: statSync(join(dir, name)).size,
+  const found = [];
+  if (existsSync(dir)) {
+    // 平铺 baselines/<key>.png 与分端 baselines/<platform>/<key>.png 混合扫描,仅下钻一层
+    for (const name of readdirSync(dir).sort()) {
+      const abs = join(dir, name);
+      if (statSync(abs).isFile() && name.endsWith('.png')) found.push({ rel: name, abs });
+      else if (statSync(abs).isDirectory()) {
+        for (const sub of readdirSync(abs).sort()) {
+          const subAbs = join(abs, sub);
+          if (statSync(subAbs).isFile() && sub.endsWith('.png')) found.push({ rel: `${name}/${sub}`, abs: subAbs });
+        }
+      }
+    }
+  }
+  const records = found.map(({ rel, abs }) => ({
+    key: rel.replace(/\.png$/, ''),
+    file: `baselines/${rel}`,
+    sha256: hashFile(abs),
+    size: statSync(abs).size,
   }));
   return { declared, files: records };
 }
