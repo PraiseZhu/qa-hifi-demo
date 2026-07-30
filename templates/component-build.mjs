@@ -23,7 +23,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ComponentBuildError, computeComponentBuild } from './component-build-core.mjs';
+import { ComponentBuildError, computeComponentBuild, CSS_PLACEHOLDER, DEFAULT_TAILWIND_INPUT } from './component-build-core.mjs';
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const CHECK_ONLY = process.argv.includes('--check-inputs');
@@ -56,7 +56,7 @@ writeFileSync(join(demoDir, 'component.inputs.json'), `${JSON.stringify(manifest
 let cssBytes = 0;
 if (comp.css?.tailwindConfig) {
   const inputCss = join(assetsDir, '.tailwind-input.css');
-  writeFileSync(inputCss, comp.css.input ?? '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n');
+  writeFileSync(inputCss, comp.css.input ?? DEFAULT_TAILWIND_INPUT);
   const bin = join(repoRoot, 'node_modules', '.bin', 'tailwindcss');
   if (!existsSync(bin)) fail(`component.css.tailwindConfig 已配置,但产品仓没有 tailwindcss CLI:${bin}`);
   // --content 始终显式传(r4 追加 #2c-b):不传时 Tailwind 按 config.content 隐式扫描,
@@ -69,7 +69,9 @@ if (comp.css?.tailwindConfig) {
   rmSync(inputCss, { force: true });
   cssBytes = readFileSync(cssOut).length;
 } else {
-  writeFileSync(cssOut, '/* 组件模式:spec.component.css 未配置,无编译产物(占位,保证 index.html <link> 不 404) */\n');
+  // 占位字节由构建核心导出(CSS_PLACEHOLDER):可信侧 --check-css 对它做字节复算,
+  // 两侧必须是同一个常量,不许在这里写字面量(写死就会漂移 → 误杀)。
+  writeFileSync(cssOut, CSS_PLACEHOLDER);
   cssBytes = readFileSync(cssOut).length;
 }
 

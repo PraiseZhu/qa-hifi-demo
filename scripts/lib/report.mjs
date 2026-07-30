@@ -68,6 +68,15 @@ export function validateReportIntegrity(demoDir, spec, report) {
   return problems;
 }
 
+/**
+ * 读 demo 里的 report-pixel.json 并校验(**仅用于对账**,不是放行依据)。
+ *
+ * r6 条目 2:本函数从头到尾只做 report-pixel.json 自身的字段算术自洽(diffRatio===bad/total、
+ * threshold===spec 声明值、bad<=total、engine 枚举…),**从不重新对真实图片跑 odiff/pixelmatch**。
+ * 手写一份满足全部约束的 JSON(inputHashes 用可导出的 buildInputHashes 现算)就能把视觉回归
+ * 伪造成 PASS。所以放行依据改由 pr-block 亲自 spawn pixel-compare 重跑得到,本函数只负责
+ * 「作者那份自报是否自洽 / 是否与可信结果一致」。
+ */
 export function validatePixelForPr(demoDir, spec = null) {
   const pixelPath = join(demoDir, 'report-pixel.json');
   const declaredBaselines = Array.isArray(spec?.baselines) ? spec.baselines.length : 0;
@@ -77,13 +86,22 @@ export function validatePixelForPr(demoDir, spec = null) {
       return { present: false, problems: [`spec 声明了 ${declaredBaselines} 个 baseline,但缺 report-pixel.json——门 E 未运行,不得附贴 PR(先跑 pixel-compare)`], report: null };
     return { present: false, problems: [], report: null };
   }
-  const problems = [];
   let report;
   try {
     report = JSON.parse(readFileSync(pixelPath, 'utf8'));
   } catch (err) {
     return { present: true, problems: [`pixel report 不是合法 JSON:${err.message}`], report: null };
   }
+  return validatePixelReport(demoDir, spec, report);
+}
+
+/**
+ * 对一份**已在内存里**的门 E 报告做完整校验。pr-block 用它校验**自己重跑**产出的
+ * 可信报告(放行依据),validatePixelForPr 用它校验 demo 自报(对账材料)。
+ */
+export function validatePixelReport(demoDir, spec, report) {
+  const declaredBaselines = Array.isArray(spec?.baselines) ? spec.baselines.length : 0;
+  const problems = [];
   if (!isPlainObject(report)) return { present: true, problems: ['pixel report 必须是 object'], report: null };
   if (report.toolVersion !== TOOL_VERSION) problems.push('pixel report toolVersion 缺失或不匹配');
   if (!report.inputHashes) problems.push('pixel report 缺 inputHashes');

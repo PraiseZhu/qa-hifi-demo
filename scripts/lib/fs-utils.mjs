@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEMO_BUILD_FILES } from './component-build-core.mjs';
-import { expandRepoGlob } from './repo-glob.mjs';
+import { expandRepoGlob, findDemoNodeModules } from './repo-glob.mjs';
 
 export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r6';
 
@@ -166,35 +166,11 @@ const CANONICAL_BUILD_FILES = {
  * demo 里的构建期文件必须逐字节等于 skill canonical——不等就是自定义构建器。
  * 返回 problems(空 = 全等)。
  */
-/**
- * demo 目录(含任意子目录)里出现的 node_modules —— 返回相对路径列表(空 = 干净)。
- * 只找目录名,不下钻进 node_modules 内部(命中即停,别把整棵依赖树走一遍)。
- */
-/* r5(#2c-a):去掉 depth>8 的静默停止 —— 声明是「任意子目录出现 node_modules 即拒」,
-   而 8 层上限让 demo/d0/../d8/node_modules 直接逃过检查,声明与实现不符。
-   现在完整遍历(普通 symlink 不跟随、命中 node_modules 即停、跳过 .git),
-   limit 只截断**报文里列举的条数**,不影响「是否命中」的判定。 */
-function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
-  const hits = [];
-  const walk = (dir, rel) => {
-    if (hits.length >= limit) return;
-    let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (!e.isDirectory() || e.isSymbolicLink()) {
-        // symlink 到依赖目录同样能被 module resolution 命中,一并算
-        if (e.isSymbolicLink() && e.name === 'node_modules') hits.push(rel ? `${rel}/${e.name}` : e.name);
-        continue;
-      }
-      const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if (e.name === 'node_modules') { hits.push(childRel); continue; }
-      if (e.name === '.git') continue;
-      walk(join(dir, e.name), childRel);
-    }
-  };
-  walk(demoDir, '');
-  return hits;
-}
+/* demo 目录里出现的 node_modules 探测:实现在 lib/repo-glob.mjs(r6 起唯一一份)。
+   搬家原因见那边注释 —— 构建核心也要在「执行产品 tailwind config」之前跑这道门,
+   而它不能反向 import 整个 fs-utils。这里只保留语义说明,行为完全一致:
+   完整遍历(普通 symlink 不跟随、命中 node_modules 即停、跳过 .git),limit 只截断
+   报文里列举的条数,不影响「是否命中」的判定(r5 #2c-a 去掉过 depth>8 的静默停止)。 */
 
 /* ── fail-closed:demo 自身不装依赖(r5 P0-2 把它前移成无条件 fail-fast) ──
    构建期文件的具名 hash 表只钉死 4 个文件,node_modules 既不入哈希链也不在表里。
@@ -346,6 +322,57 @@ export function recheckComponentBundle(demoDir, component) {
       `${rel} 的 bundle 字节与可信侧复算结果不一致——产物不是当前 spec/源码用 canonical 构建规范生成的。`
       + `\n  磁盘 sha256:${actual}\n  可信侧复算:${fresh?.sha256 ?? '(无)'}`
       + '\n可能原因:手改过 bundle(塞手写 UI / 摘哨兵)、改完源码没重跑 build、或用了别的构建器。'
+      + '\n修法:node build.mjs 重新产出,再重跑 verify。',
+    ],
+  };
+}
+
+/**
+ * 可信侧复算 **CSS 产物字节**(r6 条目 1 CRITICAL)——与 recheckComponentBundle 完全同型。
+ *
+ * 堵的洞:全仓原先**没有任何 CSS 字节复算**。buildComponentHashes / buildAssetsManifest
+ * 只把 assets/component.css 的字节记进清单(用于「report 是否过期」),从不独立重编译比对。
+ * 于是合法构建产出 component.css 之后手改它(改样式/删规则/插任意 CSS),只要不动哈希链
+ * 已记录的输入文件,verify / pr-block 全流程零检测通过。
+ *
+ * 这一条同时兜住条目 3/4/5(content glob 语义差异、node_modules 非对称扫描、tailwind
+ * config 的 presets/plugins 依赖未入链):不管入链清单算得准不准,只要有人改了 Tailwind
+ * **实扫**到的任何文件而不重建,可信侧现编的字节就不等于磁盘字节 → 门 A 红。
+ *
+ * 返回 { status: 'ok'|'mismatch'|'error', problems }。
+ */
+export function recheckComponentCss(demoDir, component) {
+  const rel = `${component?.assetsDir ?? 'assets'}/component.css`;
+  const abs = join(demoDir, rel);
+  let fresh;
+  try {
+    const out = execFileSync(process.execPath, [CANONICAL_BUILD_FILES['component-build-core.mjs'], '--check-css', '--demo', demoDir], {
+      cwd: demoDir,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    fresh = JSON.parse(out);
+  } catch (err) {
+    return {
+      status: 'error',
+      problems: [`可信侧复算 CSS 字节失败(skill 侧 component-build-core --check-css):${String(err.stdout || err.stderr || err.message).slice(0, 600)}`],
+    };
+  }
+  if (!existsSync(abs)) {
+    // 未配 tailwind 且从未跑过 build 的老 demo:index.html 的 <link> 会 404,但那不是本门的事;
+    // 只要 spec 配了 css,缺产物就是硬错(它是验收结论的一部分)。
+    if (fresh?.mode === 'placeholder') return { status: 'n/a', problems: [] };
+    return { status: 'error', problems: [`${rel} 不存在,但 spec.component.css 已配置——先跑 node build.mjs`] };
+  }
+  const actual = hashFile(abs);
+  if (fresh?.sha256 === actual) return { status: 'ok', problems: [] };
+  return {
+    status: 'mismatch',
+    problems: [
+      `${rel} 的 CSS 字节与可信侧复算结果不一致——产物不是当前 spec/样式源文件用产品 tailwind config 生成的。`
+      + `\n  磁盘 sha256:${actual}\n  可信侧复算:${fresh?.sha256 ?? '(无)'}(mode=${fresh?.mode ?? '?'})`
+      + '\n可能原因:手改过 assets/component.css、改完样式源文件没重跑 build、'
+      + '或改了 tailwind config 依赖的 preset/plugin(这些不在入链清单里,但会改 CSS 字节)。'
       + '\n修法:node build.mjs 重新产出,再重跑 verify。',
     ],
   };
