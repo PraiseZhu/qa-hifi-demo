@@ -344,6 +344,21 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
   /** tailwind content:声明了就必须能展开成实际文件并逐一入链(审核 #2c-b)。 */
   function tailwindContentFiles() {
     const list = Array.isArray(comp.css?.content) ? comp.css.content : [];
+    /* ── css 非 null 时 content 必填(审核 r4 追加 #2c-b,方案 A) ──
+       r3 允许 `css: { tailwindConfig }` 不带 content:那时 build 不传 --content,
+       Tailwind 按 **config.content** 隐式扫描,而清单只记 tailwind.config.js 本身,
+       config.content 命中的样式源文件全不入链 —— 改它们 hash 不变、旧 CSS 照过门。
+       现在:配了 css 就必须显式声明 content(非空),build 也始终用 --content 覆盖 config,
+       隐式扫描这条路彻底关掉。 */
+    if (comp.css && (!Array.isArray(comp.css.content) || comp.css.content.length === 0))
+      fail(
+        'component.css 已配置但 component.css.content 缺失/为空——组件模式要求**显式**声明 tailwind content。'
+        + '\n原因:不显式声明时 Tailwind 会按 tailwind.config.js 里的 content 隐式扫描,而那些被扫到的'
+        + '样式源文件不会进 component.inputs.json 防伪链;改样式源文件 hash 不变,旧 CSS + 旧 report 照过验收。'
+        + '\n修法:把 config 里 content 的等价 glob 抄进 component.css.content(仓内相对,只支持 * / ** / ?);'
+        + '真不需要 tailwind 就把 component.css 设为 null。',
+        2,
+      );
     const out = new Set();
     for (const pattern of list) {
       if (typeof pattern !== 'string' || !pattern.trim())

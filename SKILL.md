@@ -67,7 +67,16 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 只证明 `entry` 在 `metafile` 输入里是不够的：`import '<entry>'` 这种副作用导入同样让它进图、
 hash 入链，而界面完全可以是 bootstrap 手搓的。构建期给 `entry` 的导出套调用探针，真被调用/
 实例化（React 调函数组件、`new` 类组件、`memo`/`forwardRef` 的 `render`）时置位；verify 在
-门 B 挂载完成后、第一个状态断言前查一次。判定分三种（`manifest.entrySentinel`）：
+门 B 挂载完成后、第一个状态断言前查一次。
+
+**哨兵证据是封印的，demo 侧写不了（r4）**：置位与计数留在 bundle 的模块闭包里，对外只暴露一个
+`writable:false` / `configurable:false` 的全局 `__QA_ENTRY_SENTINEL__`，其上只有 get-only 的
+`snapshot` 访问器；verify 先校验这三项封印形态（不可写 / 只读访问器 / 对象已冻结）再读值，形态
+不对即按造假处理。r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_RENDERED__`
+上，而 bootstrap 是允许作者编辑的输入——「只持引用不调用 + 直接把布尔量写 true + 手搓 UI」
+当时能拿到 `proved`。现在 demo 侧对旧字段的任何赋值都不再有作用。
+
+判定分三种（`manifest.entrySentinel`）：
 
 | 形态 | 触发条件 | 结论 |
 |---|---|---|
@@ -93,9 +102,13 @@ import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bun
 `export?`（目标组件导出名，默认导出写 `"default"`；**拿到「真组件直渲」结论的唯一途径**，
 不填只会降级、填错直接 exit 2）/
 `sources[]`（可选的人读声明；代码层防伪链的真相源是 build 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
-`shims[{spec,file,why}]` / `css`（`css.content` 的每个 glob 必须是仓内相对的标准 glob——只支持
-`*` / `**` / `?`；`{a,b}`、`!` 否定、绝对路径、`require()`/对象形式一律拒；任一 glob 零命中也
-直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链） / `themeVars.truthPath` /
+`shims[{spec,file,why}]` / `css`（配了 `css` 就**必须**显式声明 `css.content` 非空数组——r4 起
+省略/空数组一律 schema + build 双重 fail-closed，因为不显式声明时 Tailwind 会按
+`tailwind.config.js` 里的 `content` **隐式扫描**，那些样式源文件不进防伪链，改了 hash 不变、
+旧 CSS + 旧 report 照过；build 现在始终用显式 `--content` 覆盖 config。每个 glob 必须是仓内
+相对的标准 glob——只支持 `*` / `**` / `?`；`{a,b}`、`!` 否定、绝对路径、`require()`/对象形式
+一律拒；任一 glob 零命中也直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链。
+不需要 tailwind 就把 `component.css` 设为 `null`） / `themeVars.truthPath` /
 `fixtures[{id,why,shape?}]` / `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
 （`"inject"` / `"via"`，单一真相源）。adapter 升级：
 `node scripts/init.mjs --dir <demo-dir> --update-adapter`（与 `--update-chrome` 同机制）。

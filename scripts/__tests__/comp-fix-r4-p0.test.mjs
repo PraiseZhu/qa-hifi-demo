@@ -210,3 +210,61 @@ test('#1c 阳性对照: 真调用目标导出 → 仍是 proved + PR 块写「�
   assert.equal(pr.status, 0, `${pr.stdout}${pr.stderr}`);
   assert.match(pr.stdout, /真组件直渲/);
 });
+
+// ==================== #2c-b tailwind content 必须显式声明 ====================
+
+test('#2c-b 复现形状(不 skip): config 有 content、spec 省略 content → schema fail-closed', () => {
+  const { spec } = makeFixture({ name: 'implicit-content', css: { tailwindConfig: 'tailwind.config.js' } });
+  const problems = validateSpec(spec);
+  assert.ok(problems.length >= 1, 'r3 的合法形状(省略 content)现在必须被拒');
+  assert.ok(
+    problems.some((p) => /component\.css\.content 必须是非空 string 数组/.test(p)),
+    `报文应点名 content 必填:${JSON.stringify(problems)}`,
+  );
+  assert.ok(problems.some((p) => /隐式扫描|防伪链/.test(p)), '报文应说明为什么必填(隐式扫描的文件不入防伪链)');
+});
+
+test('#2c-b 空数组同样 fail-closed(不 skip)', () => {
+  const { spec } = makeFixture({ name: 'empty-content', css: { tailwindConfig: 'tailwind.config.js', content: [] } });
+  assert.ok(validateSpec(spec).some((p) => /component\.css\.content 必须是非空 string 数组/.test(p)));
+});
+
+test('#2c-b 构建核心独立 fail-closed(不 skip): 省略 content 时 --check-inputs 直接 exit 2', () => {
+  // 不靠 schema 兜:构建核心自己也必须拒(--check-inputs 是复算 oracle 的入口,
+  // 它若放行,「清单只记 config、不记命中文件」的旧形状就又能算出一致 hash)。
+  const { dir } = makeFixture({ name: 'core-implicit', css: { tailwindConfig: 'tailwind.config.js' } });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  const out = `${r.stdout}${r.stderr}`;
+  assert.equal(r.status, 2, `构建核心放行了省略 content 的形状:${out}`);
+  assert.match(out, /component\.css\.content 缺失\/为空/);
+  assert.match(out, /隐式扫描/);
+});
+
+test('#2c-b verify 层也拦得住(不 skip,无需浏览器): 省略 content 的 demo 直接非零退出', () => {
+  const { dir } = makeFixture({ name: 'verify-implicit', css: { tailwindConfig: 'tailwind.config.js' } });
+  const v = run(VERIFY, ['--demo', dir], { env: env() });
+  assert.notEqual(v.status, 0, '省略 content 的 demo 居然能进 verify');
+  assert.match(`${v.stdout}${v.stderr}`, /component\.css\.content/);
+});
+
+test('#2c-b 薄壳模板始终显式传 --content(不 skip,源码契约)', () => {
+  const tpl = readFileSync(join(ROOT, 'templates/component-build.mjs'), 'utf8');
+  assert.match(tpl, /'--content', comp\.css\.content\.join\(','\)/, '模板必须无条件显式传 --content');
+  assert.ok(
+    !/if \(Array\.isArray\(comp\.css\.content\) && comp\.css\.content\.length\) args\.push\('--content'/.test(tpl),
+    '仍保留「有 content 才传」的条件分支 → Tailwind 会回退到 config.content 隐式扫描(#2c-b 未修)',
+  );
+});
+
+test('#2c-b 阳性对照(不 skip): 显式声明 content 且命中文件 → 命中文件逐一入 buildInputs.product', () => {
+  const { dir } = makeFixture({ name: 'explicit-content', css: { tailwindConfig: 'tailwind.config.js', content: ['src/StyleOnly.tsx'] } });
+  const r = run(CORE, ['--check-inputs', '--demo', dir], { cwd: dir, env: env() });
+  if (r.status !== 0) {
+    // 无宿主 esbuild 时构建核心跑不到清单阶段;此时至少确认它不是被 content 那道门拦下的
+    assert.doesNotMatch(`${r.stdout}${r.stderr}`, /component\.css\.content 缺失\/为空/, '显式声明了 content 却被误伤');
+    return;
+  }
+  const manifest = JSON.parse(r.stdout);
+  assert.ok(manifest.buildInputs.product.includes('tailwind.config.js'));
+  assert.ok(manifest.buildInputs.product.includes('src/StyleOnly.tsx'), 'content 命中的样式源文件必须入链');
+});

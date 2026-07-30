@@ -358,8 +358,14 @@ export function validateSpec(spec) {
         else {
           if (!relOk(c.css.tailwindConfig)) problems.push('component.css.tailwindConfig 必须是相对 repoRoot 的路径 string');
           if (c.css.input !== undefined && typeof c.css.input !== 'string') problems.push('component.css.input 必须是 string(tailwind 输入 CSS 内容)');
-          if (c.css.content !== undefined && (!Array.isArray(c.css.content) || c.css.content.some((g) => typeof g !== 'string')))
-            problems.push('component.css.content 必须是 string 数组(tailwind --content glob)');
+          // content 必填非空(r4 追加 #2c-b):省略时 Tailwind 会按 config.content 隐式扫描,
+          // 被扫到的样式源文件不入 component.inputs.json 防伪链 → 改样式不换 hash,旧 CSS 照过。
+          if (!Array.isArray(c.css.content) || c.css.content.length === 0 || c.css.content.some((g) => typeof g !== 'string'))
+            problems.push(
+              'component.css.content 必须是非空 string 数组(tailwind --content glob)——'
+              + '配了 component.css 就必须显式声明 content;省略会让 Tailwind 按 tailwind.config.js 的 content 隐式扫描,'
+              + '那些样式源文件不进防伪链。不需要 tailwind 请把 component.css 设为 null',
+            );
         }
       }
       // driver 段已下线:状态怎么被驱动统一写 states[].driver('inject'|'via'),
