@@ -120,6 +120,12 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
 - `verify.persistence` 必须写 `expected`、`storageKey`、`reloads>=1`；不能只让 demo 的 `__qa.prefs()` 自证。
 - `verify.inputs` 必须写非空 `text`、正数 `tickMs` 与 `tickWitness`；验收会等 witness 真实变化后再断言输入框 DOM 节点未被替换。
 - `bindings.kind` 只允许 `color` / `length` / `text` / `asset-sha`；`pseudo` 只允许 `::before` / `::after` / `::placeholder`。
+- `baselines[].mask` 只允许盖两类区域：**stub 区**（demo 用占位件替代的非产品渲染物，如 `WindowControls`
+  原生红绿灯）与**动态区**（时钟/倒计时/随机头像）。坐标 `[x, y, w, h]` 是相对截图元素（`frameSel`）左上角的
+  **CSS 像素**，不要自乘 DPR。**位置从 `truth.geometry.*` 推导**（extract.mjs 从产品常量提取的标题栏高度、
+  控件组宽高、内缩），允许 ±2px 容差；靠 diff 热图目测框出来的 mask 一律打回。面积护栏不变：
+  `maxMaskRatio`（缺省 0.25，组件模式建议按 stub 区实际面积收紧）、`minUnmaskedRatio`（缺省 0.5）；
+  零面积或越界 mask 直接报错，不静默跳过。
 - `baselines` 声明的每个 key 必须有对应基准图（声明 `platform` → `baselines/<platform>/<key>.png`，未声明 → `baselines/<key>.png`）；mask 超面积、未遮罩区域过少、WARN 无人工裁决都阻断 PR 附贴。分端条目的裁决文件按 `<platform>.<key>` 命名（`adjudications/<platform>.<key>.json`）。
 - 规范化只排序 object key；语义为集合的数组必须由 `extract.mjs` 按稳定 key 排序后输出。
 

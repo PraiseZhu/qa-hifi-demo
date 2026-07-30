@@ -146,6 +146,16 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
   mask 映射 `ignoreRegions`），odiff 不可用时回退 pixelmatch（行为不变并记录 `engineNote`）；
   `QA_HIFI_COMPARE_ENGINE=odiff|pixelmatch` 可点名（A/B 对比/排障用，点名 odiff 失败直接报错不静默降级）。
   mask 面积上限 / `minUnmaskedRatio` 护栏在本仓这层，不交给引擎。
+  **mask 声明规范（组件模式）**：只有两类区域允许 mask——① **stub 区**：demo 用占位件替代的
+  非产品渲染物（如 `WindowControls` 原生红绿灯按钮，真沙盒里由 OS/Electron 画，demo 画不出来）；
+  ② **动态区**：每次渲染必然不同的内容（时钟、倒计时、随机头像）。其余任何 diff 都是真差异，
+  必须改 demo，不许用 mask 盖住。坐标系 = `[x, y, w, h]`，相对截图元素（`frameSel`，缺省 `.frame`）
+  左上角的 **CSS 像素**（DPR 由 `baselineDpr` 统一换算，写 mask 时不要自己乘 DPR）。
+  **位置必须从 truth 几何推导，不许看 diff 热图目测框选**：stub 区的槽位（标题栏高度、控件组宽度、
+  左右内缩）由 `extract.mjs` 从产品源码常量提取进 `truth.geometry.*`，mask 矩形取那些叶子的值
+  （允许 ±2px 边缘容差）；review 时按「每条 mask 能在 truth.geometry 里指到对应叶子」核对，
+  指不到 = 目测的 = 打回。面积护栏不变（`maxMaskRatio` 缺省 0.25、`minUnmaskedRatio` 缺省 0.5，
+  组件模式建议按 stub 区实际面积把 `maxMaskRatio` 收得更紧），mask 越界/零面积仍按现有规则报错。
   **分端基准（gate-e-v2）**：`baselines[].platform` 声明 `web|electron-mac|electron-win|ios|android` 后，
   基准落 `baselines/<platform>/<key>.png`（未声明保持旧平铺）；**不同 platform 的基准永不互比**，
   各自只与 demo 渲染帧比——跨渲染引擎像素直比不可行（字体/取整/阴影算法差异），跨端一致性走
@@ -257,16 +267,21 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
 2. `verify.mjs` 门 A-F 全绿 + （有基准时）`pixel-compare` 无未裁决 WARN；
 3. **产品仓自己的门禁**：受影响包 typecheck + 定向测试 + 仓库要求的全量门禁
    （cindy 仓 = 根目录 `pnpm test:unit`，见其 AGENTS.md）；
-4. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
+4. **资产清单 + 体积闸门**：`node scripts/assets-manifest.mjs --demo <dir> [--max-total 8]`——
+   图片 / 组件 bundle 一律落 demo 的 `assets/` 独立文件、HTML 用相对路径引用（不全内联：
+   实测 hero 图内联能把单文件顶到 10MB 量级，首屏卡、GitHub 预览打不开、PR diff 不可读）。
+   assets/ 总体积超上限（缺省 8MB）exit 2。这些文件逐个 sha 进 `inputHashes.assets` 防伪链，
+   换了图不重跑 verify → report 失效；`pr-block --require-deployed` 也会逐个比对线上资产字节；
+5. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
    `node scripts/pr-block.mjs --demo <dir> --require-committed --require-deployed --url <部署地址> [--preview ...]`
    产出附贴块——`--require-deployed` 会拉取部署地址逐字节比对本地 index.html（带 cache-bust），
    没部署 / 部署的是旧版 / 地址不可达都 exit 2。**部署不是可选步骤，是定稿门的一部分。**
 
-四步全绿 → commit 已就绪，PR 提交只差用户一句授权（push/提 PR 仍按仓库规矩经用户确认）。
+五步全绿 → commit 已就绪，PR 提交只差用户一句授权（push/提 PR 仍按仓库规矩经用户确认）。
 
 **「demo 每次都被带进 PR」的三层保证**：
 - **带入**：demo 是分支上的入库文件，git 自动把它带进 PR diff——入库即带入，零机制成本；
-- **本地硬门**：第 4 步必须用 `--require-committed`——它校验 spec/extract/truth/index 四件套
+- **本地硬门**：第 5 步必须用 `--require-committed`——它校验 spec/extract/truth/index 四件套
   已被 git 跟踪 + demo 目录无未提交改动（防「忘了入库」与「入库了但 PR 带旧版」）+ 报告 hash
   与当前文件一致（防旧验收报告冒充），任一不满足 exit 2、附贴块生成不出来；
 - **远端兜底**：上游 review-pr 格式门把 UI 证据（HTML/截图）列为硬要求，PR 里没带直接被打回——
