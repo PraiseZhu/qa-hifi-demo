@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{NAME}} · qa-hifi demo(组件模式)</title>
+<!-- 组件样式:由 build.mjs 产出(spec.component.css 未配置时是占位空文件) -->
+<link rel="stylesheet" href="assets/component.css">
+<style>
+/* ===== 组件模式:界面本体样式来自产品自己的 CSS,这里不要手写界面样式 =====
+   只允许放 demo 壳自身需要的极少数修正(如 #component-root 的尺寸容器)。
+   chrome 工具区样式由 qa-chrome 注入,不要覆盖 qa-* 类。 */
+#component-root { height: 100%; }
+</style>
+</head>
+<body>
+<!-- 真值块:由 `node <skill>/scripts/truth.mjs --demo <dir> --embed` 写入,禁止手抄 -->
+<script id="qa-truth" type="application/json"></script>
+<script>
+// ===== demo 配置(组件模式;renderApp 由 adapter 提供,作者不写界面渲染) =====
+window.__qaDemo = {
+  name: '{{NAME}}',
+  pr: {{PR}},
+  summary: {
+    what: 'TODO:做了什么(≤2 行)',
+    how: 'TODO:怎么做的(≤2 行)',
+    accept: 'TODO:怎么验收(≤2 行)',
+  },
+  matrix: {
+    plat:   { label: '端',   options: [{ v: 'desktop', label: '桌面' }] },
+    region: { label: '区域', options: [{ v: 'cn', label: '中国大陆' }, { v: 'global', label: 'Global' }] },
+    os:     { label: '系统', options: [{ v: 'mac', label: 'macOS' }, { v: 'win', label: 'Windows' }] },
+    mode:   { label: '主题', options: [{ v: 'light', label: 'Light' }, { v: 'dark', label: 'Dark' }] },
+    lang:   { label: '语言', options: [{ v: 'zh-CN', label: '简中' }, { v: 'en', label: 'EN' }] },
+  },
+  defaultPrefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' },
+  initialState: 'entry',
+  states: {
+    entry: {},
+    // TODO:补齐 spec.states 声明的所有状态(两边必须一致,门 B 会验)。
+    // 只能经真实交互到达的状态(组件局部 useState)在 spec.states 里写 via 链路,
+    // driver.goto 对它返回 false,由 adapter 降级为重放——不要在这里假装可直达。
+  },
+  tabStates: [],
+  adaptive: null,
+  scale: () => 1,
+  // renderApp / inject 由下方 adapter 段注入(组件模式不手写 renderApp)。
+};
+</script>
+<script>
+/* QA_COMPONENT_ADAPTER_BEGIN — 组件模式适配层,由 init.mjs 内联;勿手改。
+   升级:node <skill>/scripts/init.mjs --dir <demo-dir> --update-adapter */
+{{QA_COMPONENT_ADAPTER}}
+/* QA_COMPONENT_ADAPTER_END */
+</script>
+<!-- 组件 bundle:build.mjs 产出(真实产品组件 + shims 装配),会调 __qaDemo.inject(driver) -->
+<script src="assets/component.bundle.js"></script>
+<script>
+/* QA_CHROME_BEGIN — 标准 chrome 运行时,由 init.mjs 内联;勿手改。
+   升级:node <skill>/scripts/init.mjs --dir <demo-dir> --update-chrome */
+{{QA_CHROME}}
+/* QA_CHROME_END */
+</script>
+</body>
+</html>
