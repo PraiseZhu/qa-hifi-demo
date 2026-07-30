@@ -204,6 +204,25 @@ export function validatePixelReport(demoDir, spec, report) {
         if (r.adjudication.artifactHashes?.[kind] !== recorded)
           problems.push(`pixel WARN ${r.key} 的人工裁决未绑定 ${kind} 图的 sha256(声明 ${r.adjudication.artifactHashes?.[kind] ?? '(缺)'} ≠ 实际 ${recorded})——裁决判的不是这三张图`);
       }
+      /* r8:除三图字节,裁决还必须声明并全等本次的 **key / diffRatio / threshold**。
+         只绑三图挡得住「换图」,挡不住「换差异」——同 key 上一次小幅 WARN 的裁决,在差异变大、
+         三图跟着重跑更新之后,旧裁决的语义(判的是 0.1% 还是 8%)此前无人核对。人工裁决的是
+         当时那个具体差异;key 带 platform 是因为基准分端存放、永不互比,mac 的裁决不能给
+         windows 的 WARN 用。校验点与 pixel-compare 采纳处保持一致(两侧都拦)。 */
+      const ck = r.platform ? `${r.platform}/${r.key}` : r.key;
+      for (const [field, actual] of [
+        ['key', ck],
+        ['diffRatio', r.diffRatio],
+        ['threshold', spec?.baselineThreshold ?? 0.005],
+      ]) {
+        const declared = r.adjudication[field];
+        if (declared === undefined || declared === null) {
+          problems.push(`pixel WARN ${ck} 的人工裁决缺 ${field}——裁决必须同时声明 key / diffRatio / threshold / artifactHashes 四项,否则旧裁决可被复用到新的差异上`);
+          continue;
+        }
+        if (declared !== actual)
+          problems.push(`pixel WARN ${ck} 的人工裁决 ${field} 与本次现算不符(裁决声明 ${declared} vs 本次现算 ${actual})——旧裁决被复用?必须针对当前差异重新裁决`);
+      }
     }
   }
   if (statuses.some((s) => ['ERROR', 'MISSING', 'FAIL'].includes(s))) problems.push('pixel report 含 ERROR/MISSING/FAIL');
