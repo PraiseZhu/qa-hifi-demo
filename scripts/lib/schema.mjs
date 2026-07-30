@@ -284,8 +284,9 @@ export function validateSpec(spec) {
     }
   }
   // component:真组件直渲模式声明(合约 v1)。entry/sources 相对产品仓根(repoRoot),
-  // bundle 是 demo 内的构建产物。声明了组件模式就必须锁源——sources 为空一律 FAIL,
-  // 否则代码层防伪链形同虚设(改产品组件而 demo 不重构建,旧 report 照样过)。
+  // bundle 是 demo 内的构建产物。代码层防伪链的真相源是 build.mjs 生成的
+  // component.inputs.json(esbuild metafile 规范化输入清单),不是这里的自报字段:
+  // entry 必须出现在真实输入里、sources(可选)必须 ⊆ 真实输入,均由 report 侧 fail-closed。
   if (spec.component !== undefined) {
     const c = spec.component;
     if (!isPlainObject(c)) problems.push('component 必须是 object');
@@ -293,9 +294,12 @@ export function validateSpec(spec) {
       if (c.mode !== 'component') problems.push(`component.mode 必须是 "component"(当前 ${JSON.stringify(c.mode)})`);
       const relOk = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.includes('\\') && !v.split('/').includes('..');
       if (!relOk(c.entry)) problems.push('component.entry 必须是相对 repoRoot 的路径 string(不含 ".."/绝对路径/反斜杠)');
-      if (!Array.isArray(c.sources) || c.sources.length === 0)
-        problems.push('component.sources 必须是非空数组——声明了组件模式就必须锁定源文件(代码层防伪链)');
-      else c.sources.forEach((s, i) => {
+      // sources 自 metafile 真相源上线后降级为**可选的人读声明**:代码层防伪链锁的是
+      // build.mjs 从 esbuild metafile 落下的 component.inputs.json(bundle 真实输入),
+      // 作者自报的窄集再也决定不了链的范围。声明了就必须 ⊆ 真实输入(report 侧校验)。
+      if (c.sources !== undefined && !Array.isArray(c.sources))
+        problems.push('component.sources 必须是数组(可选;人读声明,真相源是 component.inputs.json)');
+      else if (Array.isArray(c.sources)) c.sources.forEach((s, i) => {
         if (!relOk(s)) problems.push(`component.sources[${i}] 必须是相对 repoRoot 的路径/glob string(不含 ".."/绝对路径/反斜杠)`);
       });
       // bundle 拼进 demo 目录做 hash 与页面加载:限 demo 内相对路径,禁越狱

@@ -204,10 +204,10 @@ truth 结构(每个模式各一个标准叶子,直接过 `validateTruth`):
 "component": {
   "mode": "component",                       // 必填,固定值
   "entry": "apps/desktop/src/renderer/components/login/LoginPage.tsx",  // 相对 repoRoot
-  "sources": [                               // 必填非空:代码层防伪链锁定的源文件/glob
-    "apps/desktop/src/renderer/components/login/**/*.tsx",
-    "packages/auth-client/src/types.ts"
-  ],
+  "sources": [],                             // 可选人读声明(路径/glob)。防伪链**不**看这里:
+                                             // 真相源是 build.mjs 生成的 component.inputs.json
+                                             // (esbuild metafile → bundle 真实输入)。写了就必须
+                                             // ⊆ 真实输入,否则 fail-closed 拒绝出块
   "bundle": "assets/component.bundle.js",    // demo 内构建产物(hash 入链)
   "bootstrap": "src/bootstrap.tsx",          // demo 内装配入口(esbuild entryPoint)
   "assetsDir": "assets",
@@ -229,7 +229,14 @@ truth 结构(每个模式各一个标准叶子,直接过 `validateTruth`):
 
 - `entry` / `sources[]` / `rendererRoot` / `packageRoots` / `css.tailwindConfig` 相对 **repoRoot**;
   `bundle` / `bootstrap` / `assetsDir` / `shims[].file` 相对 **demo 目录**。一律禁 `..`、绝对路径、反斜杠;
-- `sources` 为空 = FAIL:声明了组件模式就必须锁源,否则改产品组件而 demo 不重构建,旧 report 照样过;
+- **代码层防伪链的真相源是 `component.inputs.json`**(build.mjs 从 esbuild `metafile` 规范化落盘,
+  含 `productInputs`(相对 repoRoot)/ `demoInputs`(相对 demo)/ `skippedExternal`;不含 node_modules)。
+  门 A 对 `productInputs` + `demoInputs` + 清单自身 + bundle 逐一 sha256;
+  缺清单或结构非法 = `NO_MANIFEST` fail-closed(先跑 `node build.mjs` 再重跑 verify);
+- `component.entry` 必须出现在 `productInputs` 里:bootstrap 没 import 它 → **build.mjs 直接 exit 2**
+  (「声明的入口未被 bundle」),report 侧同样兜底拒。声明真组件却手搓 UI 的路被机械堵死;
+- `sources` 是可选的人读声明,自报窄集再也决定不了链的范围(声明 14 个而 bundle 真读 42 个时,
+  改那 30 个未声明文件同样让 hash 变);声明了却未被 bundle 读到 = FAIL(误导性声明);
 - `shims[].why` / `fixtures[].why` 必填——写不出理由的替身不该存在(替身是保真度让步,必须留痕);
 - **没有 `component.driver`**:状态怎么被驱动只写 `states[].driver`(`"inject"` / `"via"`)。
   两处声明必然漂移,单一真相源在 `states[]`(2026-07-30 集成调和;旧 `component.driver` 直接报错);

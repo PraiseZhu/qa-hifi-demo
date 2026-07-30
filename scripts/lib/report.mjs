@@ -1,6 +1,13 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { buildInputHashes, isPlainObject, sameInputHashes, TOOL_VERSION } from './fs-utils.mjs';
+import {
+  buildInputHashes,
+  checkDeclaredComponentSources,
+  COMPONENT_INPUTS_FILE,
+  isPlainObject,
+  sameInputHashes,
+  TOOL_VERSION,
+} from './fs-utils.mjs';
 
 export function summarizeGate(gate) {
   if (!gate || typeof gate !== 'object') return { ok: false, reason: 'missing gate' };
@@ -24,14 +31,21 @@ export function validateReportIntegrity(demoDir, spec, report) {
   // 这条链就没锁住任何东西——改产品源码旧 report 照样过。一律阻断,并明示怎么修。
   if (spec?.component?.mode === 'component') {
     const FIX = {
-      MISSING: '源文件不存在——检查 spec.component.entry/sources 路径,或该文件已被删/改名',
+      MISSING: '文件不存在——bundle 输入清单里的文件已被删/改名,重跑 build.mjs 重生清单',
       NO_MATCH: 'glob 零命中——该 pattern 在产品仓内匹配不到任何文件,修正 spec.component.sources',
       UNRESOLVED: 'demo 所在目录不在任何 git 仓内——demo 必须位于产品 git 仓内,代码层 hash 才能锁源',
+      INVALID_PATH: '清单里的路径非法(绝对路径/含 ".."/反斜杠)——component.inputs.json 被手改过?重跑 build.mjs',
+      NO_MANIFEST: `缺少 bundle 输入清单 ${COMPONENT_INPUTS_FILE}(或结构非法)——它由 build.mjs 从 esbuild metafile 生成,是「bundle 真实读了哪些源文件」的唯一真相源;先跑 node build.mjs 再重跑 verify`,
     };
     const cs = actualHashes.componentSources ?? {};
-    for (const [group, entries] of [['sources', cs.sources], ['bundle', cs.bundle]]) {
+    if (FIX[cs.manifest] || !cs.manifest) problems.push(`component 防伪链未锁住 bundle 输入清单(状态 ${cs.manifest ?? 'NO_MANIFEST'}):${FIX[cs.manifest] ?? FIX.NO_MANIFEST}`);
+    problems.push(...checkDeclaredComponentSources(demoDir, spec.component));
+    for (const [group, entries] of [['sources', cs.sources], ['demoInputs', cs.demoInputs], ['bundle', cs.bundle]]) {
       for (const [name, value] of Object.entries(entries ?? {})) {
         if (FIX[value]) problems.push(`component 防伪链未锁住 ${group} "${name}"(状态 ${value}):${FIX[value]}`);
+        // 任何非真 sha256 的值都不锁任何东西(手写占位/未知状态一律拒)
+        else if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value))
+          problems.push(`component 防伪链 ${group} "${name}" 的 hash 不是合法 sha256(${JSON.stringify(value)})——重跑 build.mjs + verify`);
       }
     }
     if (cs.repoRoot === 'UNRESOLVED') problems.push(`component 防伪链未锁住 repoRoot(状态 UNRESOLVED):${FIX.UNRESOLVED}`);

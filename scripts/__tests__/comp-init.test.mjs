@@ -61,7 +61,9 @@ test('spec.component 骨架字段齐全,entry 原样写入,平台收窄为 deskt
   assert.ok(comp, '缺 component 段');
   assert.equal(comp.mode, 'component', 'schema 硬要求 component.mode');
   assert.equal(comp.entry, ENTRY);
-  assert.deepEqual(comp.sources, [ENTRY], '防伪链默认锁 entry(作者再扩)');
+  // 防伪链真相源改为 build.mjs 生成的 component.inputs.json(esbuild metafile),
+  // sources 降级为可选人读声明 → 骨架默认留空,不再预填 entry
+  assert.deepEqual(comp.sources, [], 'sources 是可选人读声明,骨架应留空');
   assert.equal(comp.bootstrap, 'src/bootstrap.tsx');
   assert.equal(comp.bundle, 'assets/component.bundle.js');
   assert.equal(comp.assetsDir, 'assets');

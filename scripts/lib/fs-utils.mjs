@@ -171,28 +171,55 @@ export function expandRepoGlob(repoRoot, pattern) {
   return files.filter((f) => re.test(f)).sort();
 }
 
+// 组件模式 bundle 输入清单(由 build.mjs 从 esbuild metafile 生成)。
+// 「声明源」(spec.component.entry/sources)与「bundle 真实输入」必须机械绑定:
+// 真相源是这份 manifest,不是作者的自报。
+export const COMPONENT_INPUTS_FILE = 'component.inputs.json';
+
+const relSafe = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.includes('\\') && !v.split('/').includes('..');
+
 /**
- * component 模式的代码层防伪链:产品组件源文件 + bundle 产物逐一 sha256。
- * 源文件改了而 demo 没重构建 → hash 变 → 旧 report 被 pr-block 拒。
- * 缺失文件记 MISSING、glob 零命中记 NO_MATCH(源集消失同样要让 hash 变)。
+ * 读 component.inputs.json。结构不合法(非 object / productInputs 不是非空字符串数组)
+ * 一律视为「没有 manifest」——宁可 fail-closed,不接受半张清单当真相源。
+ */
+export function readComponentInputsManifest(demoDir) {
+  const file = join(demoDir, COMPONENT_INPUTS_FILE);
+  if (!existsSync(file)) return null;
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+  if (!isPlainObject(parsed)) return null;
+  if (!Array.isArray(parsed.productInputs) || parsed.productInputs.length === 0) return null;
+  if (parsed.demoInputs !== undefined && !Array.isArray(parsed.demoInputs)) return null;
+  return parsed;
+}
+
+/**
+ * component 模式的代码层防伪链:**bundle 真实输入**逐一 sha256(真相源 = manifest)。
+ *   sources     — manifest.productInputs(产品仓内相对路径)逐文件 sha256
+ *   demoInputs  — manifest.demoInputs(demo 内相对路径,bootstrap/shims 等)逐文件 sha256
+ *   manifest    — manifest 文件自身 sha256(改清单本身同样让链失效)
+ *   bundle      — 构建产物 sha256
+ * 缺 manifest → manifest:'NO_MANIFEST'(report fail-closed);路径越狱 → 'INVALID_PATH';
+ * 仓根不可解析 → repoRoot:'UNRESOLVED' 且产品输入全记 UNRESOLVED;文件不在 → 'MISSING'。
+ * spec.component.sources 不再参与 hash——它降级为可选的人读声明,由
+ * checkDeclaredComponentSources 校验必须 ⊆ manifest 真实输入。
  */
 export function buildComponentHashes(demoDir, component) {
   const repoRoot = findGitRepoRoot(demoDir);
-  const out = { sources: {}, bundle: {} };
-  const patterns = Array.isArray(component?.sources) ? component.sources : [];
-  const entry = typeof component?.entry === 'string' && component.entry ? [component.entry] : [];
-  if (!repoRoot) {
-    out.repoRoot = 'UNRESOLVED';
-    for (const p of [...entry, ...patterns]) out.sources[p] = 'UNRESOLVED';
-  } else {
-    for (const pattern of [...entry, ...patterns]) {
-      const matched = expandRepoGlob(repoRoot, pattern);
-      if (matched.length === 0) { out.sources[pattern] = 'NO_MATCH'; continue; }
-      for (const rel of matched) {
-        const abs = join(repoRoot, rel);
-        out.sources[rel] = existsSync(abs) && statSync(abs).isFile() ? hashFile(abs) : 'MISSING';
-      }
-    }
+  const out = { manifest: 'NO_MANIFEST', sources: {}, demoInputs: {}, bundle: {} };
+  const manifest = readComponentInputsManifest(demoDir);
+  if (manifest) out.manifest = hashFile(join(demoDir, COMPONENT_INPUTS_FILE));
+  if (!repoRoot) out.repoRoot = 'UNRESOLVED';
+  for (const rel of manifest?.productInputs ?? []) {
+    if (!relSafe(rel)) { out.sources[String(rel)] = 'INVALID_PATH'; continue; }
+    if (!repoRoot) { out.sources[rel] = 'UNRESOLVED'; continue; }
+    const abs = join(repoRoot, rel);
+    out.sources[rel] = existsSync(abs) && statSync(abs).isFile() ? hashFile(abs) : 'MISSING';
+  }
+  for (const rel of manifest?.demoInputs ?? []) {
+    if (!relSafe(rel)) { out.demoInputs[String(rel)] = 'INVALID_PATH'; continue; }
+    const abs = join(demoDir, rel);
+    out.demoInputs[rel] = existsSync(abs) && statSync(abs).isFile() ? hashFile(abs) : 'MISSING';
   }
   const bundle = typeof component?.bundle === 'string' && component.bundle ? component.bundle : null;
   if (bundle) {
@@ -200,6 +227,36 @@ export function buildComponentHashes(demoDir, component) {
     out.bundle[bundle] = existsSync(abs) ? hashFile(abs) : 'MISSING';
   }
   return out;
+}
+
+/**
+ * 声明层与真实输入的一致性校验(report fail-closed 调用,不入 hash):
+ *   1. component.entry 必须出现在 manifest.productInputs —— 否则 bootstrap 根本没
+ *      import 声明的入口(hash 真组件、bundle 全是手写货);
+ *   2. component.sources(可选人读声明)展开后必须 ⊆ manifest.productInputs ——
+ *      声明了却没被 bundle 读到的源文件属于误导性声明。
+ * 返回 problems 字符串数组(空 = 通过)。
+ */
+export function checkDeclaredComponentSources(demoDir, component) {
+  const problems = [];
+  const manifest = readComponentInputsManifest(demoDir);
+  if (!manifest) return problems; // 缺 manifest 由 NO_MANIFEST 那条单独阻断,不重复报
+  const real = new Set(manifest.productInputs.filter((p) => typeof p === 'string'));
+  const entry = typeof component?.entry === 'string' ? component.entry : '';
+  if (entry && !real.has(entry))
+    problems.push(`component.entry "${entry}" 不在 bundle 真实输入里(component.inputs.json)——bootstrap 没有 import 它,「真组件直渲」不成立;重跑 build.mjs 会直接失败并给出修法`);
+  const repoRoot = findGitRepoRoot(demoDir);
+  const patterns = Array.isArray(component?.sources) ? component.sources : [];
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string' || !pattern) continue;
+    const matched = repoRoot ? expandRepoGlob(repoRoot, pattern) : [];
+    const stray = matched.filter((rel) => !real.has(rel));
+    if (matched.length === 0)
+      problems.push(`component.sources "${pattern}" 在产品仓内零命中——删掉或修正(sources 只是人读声明,真相源是 component.inputs.json)`);
+    else if (stray.length)
+      problems.push(`component.sources "${pattern}" 声明了未被 bundle 读到的源文件:${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ` 等 ${stray.length} 个` : ''}——声明必须 ⊆ bundle 真实输入`);
+  }
+  return problems;
 }
 
 // assets/ 清单(递归,路径为 demo 相对 posix 路径,按路径稳定排序)。

@@ -61,9 +61,11 @@ demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写�
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `skippedExternal`。**代码层防伪链的真相源**——门 A 对清单里每个输入 + 清单自身逐文件 sha256；缺清单 = `NO_MANIFEST` fail-closed |
 
-`spec.json` 多一个 `component` 段：`mode:"component"` / `entry` / `sources[]`（代码层防伪链，
-必填非空）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
+`spec.json` 多一个 `component` 段：`mode:"component"` / `entry`（必须是 bootstrap 真正
+import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bundle 真实输入里就 exit 2）/
+`sources[]`（可选的人读声明；代码层防伪链的真相源是 build.mjs 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
 `shims[{spec,file,why}]` / `css` / `themeVars.truthPath` / `fixtures[{id,why,shape?}]` /
 `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
 （`"inject"` / `"via"`，单一真相源）。adapter 升级：
