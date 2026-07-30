@@ -28,9 +28,11 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import zlib from 'node:zlib';
-import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
+import { buildAssetsManifest, buildInputHashes, hashFile, safeJsonForScript, stableJson, TOOL_VERSION } from '../lib/fs-utils.mjs';
 import { explicitContentFileProblem, restrictedGlobProblem } from '../lib/repo-glob.mjs';
 import { resolveContentFiles } from '../lib/component-build-core.mjs';
+import { GATE_LETTERS, RUNNERS, TRUSTED_GATES, lettersFor, markTrustedRun } from '../lib/gates.mjs';
+import { renderPrBlock } from '../lib/pr-render.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const CORE = join(ROOT, 'scripts/lib/component-build-core.mjs');
@@ -839,4 +841,170 @@ test('文档契约(不 skip): SKILL.md 必须写明执行时序原则、S ⊆ E 
   assert.match(doc, /意图信号/, '? 的取舍必须如实标注');
   assert.match(doc, /逗号分隔多值串/, '逗号必须写明是 transport 限制');
   assert.match(doc, /且排在可信 verify 之前/, '门 E 行必须写明可信重跑的新次序');
+});
+
+// ============================================================================
+// 条目 7 — 防再漏门机制（门列表唯一真相源 + taint 保护）
+// ============================================================================
+
+test('条目 7a 唯一真相源(不 skip): 门列表只有 TRUSTED_GATES 一份，别处不许再手写', () => {
+  assert.deepEqual(GATE_LETTERS, ['A', 'B', 'C', 'D', 'E', 'F', 'X']);
+  assert.deepEqual(lettersFor('verify'), ['A', 'B', 'C', 'D', 'F', 'X']);
+  assert.deepEqual(lettersFor('pixel'), ['E']);
+  // verify / pr-block / 渲染器都必须遍历映射,而不是内联门字母数组
+  const v = stripComments(readFileSync(VERIFY, 'utf8'));
+  assert.match(v, /lettersFor\('verify'\)/, "verify 的门集合必须取自 lettersFor('verify')");
+  assert.ok(!/\[\s*'A',\s*'B',\s*'C',\s*'D',\s*'F',\s*'X'\s*\]/.test(v), 'verify 里仍有手写门字母数组(条目 7a)');
+  const pb = stripComments(readFileSync(PR_BLOCK, 'utf8'));
+  assert.ok(
+    !/\['gateA',\s*'gateB'/.test(pb),
+    'pr-block 里仍有手写的 gateA/gateB/… 门列表 —— 门 E 那个 CRITICAL 就是这么漏的',
+  );
+  assert.match(pb, /lettersFor\('verify'\)/, 'pr-block 的投影门集合必须取自映射');
+  const rn = stripComments(readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8'));
+  assert.match(rn, /TRUSTED_GATES\[letter\]/, 'PR 门表渲染必须按映射取 runner');
+  assert.match(rn, /GATE_LETTERS\.filter/, '渲染器必须自查有没有漏门');
+});
+
+test('条目 7c③ 四者集合全等(不 skip): TRUSTED_GATES / verify 实现 / runner 映射 / SKILL.md 门表', () => {
+  const letters = new Set(GATE_LETTERS);
+  // ① verify 运行时接受的门字母(--gate 的合法取值)必须 === runner 为 verify 的那批
+  const usage = run(VERIFY, ['--demo', ROOT, '--gate', 'Z'], { env: env() });
+  const m = /只支持 ([A-Z/]+)/.exec(`${usage.stdout}${usage.stderr}`);
+  assert.ok(m, `verify 的 --gate 报文里读不到合法门字母:${usage.stdout}${usage.stderr}`);
+  assert.deepEqual(m[1].split('/').sort(), lettersFor('verify'), 'verify 实际接受的门字母 ≠ 映射');
+  // ② runner 取值必须都在 RUNNERS 里,且每个门字母都有 runner
+  for (const l of GATE_LETTERS) assert.ok(RUNNERS.includes(TRUSTED_GATES[l]), `门 ${l} 的 runner 非法`);
+  // ③ SKILL.md 门级全表里的字母门必须与映射集合全等
+  const doc = readFileSync(join(ROOT, 'SKILL.md'), 'utf8');
+  const table = doc.slice(doc.indexOf('| 门 | 结论进 PR 附贴块'));
+  const docLetters = new Set([...table.matchAll(/^\| ([A-Z]) [^|]+\|/gm)].map((x) => x[1]));
+  assert.deepEqual([...docLetters].sort(), [...letters].sort(), 'SKILL.md 门级全表与 TRUSTED_GATES 不等 —— 新增门字母必须同步文档');
+  // ④ 渲染器的门行实现必须每个字母都有(漏一个就等于那门不出块)
+  const rn = readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8');
+  const rows = new Set([...rn.matchAll(/^  ([A-Z]): \(/gm)].map((x) => x[1]));
+  assert.deepEqual([...rows].sort(), [...letters].sort(), '渲染器的 GATE_ROWS 与 TRUSTED_GATES 不等');
+});
+
+test('条目 7b taint 单测(不 skip): 未标记的 report 喂给渲染器必须 throw', () => {
+  const spec = { meta: { name: 'x' }, component: { mode: 'component' } };
+  const fakeReport = {
+    ok: true, toolVersion: 'x', generatedAt: 'now', coverage: { cases: [] },
+    gateA: { pass: true }, gateB: { pass: true, passed: 1, total: 1, entryRenderProof: 'proved' },
+    gateC: { pass: true, checks: [{ id: 'no-clip' }] }, gateD: { pass: true, total: 1 },
+    gateF: { pass: true, total: 1 }, gateX: { pass: true, total: 0 },
+    inputHashes: { componentSources: { sources: { 'a.ts': 'h' } } },
+  };
+  // ① 直接喂 JSON.parse 出来的普通对象(模拟"忘了走可信侧")→ 必须炸
+  assert.throws(
+    () => renderPrBlock({ spec, trustedVerify: JSON.parse(JSON.stringify(fakeReport)) }),
+    /未经 canonical runner 标记/,
+    '未标记的 report 居然能出块 —— taint 保护没生效',
+  );
+  // ② 手工构造一个"看起来一样"的盒子也不行(WeakSet 成员身份无法伪造)
+  assert.throws(() => renderPrBlock({ spec, trustedVerify: { runner: 'verify', payload: fakeReport } }), /未经 canonical runner 标记/);
+  // ③ runner 张冠李戴也不行
+  assert.throws(
+    () => renderPrBlock({ spec, trustedVerify: markTrustedRun('pixel', fakeReport) }),
+    /来自 runner "pixel"/,
+  );
+  // ④ 正确标记后可以出块,且数字取的是**被标记那份**
+  const out = renderPrBlock({ spec, trustedVerify: markTrustedRun('verify', { ...fakeReport, gateB: { ...fakeReport.gateB, passed: 42, total: 42 } }) });
+  assert.match(out, /状态覆盖（实际执行 42\/42）/, 'PR 数字必须来自可信盒子里的 payload');
+  // ⑤ 门 E 的盒子同样受检
+  assert.throws(() => renderPrBlock({ spec, trustedVerify: markTrustedRun('verify', fakeReport), trustedPixel: { ok: true } }), /未经 canonical runner 标记/);
+});
+
+test('条目 7c① provenance(不 skip): 渲染器结构上读不到 demo 自报的 report', () => {
+  const rn = readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8');
+  // 渲染器不许自己读盘、不许接收 claimed/自报参数
+  for (const bad of ['readFileSync', 'existsSync', 'demoDir', 'claimed', 'report.json']) {
+    assert.ok(!stripComments(rn).includes(bad), `渲染器出现了 ${bad} —— 它必须只吃可信盒子,不许自己取数据`);
+  }
+  // 所有门行的数据对象只能是 v(trusted verify)或 px(trusted pixel)
+  const rowsSrc = rn.slice(rn.indexOf('const GATE_ROWS'), rn.indexOf('export function renderPrBlock'));
+  assert.ok(!/\breport\b/.test(stripComments(rowsSrc)), '门行里出现了 report 变量(可能是自报来源)');
+  // pr-block 侧:出块调用只传可信盒子 + 明确分离的政策输入
+  const pb = readFileSync(PR_BLOCK, 'utf8');
+  assert.match(pb, /trustedVerify: trustedVerifyBox/);
+  assert.match(pb, /trustedPixel: trustedPixelBox/);
+  assert.match(pb, /assetsPolicy:/, '抬闸政策输入必须与测量证据分开传(条目 11)');
+  assert.ok(!/lines\.push/.test(pb), 'pr-block 里仍在自己拼门表 —— 渲染必须收敛到 pr-render');
+});
+
+test('条目 7d 对抗(实跑): 三份自报各自手写全绿且不跑对应执行器 → 分别被 canonical/现算阻断', (t) => {
+  if (!MODULE_ROOT) return t.skip('端到端需要真 esbuild + playwright');
+  /* 三份"报告型 JSON"逐个来一遍:每次都手写成全绿、且**不运行**对应执行器,
+     断言 A-X / E / 体积门分别被 canonical runner 或 pr-block 现算挡住。 */
+  const baselines = [{ key: 'one', frameSel: '#frame' }];
+
+  // ① report.json:手写全绿 + 从不跑 verify(门 D 声明 1 条但 index.html 落盘的是错值)
+  {
+    const { dir, truth } = makeFixture({
+      name: 'forge-report', repoDeps: true, boxWidth: '99px',
+      bindings: [{ sel: '.box', prop: 'width', truth: 'geometry.width', kind: 'length' }],
+    });
+    assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+    writeFileSync(join(dir, 'report.json'), `${JSON.stringify({
+      ok: true, partial: false, toolVersion: TOOL_VERSION, demo: 'forge-report',
+      inputHashes: buildInputHashes(dir, readJson(join(dir, 'spec.json'))),
+      statesResult: { total: 1, viaReachable: 1, tabOnly: 0 },
+      truthStats: { fixtureLeaves: 0 },
+      coverage: { cases: [{ id: 'desk-cn-light', prefs: {}, source: 'spec' }] },
+      gateA: { name: 'A', pass: true, extractorDrift: 'none' },
+      gateB: { name: 'B', pass: true, passed: 1, total: 1, failures: [], cases: [], entryRenderProof: 'proved' },
+      gateC: { name: 'C', pass: true, checks: [{ id: 'no-clip', pass: true, failures: [] }] },
+      gateD: { name: 'D', pass: true, passed: 1, total: 1, failures: [], cases: [] },
+      gateF: { name: 'F', pass: true, passed: 0, total: 0, failures: [], cases: [] },
+      gateX: { name: 'X', pass: true, total: 0, passed: 0, failures: [], gates: [] },
+      generatedAt: new Date(0).toISOString(),
+    }, null, 2)}\n`);
+    run(ASSETS_MANIFEST, ['--demo', dir], { env: env() });
+    const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+    assert.equal(pr.status, 2, `手写全绿 report.json 居然出了块:${pr.stdout}${pr.stderr}`);
+    assert.match(`${pr.stdout}${pr.stderr}`, /trusted-verify|trusted-report/, '必须由可信侧重跑挡住');
+    void truth;
+  }
+
+  // ② report-pixel.json:手写全 PASS + 基准图是非 PNG(真跑一定 ERROR)
+  {
+    const { dir, spec } = makeFixture({ name: 'forge-pixel', repoDeps: true });
+    const s2 = readJson(join(dir, 'spec.json'));
+    s2.baselines = baselines; s2.baselineFrameSel = '#frame';
+    writeFileSync(join(dir, 'spec.json'), JSON.stringify(s2, null, 2));
+    mkdirSync(join(dir, 'baselines'), { recursive: true });
+    writeFileSync(join(dir, 'baselines/one.png'), 'NOT-A-PNG');
+    assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+    assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0, '除门 E 之外应该是绿的');
+    writeFileSync(join(dir, 'report-pixel.json'), `${JSON.stringify({
+      ok: true, skipped: false, toolVersion: TOOL_VERSION, threshold: 0.005, compared: 1, declared: 1,
+      inputHashes: buildInputHashes(dir, s2),
+      results: [{ key: 'one', status: 'PASS', engine: 'odiff', bad: 0, total: 10000, masked: 0, diffRatio: 0, detail: '' }],
+      generatedAt: new Date(0).toISOString(),
+    }, null, 2)}\n`);
+    run(ASSETS_MANIFEST, ['--demo', dir], { env: env() });
+    const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+    assert.equal(pr.status, 2, `手写全 PASS 的 report-pixel.json 居然出了块:${pr.stdout}${pr.stderr}`);
+    assert.match(`${pr.stdout}${pr.stderr}`, /trusted-pixel/, '必须由门 E 的可信重跑挡住');
+    void spec;
+  }
+
+  // ③ report-assets.json:手写 totalBytes:0 + ok:true,资产其实很大
+  {
+    const { dir } = makeFixture({ name: 'forge-assets', repoDeps: true });
+    assert.equal(run(join(dir, 'build.mjs'), [], { cwd: dir, env: env() }).status, 0);
+    assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0);
+    writeFileSync(join(dir, 'assets/huge.bin'), Buffer.alloc(9 * 1024 * 1024, 7));
+    // verify 要重跑一次让 assets hash 对上(否则被 report hash 门先挡下,测不到体积门)
+    assert.equal(run(VERIFY, ['--demo', dir], { env: env() }).status, 0);
+    writeFileSync(join(dir, 'report-assets.json'), `${JSON.stringify({
+      ok: true, toolVersion: TOOL_VERSION, totalBytes: 0, defaultLimitMb: 8, effectiveLimitMb: 8,
+      overrideReason: null, problems: [],
+      inputHashes: { assets: buildAssetsManifest(dir).files },
+      generatedAt: new Date(0).toISOString(),
+    }, null, 2)}\n`);
+    const pr = run(PR_BLOCK, ['--demo', dir, '--url', 'https://demo.workers.xd.team'], { env: env() });
+    assert.equal(pr.status, 2, `手写 totalBytes:0 的 report-assets.json 居然出了块:${pr.stdout}${pr.stderr}`);
+    assert.match(`${pr.stdout}${pr.stderr}`, /assets:/, '必须由 pr-block 自己现算的体积门挡住');
+  }
 });
