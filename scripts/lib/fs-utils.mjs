@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
-export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r2';
+export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r3';
 
 export function isPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
