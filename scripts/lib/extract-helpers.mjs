@@ -94,6 +94,46 @@ export function makeLeaf(value, sourceFile, { locator, locatorPattern, keyPath, 
   return { value, provenance };
 }
 
+/**
+ * 服务端驱动数据的叶子工厂:值来自**录制的服务端响应**(providers 配置、account
+ * memberships 等源码里没有字面量的数据)。产出 provenance.sourceKind='fixture',
+ * 并强制 capturedFrom——诚实声明"这不是源码溯源",而不是假装是。
+ *
+ * 硬约束(与 validateProvenance 同口径,这里提前抛以便 extract 作者立刻看到):
+ *   - capturedFrom 必填:一句话说清什么时候从哪个环境的哪个接口录的;
+ *   - fixtureFile 必须存在,且落在 demo 内 `fixtures/` 下(随 PR 走、reviewer 能打开)。
+ *
+ * @param value 从 fixture 里读出的值
+ * @param fixtureFile fixture 文件路径(绝对或相对 demoDir),须为 demo 内 fixtures/<name>.json
+ * @param opts.locator 必填:该值在 fixture 中的定位方式(如 'data.providers[0].id')
+ * @param opts.capturedFrom 必填:录制来源声明(如 '2026-07-30 公司沙盒 /api/providers 响应')
+ * @param opts.demoDir 默认 process.cwd()
+ */
+export function makeFixtureLeaf(value, fixtureFile, { locator, capturedFrom, demoDir = process.cwd() } = {}) {
+  if (!locator || typeof locator !== 'string') {
+    throw new Error(`makeFixtureLeaf(${JSON.stringify(value)}): 必须写 locator——该值在 fixture 里怎么定位`);
+  }
+  if (!capturedFrom || typeof capturedFrom !== 'string' || !capturedFrom.trim()) {
+    throw new Error(
+      `makeFixtureLeaf(${JSON.stringify(value)}): 必须写 capturedFrom——一句话声明录制来源,` +
+        '如 "2026-07-30 公司沙盒 /api/providers 响应"。没有来源声明的 fixture 等于手抄',
+    );
+  }
+  const abs = isAbsolute(fixtureFile) ? fixtureFile : resolve(demoDir, fixtureFile);
+  if (!existsSync(abs)) throw new Error(`makeFixtureLeaf: fixture 文件不存在:${abs}`);
+  const rel = relative(demoDir, abs).split('\\').join('/');
+  if (!rel || rel === '..' || rel.startsWith('../')) {
+    throw new Error(`makeFixtureLeaf: fixture 必须放 demo 目录内(当前 ${abs} 在 demo 外,随 PR 走不了)`);
+  }
+  if (!rel.startsWith('fixtures/')) {
+    throw new Error(`makeFixtureLeaf: fixture 必须放 demo 内 fixtures/ 下(当前 ${rel})`);
+  }
+  return {
+    value,
+    provenance: { source: rel, sourceKind: 'fixture', locator, capturedFrom: capturedFrom.trim(), hash: sha256File(abs) },
+  };
+}
+
 /** 从正则捕获组提取源文件中的值(常见「读常量」场景的一步到位封装)。 */
 export function extractByPattern(sourceFile, pattern, { locator, demoDir = process.cwd(), transform } = {}) {
   const abs = isAbsolute(sourceFile) ? sourceFile : resolve(demoDir, sourceFile);
