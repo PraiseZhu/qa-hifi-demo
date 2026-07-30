@@ -185,13 +185,17 @@ async function comparePngsOdiff({ PNG, odiff, baselineRaw, actualRaw, cssSize, m
     writeFileSync(basePath, baselineRaw);
     writeFileSync(actPath, actualRaw);
     // 注意:odiff 把 ignoreRegions 序列化成 --ignore "x1:y1-x2:y2,...",空数组会变 --ignore ""
-    // 被二进制拒绝(Invalid ignore regions format)——无 mask 时不得传该选项
+    // 被二进制拒绝(Invalid ignore regions format)。判定必须看**过滤后**的 ignoreRegions——
+    // maskToIgnoreRegions 会把零面积/完全出界 mask 滤掉(它们在 maskBitmap 里本就 0 贡献,
+    // 语义等同无 mask),若仍按原始 masks.length 判断会传空数组、让首选引擎无谓抛错
+    // (终审缺口 #1b)。
     const odiffOptions = {
       threshold: Math.max(0, Math.min(1, threshold)),
       antialiasing: true,
       outputDiffMask: true,
     };
-    if (masks.length) odiffOptions.ignoreRegions = maskToIgnoreRegions(masks, dpr, baseline.width, baseline.height);
+    const ignoreRegions = maskToIgnoreRegions(masks, dpr, baseline.width, baseline.height);
+    if (ignoreRegions.length > 0) odiffOptions.ignoreRegions = ignoreRegions;
     const result = await odiff.compare(basePath, actPath, diffPath, odiffOptions);
     if (result.match === false && result.reason === 'layout-diff')
       return { status: 'ERROR', detail: `尺寸不一致(odiff layout-diff):${baseline.width}x${baseline.height} vs ${actual.width}x${actual.height}` };
