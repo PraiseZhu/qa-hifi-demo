@@ -117,6 +117,19 @@
       "occurrences": 1,
       "firstSeen": "2026-07-30T07:00:26.037Z",
       "lastSeen": "2026-07-30T07:00:26.037Z"
+    },
+    {
+      "fingerprint": "cross-engine-pixel-compare-infeasible",
+      "tier": "by-design",
+      "title": "web 基准图与原生端截图直接像素比对不可行,基准必须分端存",
+      "detail": "2026-07-30 调研确认:无任何活跃开源项目做跨渲染引擎直比;Playwright 官方文档明示连同引擎跨 OS 都要分快照;根因=字体渲染/Yoga 取整/阴影实现三套/OS chrome。正确姿势:truth 跨端共享,基准 baselines/{web,electron-mac,electron-win,ios,android} 分端,跨端一致性断言放几何/属性层",
+      "proposal": null,
+      "status": "tracked",
+      "commit": null,
+      "note": null,
+      "occurrences": 1,
+      "firstSeen": "2026-07-30T07:00:29.655Z",
+      "lastSeen": "2026-07-30T07:00:29.655Z"
     }
   ]
 }

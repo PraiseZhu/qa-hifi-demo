@@ -30,5 +30,7 @@
 
 ## 无法自动化(by-design,只计数观察)
 
+- `cross-engine-pixel-compare-infeasible` **web 基准图与原生端截图直接像素比对不可行,基准必须分端存** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: tracked
+  - 现象:2026-07-30 调研确认:无任何活跃开源项目做跨渲染引擎直比;Playwright 官方文档明示连同引擎跨 OS 都要分快照;根因=字体渲染/Yoga 取整/阴影实现三套/OS chrome。正确姿势:truth 跨端共享,基准 baselines/{web,electron-mac,electron-win,ios,android} 分端,跨端一致性断言放几何/属性层
 - `html-to-native-no-mechanical-path` **结构级 HTML→四端机械转换原理性不存在,agent 双改即业界最优** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: tracked
   - 现象:2026-07-30 GitHub 全量调研确认:Mitosis 只有 JSX 子集正向编译器且无 HTML parser(RN sanitizer 策略=丢弃+警告);html-to-react-native 生态位仅 0-6 star 玩具;跨框架 patch 生成无任何开源项目。CSS/RN 样式语义鸿沟(级联/继承/grid vs flex-only)与结构语义鸿沟(div→View/Pressable 是意图判断)决定无损映射不可能
