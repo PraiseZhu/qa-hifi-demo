@@ -48,40 +48,55 @@ chrome 运行时升级：`node scripts/init.mjs --dir <demo-dir> --update-chrome
 
 ```bash
 node scripts/init.mjs --dir <demo-dir> --name <slug> --mode component \
-  --entry <组件入口，相对 repoRoot>
+  --entry <组件入口，相对 repoRoot> [--entry-export <目标组件导出名>]
 ```
 
 不带 `--mode` 就是**经典模式**（手写 HTML 复刻界面，默认路线，行为不变）。组件模式把
 demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写，因此「文案/色值手抄漂移」和
-「复刻状态机 ≠ 产品状态机」这两类盲区从根上消失。多生成四件套：
+「复刻状态机 ≠ 产品状态机」这两类盲区从根上消失。多生成的产物：
 
 | 产物 | 作用 |
 |---|---|
-| `build.mjs` | 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 图片落 `assets/` + 可选 tailwind CSS |
+| `build.mjs` + `component-build-core.mjs` + `repo-glob.mjs` | 构建器**薄壳 + 规范正本**：core 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 输入清单；`build.mjs` 只负责落清单 + 图片落 `assets/` + 可选 tailwind CSS。三份都是 skill canonical 的逐字节拷贝，改写任一份 → 门 A fail-closed「检测到自定义构建器，需人工审查」 |
 | `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
 | `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
 | `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
-| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建器自身 / tailwind config / alias 读过的 package.json）/ `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都会跑 `node build.mjs --check-inputs` 用 esbuild 现算一遍再全等比对，「先缩清单再重跑 verify」当场被抓（缺 `build.mjs` 也 fail-closed——无法复算） |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` glob 命中的每个文件** / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓 |
 
-**「真组件直渲」不靠声明，靠运行期哨兵。** 只证明 `entry` 在 `metafile` 输入里是不够的：
-`import '<entry>'` 这种副作用导入同样让它进图、hash 入链，而界面完全可以是 bootstrap 手搓的。
-`build.mjs` 给 `entry` 的每个导出套一层调用探针，真被调用/实例化（React 调函数组件、`new`
-类组件、`memo`/`forwardRef` 的 `render`）时置 `globalThis.__QA_ENTRY_RENDERED__`；verify 在
-门 B 挂载完成后、第一个状态断言前查一次，没置位就是门 B 首项 fail（报文点名 side-effect import）。
-另有 tree-shake 护栏：`entry` 在图里但 `bytesInOutput` 为 0（只被 `import type`、或导出全未
-被引用且无副作用）→ build exit 2。
+**「真组件直渲」不靠声明，靠运行期哨兵 —— 而且只认你声明的那个导出。**
+只证明 `entry` 在 `metafile` 输入里是不够的：`import '<entry>'` 这种副作用导入同样让它进图、
+hash 入链，而界面完全可以是 bootstrap 手搓的。构建期给 `entry` 的导出套调用探针，真被调用/
+实例化（React 调函数组件、`new` 类组件、`memo`/`forwardRef` 的 `render`）时置位；verify 在
+门 B 挂载完成后、第一个状态断言前查一次。判定分三种（`manifest.entrySentinel`）：
 
-诚实边界（不隐瞒）：探针只能套函数/类/`memo`·`forwardRef`。`entry` 的导出全是常量或纯数据、
-或全靠 `export *` 转出时套不上，此时 **verify 不判造假**（避免误伤），改由 `pr-block` 把结论
-降级成「产品模块已打包（N 个源文件 hash 入链）｜⚠️ 运行期哨兵无法覆盖该入口的导出形态，
-bootstrap 使用方式需人工审查」。同理，bootstrap 调用 `entry` 的非组件导出（工具函数）也会
-置位——这两个缺口由降级文案与人工 review 兜，工具不宣称自己做到了做不到的事。
+| 形态 | 触发条件 | 结论 |
+|---|---|---|
+| `targeted` | 声明了 `component.export` 且探针就位 | 目标导出被调用 → `entryRenderProof='proved'`，PR 块写「真组件直渲」；目标可探测却一次没被调用 → **门 B 硬失败**并点名（报文区分「只调了其它导出」与「纯 side-effect import」） |
+| `active` | 未声明 `component.export` | 只保留「一个导出都没被调用 → 门 B 失败」这条硬失败；最高只到 `nontarget`，**PR 块一律降级** |
+| `unavailable` | 探针完全套不上（`entry` 不是 JS/TS、无任何导出、或声明的目标导出是常量/纯数据） | 不判造假（避免误伤），PR 块降级 |
+
+声明了 `entry` 里**不存在**的导出 → `build` 直接 exit 2 并列出真实导出名（错误声明不许静默
+降级）。另有 tree-shake 护栏：`entry` 在图里但 `bytesInOutput` 为 0（只被 `import type`、
+或导出全未被引用且无副作用）→ build exit 2。
+
+诚实边界（不隐瞒）：
+* 不声明 `component.export` 就**永远拿不到**「真组件直渲」这句话，PR 块只会写「产品模块已打包
+  （N 个源文件 hash 入链）｜⚠️ 运行期哨兵未证明「声明的目标组件导出被渲染」…是否为 UI 组件需
+  人工审查」。这是 r3 收紧的点：r2 只要 `entry` 的**任一**导出被调用就宣称直渲，于是
+  「entry 同时导出组件与工具函数、bootstrap 只调工具函数 + 手搓 UI」能骗到 ✅。
+* 探针只能套函数/类/`memo`·`forwardRef`；`export *` 转出的名字拿不到，不套探针。
+* 工具**不**证明「渲染出来的像素来自该组件」——它证明的是「该导出被调用过」。组件里再套一层
+  假 UI 这类情形仍需人工 review；工具不宣称自己做到了做不到的事。
 
 `spec.json` 多一个 `component` 段：`mode:"component"` / `entry`（必须是 bootstrap 真正
 import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bundle 真实输入里就 exit 2）/
-`sources[]`（可选的人读声明；代码层防伪链的真相源是 build.mjs 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
-`shims[{spec,file,why}]` / `css` / `themeVars.truthPath` / `fixtures[{id,why,shape?}]` /
-`target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
+`export?`（目标组件导出名，默认导出写 `"default"`；**拿到「真组件直渲」结论的唯一途径**，
+不填只会降级、填错直接 exit 2）/
+`sources[]`（可选的人读声明；代码层防伪链的真相源是 build 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
+`shims[{spec,file,why}]` / `css`（`css.content` 的每个 glob 必须是仓内相对的标准 glob——只支持
+`*` / `**` / `?`；`{a,b}`、`!` 否定、绝对路径、`require()`/对象形式一律拒；任一 glob 零命中也
+直接 exit 2，因为「声明了 content 却匹配不到」等于样式源文件不进链） / `themeVars.truthPath` /
+`fixtures[{id,why,shape?}]` / `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
 （`"inject"` / `"via"`，单一真相源）。adapter 升级：
 `node scripts/init.mjs --dir <demo-dir> --update-adapter`（与 `--update-chrome` 同机制）。
 
