@@ -53,6 +53,48 @@ export function validatePixelForPr(demoDir, spec = null) {
   // report-pixel 存在但 skipped(声明了 baseline 却没图匹配上)= 阻断,不是「未验证」放行
   if (report.skipped === true && declaredBaselines > 0)
     problems.push(`spec 声明了 ${declaredBaselines} 个 baseline 但 pixel report 为 skipped——门 E 实际未比对,不得附贴`);
+  // 防伪(review finding #2):results 必须与 spec.baselines 一一对应——旧代码只查 hash/ok,
+  // 手写 {ok:true,declared:N,compared:0,results:[]}+当前 hash 即可零比对出附贴块。
+  // 这里重建期望复合 key 集(platform/key 或 legacy key)做数量/唯一性/集合全等校验,
+  // 并对每条结果做 status 合法性、计数自洽(diffRatio≈bad/total)、engine 字段检查。
+  if (report.skipped !== true) {
+    const expectedKeys = Array.isArray(spec?.baselines)
+      ? spec.baselines.map((b) => (b?.platform ? `${b.platform}/${b.key}` : b?.key))
+      : [];
+    const results = Array.isArray(report.results) ? report.results : null;
+    if (report.declared !== expectedKeys.length)
+      problems.push(`pixel report declared(${report.declared}) 与 spec.baselines 数量(${expectedKeys.length}) 不符`);
+    if (!results) problems.push('pixel report 缺 results 数组(非 skipped 报告必须逐条列出比对结果)');
+    else {
+      if (results.length !== expectedKeys.length)
+        problems.push(`pixel report results 数量(${results.length}) 与 spec.baselines(${expectedKeys.length}) 不一致——漏端或多端`);
+      if (report.compared !== results.length)
+        problems.push(`pixel report compared(${report.compared}) 与 results.length(${results.length}) 不符(计数伪造?)`);
+      const seen = new Set();
+      const LEGAL = new Set(['PASS', 'WARN', 'ERROR', 'MISSING']);
+      for (const [i, r] of results.entries()) {
+        const ck = r?.platform ? `${r.platform}/${r.key}` : r?.key;
+        if (typeof ck !== 'string' || !ck) { problems.push(`pixel results[${i}] 缺 key`); continue; }
+        if (seen.has(ck)) problems.push(`pixel results[${i}] 复合 key 重复:${ck}`);
+        seen.add(ck);
+        if (!LEGAL.has(r?.status)) problems.push(`pixel results[${i}](${ck}) status 非法:${r?.status}`);
+        if (r?.status === 'PASS' || r?.status === 'WARN') {
+          if (typeof r.engine !== 'string' || !r.engine)
+            problems.push(`pixel results[${i}](${ck}) ${r.status} 缺 engine 字段(odiff/pixelmatch/manual)——非本工具产出?`);
+          for (const f of ['bad', 'total', 'masked']) {
+            if (!Number.isFinite(r[f]) || r[f] < 0) problems.push(`pixel results[${i}](${ck}) ${f} 必须是非负数值`);
+          }
+          if (!Number.isFinite(r.diffRatio)) problems.push(`pixel results[${i}](${ck}) diffRatio 必须是数值`);
+          else if (Number.isFinite(r.bad) && Number.isFinite(r.total) && r.total > 0 && Math.abs(r.diffRatio - r.bad / r.total) > 1e-9)
+            problems.push(`pixel results[${i}](${ck}) diffRatio(${r.diffRatio}) 与 bad/total(${r.bad}/${r.total}) 不一致——计数伪造?`);
+        }
+      }
+      const missing = expectedKeys.filter((k) => !seen.has(k));
+      const extra = [...seen].filter((k) => !expectedKeys.includes(k));
+      if (missing.length) problems.push(`pixel report 缺 spec 声明的基准结果:${missing.join(', ')}`);
+      if (extra.length) problems.push(`pixel report 含 spec 未声明的结果:${extra.join(', ')}`);
+    }
+  }
   const statuses = report.results?.map((r) => r.status) ?? [];
   if (statuses.includes('WARN')) {
     for (const r of report.results.filter((x) => x.status === 'WARN')) {
