@@ -70,8 +70,15 @@ export function validatePixelForPr(demoDir, spec = null) {
         problems.push(`pixel report results 数量(${results.length}) 与 spec.baselines(${expectedKeys.length}) 不一致——漏端或多端`);
       if (report.compared !== results.length)
         problems.push(`pixel report compared(${report.compared}) 与 results.length(${results.length}) 不符(计数伪造?)`);
+      // 终审缺口 #2b:status 结论不得与阈值矛盾——threshold 必须等于 spec 声明值
+      // (防篡改放宽),PASS 的 diffRatio 不得超阈值、WARN 的 diffRatio 必须超阈值
+      // (WARN 另有人工裁决校验兜底),engine 限本工具真实产出枚举
+      const expectedThreshold = spec?.baselineThreshold ?? 0.005;
+      if (report.threshold !== expectedThreshold)
+        problems.push(`pixel report threshold(${report.threshold}) 与 spec.baselineThreshold(${expectedThreshold}) 不符——阈值篡改?`);
       const seen = new Set();
       const LEGAL = new Set(['PASS', 'WARN', 'ERROR', 'MISSING']);
+      const ENGINE_LEGAL = new Set(['odiff', 'pixelmatch', 'manual']);
       for (const [i, r] of results.entries()) {
         const ck = r?.platform ? `${r.platform}/${r.key}` : r?.key;
         if (typeof ck !== 'string' || !ck) { problems.push(`pixel results[${i}] 缺 key`); continue; }
@@ -79,14 +86,20 @@ export function validatePixelForPr(demoDir, spec = null) {
         seen.add(ck);
         if (!LEGAL.has(r?.status)) problems.push(`pixel results[${i}](${ck}) status 非法:${r?.status}`);
         if (r?.status === 'PASS' || r?.status === 'WARN') {
-          if (typeof r.engine !== 'string' || !r.engine)
-            problems.push(`pixel results[${i}](${ck}) ${r.status} 缺 engine 字段(odiff/pixelmatch/manual)——非本工具产出?`);
+          if (!ENGINE_LEGAL.has(r.engine))
+            problems.push(`pixel results[${i}](${ck}) engine 非法:${r.engine}(只允许 odiff/pixelmatch/manual)——非本工具产出?`);
           for (const f of ['bad', 'total', 'masked']) {
             if (!Number.isFinite(r[f]) || r[f] < 0) problems.push(`pixel results[${i}](${ck}) ${f} 必须是非负数值`);
           }
           if (!Number.isFinite(r.diffRatio)) problems.push(`pixel results[${i}](${ck}) diffRatio 必须是数值`);
-          else if (Number.isFinite(r.bad) && Number.isFinite(r.total) && r.total > 0 && Math.abs(r.diffRatio - r.bad / r.total) > 1e-9)
-            problems.push(`pixel results[${i}](${ck}) diffRatio(${r.diffRatio}) 与 bad/total(${r.bad}/${r.total}) 不一致——计数伪造?`);
+          else {
+            if (Number.isFinite(r.bad) && Number.isFinite(r.total) && r.total > 0 && Math.abs(r.diffRatio - r.bad / r.total) > 1e-9)
+              problems.push(`pixel results[${i}](${ck}) diffRatio(${r.diffRatio}) 与 bad/total(${r.bad}/${r.total}) 不一致——计数伪造?`);
+            if (r.status === 'PASS' && r.diffRatio > expectedThreshold)
+              problems.push(`pixel results[${i}](${ck}) 伪 PASS:diffRatio(${r.diffRatio}) 超阈值(${expectedThreshold})——高差异伪装通过?`);
+            if (r.status === 'WARN' && r.diffRatio <= expectedThreshold)
+              problems.push(`pixel results[${i}](${ck}) 伪 WARN:diffRatio(${r.diffRatio}) 未超阈值(${expectedThreshold})——WARN 无依据`);
+          }
         }
       }
       const missing = expectedKeys.filter((k) => !seen.has(k));
