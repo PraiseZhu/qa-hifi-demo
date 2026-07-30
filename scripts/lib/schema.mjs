@@ -114,6 +114,15 @@ export function validateSpec(spec) {
     if (hasVia && st.tab) problems.push(`${where}:via 与 tab 二选一`);
     if (!hasVia && !tabOnly) problems.push(`${where}:必须有 via 数组,或 via:null + tab:"状态补齐"`);
     if (tabOnly && !(typeof st.note === 'string' && st.note.trim())) problems.push(`${where}:状态补齐必须写 note`);
+    // driver(组件模式,可选):声明该状态怎么被驱动到。'inject' = 可由 adapter 调
+    // __qaDemo.inject(id) 直达(推 reducer/setState);'via' = 局部 useState 类状态,
+    // 外部注入不到,只能经真实交互链路重放(__qa.goto 对其显式 throw)。
+    // 复刻模式(手写 HTML)不写该字段,语义不变。
+    if (st.driver !== undefined) {
+      if (st.driver !== 'inject' && st.driver !== 'via') problems.push(`${where}.driver 只允许 "inject" 或 "via"`);
+      // driver:'via' ⇒ 必须真有 via 链路,否则该状态既不能注入也没有到达路径 = 永不可达
+      else if (st.driver === 'via' && !hasVia) problems.push(`${where}.driver:"via" 必须同时声明 via 链路(否则该状态无任何到达路径)`);
+    }
     if (hasVia) {
       if (st.via.length === 0) problems.push(`${where}.via 不能为空`);
       for (const [j, step] of st.via.entries()) problems.push(...validateStep(step, `${where}.via[${j}]`, ids));
