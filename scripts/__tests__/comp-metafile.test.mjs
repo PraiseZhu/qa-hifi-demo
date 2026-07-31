@@ -16,6 +16,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildInputHashes, checkDeclaredComponentSources, hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
 import { validateReportIntegrity } from '../lib/report.mjs';
+import { templateExtractor } from './_extractor-template.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const VERIFY = join(ROOT, 'scripts/verify.mjs');
@@ -119,7 +120,11 @@ function makeFixture({ name, bootstrap = 'real', sources = [] } = {}) {
   writeFileSync(join(dir, 'truth.json'), stableJson(truth));
   writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
   writeFileSync(join(dir, 'index.html'), baseHtml(truth));
-  writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
+    /* r10 fixture 忠实化:与 init.mjs 生成的官方模板**同形**(import 兄弟
+       ./extract-helpers.mjs)。此前是自包含单文件,于是「可信副本搬走脚本后相对 import 断」
+       这类真实使用路径缺陷在全绿下测不出来。 */
+  writeFileSync(join(dir, 'extract.mjs'), templateExtractor(truth));
+  copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
   return { repo, dir };
 }
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { createSafeStaticServer } from '../lib/safe-server.mjs';
 import { hashFile, safeJsonForScript, stableJson } from '../lib/fs-utils.mjs';
 import { comparePngs } from '../lib/png-compare.mjs';
+import { templateExtractor as TEMPLATE_EXTRACTOR } from './_extractor-template.mjs';
 
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
 /* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
@@ -74,7 +75,12 @@ function writeDemo({ mutateSpec, mutateHtml, truthOverride, truthMutate, name = 
   // noExtractor=true 或 extractOutput 覆盖 → 供「缺 extractor / 漂移」类 fixture 使用。
   if (!noExtractor) {
     const emit = extractOutput !== undefined ? extractOutput : truth;
-    writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(emit))});\n`);
+    /* r10 fixture 忠实化:与 init.mjs 生成的官方模板**同形** —— import 兄弟模块
+       `./extract-helpers.mjs`,helpers 一并拷进 demo。此前 fixture 是自包含单文件,于是
+       「可信副本把脚本搬走后相对 import 解析不到兄弟模块」这类缺陷 350/350 全绿也测不出来
+       (要靠 e2e 才抓到)。忠实化后官方脚手架的真实形态本身受回归保护。 */
+    writeFileSync(join(dir, 'extract.mjs'), TEMPLATE_EXTRACTOR(emit));
+    copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
   }
   if (pngBaseline) {
     mkdirSync(join(dir, 'baselines'), { recursive: true });

@@ -6,13 +6,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateTruth, countFixtureLeaves } from '../lib/schema.mjs';
 import { makeFixtureLeaf, makeLeaf } from '../lib/extract-helpers.mjs';
 import { hashFile, safeJsonForScript } from '../lib/fs-utils.mjs';
+import { templateExtractor } from './_extractor-template.mjs';
 
 const MODULE_ROOT = process.env.QA_HIFI_MODULE_ROOT;
 /* r7 条目 14:宿主没有产品仓依赖(esbuild / playwright)时,这些用例**跑不了**,
@@ -213,7 +214,11 @@ function writeVerifiableDemo({ name, withFixture }) {
   };
   writeFileSync(join(dir, 'spec.json'), JSON.stringify(spec, null, 2));
   writeFileSync(join(dir, 'truth.json'), JSON.stringify(truth, null, 2));
-  writeFileSync(join(dir, 'extract.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify(truth))});\n`);
+    /* r10 fixture 忠实化:与 init.mjs 生成的官方模板**同形**(import 兄弟
+       ./extract-helpers.mjs)。此前是自包含单文件,于是「可信副本搬走脚本后相对 import 断」
+       这类真实使用路径缺陷在全绿下测不出来。 */
+  writeFileSync(join(dir, 'extract.mjs'), templateExtractor(truth));
+  copyFileSync(join(ROOT, 'scripts/lib/extract-helpers.mjs'), join(dir, 'extract-helpers.mjs'));
   writeFileSync(
     join(dir, 'index.html'),
     `<!doctype html><html><head><style>.box{color:#ff0000}</style></head><body>
