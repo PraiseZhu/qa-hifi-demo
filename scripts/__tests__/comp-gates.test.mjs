@@ -259,7 +259,11 @@ test('buildInputHashes: 缺 manifest → manifest 记 NO_MANIFEST(fail-closed �
   const { dir } = makeRepoDemo({ name: 'hash-nomanifest', manifest: false });
   const h = buildInputHashes(dir, readSpec(dir));
   assert.equal(h.componentSources.manifest, 'NO_MANIFEST');
-  assert.deepEqual(h.componentSources.sources, {});
+  /* r12:这些映射改成了无原型对象(路径/名字为 key 的映射统一收紧,见 comp-fix-r12)。
+     deepStrictEqual 会比原型,所以期望值也用 Object.create(null) 构造 —— 顺带把
+     「必须是无原型对象」这条不变式钉进断言,比改成 deepEqual 更严。 */
+  assert.deepEqual(h.componentSources.sources, Object.create(null));
+  assert.equal(Object.getPrototypeOf(h.componentSources.sources), null, 'r12:路径为 key,必须无原型');
 });
 
 test('buildInputHashes: 改源文件 / 改 bundle 都让 hash 变', (t) => {
