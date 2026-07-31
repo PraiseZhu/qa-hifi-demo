@@ -6,6 +6,48 @@
 
 ## 已自动落地(工具/文档缺口修复,不放宽口径)
 
+- `prototype-key-drops-path-entry` **以路径为 key 的普通对象会漏掉 __proto__,而 in-membership 又因原型链误判为已存在** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `5c7ebc0`
+  - 现象:entries['__proto__']=record 不建 own property 而触发原型 setter:Object.keys 遍历不到、hasOwn 为 false、但 '__proto__' in obj 却是 true → 冻结基准漏这条路径、磁盘侧又不进 added,两头都瞎。一个名为 __proto__ 的页面可达资源被改掉,全链报绿。连写测试的人都会踩:{__proto__:x} 的 hasOwn 是 false,{['__proto__']:x} 才是 true
+  - 提案:所有以路径/名字为 key 的映射一律 Object.create(null) 或 Map,成员判断一律 Object.hasOwn。必须全仓排查同形状:本轮查出 13 处,其中 component.inputs.json 声明的源文件路径、spec.adaptive.probes[].id、HTML 属性名/CSS 属性名的 diff 映射三处 key 是外部可控的
+- `mutable-oracle-proves-nothing` **收口用的比较基准本身可被被审方改写,于是「两边全等」证明不了「交付等于被观察」** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `57062ad`
+  - 现象:整树快照与后置脚本的执行副本都落在同一个用户可枚举可写的 os.tmpdir(),随机后缀只防猜不防同权限枚举。custom gate 枚举到快照后把快照与磁盘同时改成相同错误字节 → 收口报全等、verify exit 0,交付页面已变错。根因:manifest 证明的只是「两个当前可变对象现在相等」
+  - 提案:收口基准在执行任何 demo 代码之前冻结进父进程内存(不落盘——落盘就又变成同权限可写文件);枚举照样成功,但让枚举变得无用。另加:每次复制出 exec 树后也拿冻结基准逐条校验,使「exec 树兄弟模块字节来自观察快照」这句文档声明恒真
+- `security-fix-breaks-official-scaffold-path` **安全修复打断了官方脚手架推荐写法,而 fixture 不忠实于真实产物所以测不出来** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `ac463ed`
+  - 现象:「门 X 执行已 hash 的可信副本」把脚本单文件复制到 output root 执行,ESM 相对 import 解析基于脚本自身位置 → init 模板生成的 extract.mjs(import ./extract-helpers.mjs)直接 ERR_MODULE_NOT_FOUND。361 条测试全绿 + 十轮安全终审 APPROVED 都没拦住:测试 fixture 的 extract.mjs 是自包含的,不是 init 真实产物。安全评审只问「能不能伪造出假的绿」,不会问「真实推荐用法能不能跑出绿」
+  - 提案:可信副本从单文件改为从观察快照复制出的一次性整树,脚本在树内原相对位置执行;hash 仍取自磁盘、复制后对树内那份再验一次(于是同时要求磁盘字节≡快照字节,比原来更严);fixture 按 init 模板形态忠实化并加契约:init 模板改形态而 fixture 没跟上就红。端到端跑一遍真实使用路径必须是收官必经环节,不能测试全绿就发布
+- `snapshot-dereference-semantic-divergence` **快照 dereference symlink,导致可信侧量到的字节与实际交付的可达语义不是同一件事** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `fcc382a`
+  - 现象:cpSync dereference:true 把仓外 symlink 在快照里变成普通文件 → 快照 server 200、原地 server realpath 后 403:verify 全绿而交付页面坏。manifest 只记跟随链接后的内容 hash、不记 lstat 类型。附 Node 坑:cpSync 只在同时传 filter 时才真按 dereference 跟随
+  - 提案:输入树任何 symlink 一律 fail-closed(含内部链接/目录链接/悬空链接),检查点在建快照之前、三入口同一道门;快照函数自身再拦一次;manifest 改 lstat 记录并比较 {type,linkTarget};另加通用回归:每个页面可达资源断言原地 server 与快照 server 的 status+bytes 全等——检的是行为分叉本身
+- `reimplementing-third-party-glob-semantics` **复刻第三方(Tailwind)glob 展开语义被证伪四次,且对方没有稳定 API 可导出真实 file set** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `0f9ae55`
+  - 现象:自研展开先后死于字符类 [ab]、content.relative 基准错位、node_modules 非对称扫描、***/a** 语法差异;改用 fast-glob 后仍留三条残余;parseCandidateFiles 是包内私有 API 不是升级契约
+  - 提案:放弃自研,收回语义解释权——css.content 只接受显式仓内相对普通文件路径列表,转绝对路径传 --content 使 Tailwind glob===null,不变式 S ⊆ E = L 由参数结构保证
+- `own-dep-version-masked-by-host` **skill 自己钉错依赖大版本,错误被宿主项目碰巧装对的版本长期掩盖** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `6703047`
+  - 现象:package.json 把 typescript 钉成 ^7(README 与实现都要 5.x,TS7 移除了 Compiler API),因为解析时命中产品仓的 TS 5.9.3 而一直没暴露
+  - 提案:钉回 ^5.9 + 依赖一致性契约测试(package.json ⟷ 文档 ⟷ 实现三处对齐)
+- `silent-skip-reads-as-pass` **测试静默 skip 让「因环境缺依赖没跑」与「跑过且通过」在汇总里长得一样** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `6703047`
+  - 现象:缺 QA_HIFI_MODULE_ROOT 时 42 条测试静默 skip,汇总看起来全绿
+  - 提案:fail/skip 语义分离,每条 skip 必带原因;隔离 fixture 让核心语义测试不依赖宿主碰巧装了什么
+- `gate-list-hand-duplicated` **防漏门的机制本身漏门——门列表被手写两份,两份都漏同一道门** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `3f51e60`
+  - 现象:verify 的 GATE_LETTERS 与 pr-block 的投影数组各写一份,两份都漏了门 E。靠调用点自觉传对 report 的设计必然出这种漏
+  - 提案:门字母⟷runner 唯一机读映射 + WeakSet taint(未标记 report 喂进渲染器直接 throw) + 唯一渲染器且签名里没有自报 report 参数——来源由参数结构决定
+- `unidirectional-manifest-blind-to-additions` **单向 manifest 对「验收期间新增一个页面可达文件」整类零感知** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `9000d5b`
+  - 现象:只走 snapshot→磁盘 的 walk 能抓删除与改写,抓不到新增;PoC 用的正是「加一个 late.js」
+  - 提案:双向 manifest:两侧都遍历,出块前再做一次收口检查
+- `exclusion-list-is-blindspot` **快照排除列表本身就是盲区——排除了但没禁止页面引用** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `96fbc08`
+  - 现象:排除 artifacts 目录却不禁止页面引用它 → 页面加载被排除目录里的脚本改掉绑定值,前后 hash 与 drift 全自洽
+  - 提案:整树快照 + 工具输出移到 demo 之外的 output root,让排除表为空
+- `check-use-window-toctou` **check 与 use 之间留窗口,被审对象可在观察期变对、退出即恢复** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `9000d5b`
+  - 现象:extractor 同步返回正确 truth 同时派 detached worker,在观察期改对页面,verify 一退出即恢复 → 全门绿而交付页面错;门 X 同款:hash 算完仍按同一路径 spawn
+  - 提案:核心观察全部前移到执行 demo 代码之前 + 不可变整树快照 + 前后双向 drift;门 X 执行已 hash 字节的副本
+- `hash-binds-wrong-quantity` **hash 锁住的量不是要证明的量(内容指纹≠校验和;只锁输入不锁产物)** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `a54fd40`
+  - 现象:esbuild [name]-[hash] 是内容指纹,保留文件名覆盖 PNG 字节全链绿;改 tailwind plugin 让 CSS 不重建则旧 CSS 照过。同一根因两次落地:派生资产字节复算 a54fd40、CSS 字节复算 bc8724e
+  - 提案:全部 outputFiles 路径→字节双向映射复算 + CSS 字节复算
+- `sentinel-evidence-forgeable-single-point` **单点哨兵证据(全局布尔/只读封印)总能被伪造或预占** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `fc48f38`
+  - 现象:证据放公开可写 globalThis 布尔量 → 页面自己置 true;改闭包私有+freeze 后被「探针安装前预占同形假封印」绕过。追三轮才承认单点不可守
+  - 提案:不依赖单点——可信侧 bundle 字节复算 + pageerror + nonce 回应三层叠加
+- `self-reported-evidence-trusted` **验证方直接读被审方产生的 report 放行,手写 report 即可伪造全绿** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: landed,commit `8084ea7`
+  - 现象:pr-block 读 demo 的 report.json 决定附贴块 → 手写 report 不跑 verify 就能打出「真组件直渲」;同形状在门 E 复现(手写 report-pixel.json,baseline 甚至非 PNG)。加字段校验无用,必须换证据来源
+  - 提案:pr-block 亲自 spawn canonical verify / pixel-compare 重跑全门,报告写到 demo 之外;demo 自报降级为仅对账
 - `drift-check-per-demo-manual` **漂移检查只能逐 demo 手跑,demo 一多必然漏检** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: landed,commit `b173ced`
   - 现象:10 个 demo 要手跑 10 次 --check;预检未挂,产品常量一改全部静默过期
   - 提案:truth.mjs --check --all <root> 批量 + 挂进 cindy-pr-preflight
@@ -30,6 +72,18 @@
 
 ## 无法自动化(by-design,只计数观察)
 
+- `static-reachability-is-detection-not-proof` **页面引用的静态可达性扫描是检测,不是证明** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:能抓常见的「引用了不该引用的文件」,不穷尽(动态拼接 URL、运行期注入)。价值是抬高成本,不是关闭它
+- `no-os-level-sandbox` **未做 OS 级沙箱,Node vm 不是安全边界** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:整条防伪链的威胁模型是「审自己团队的 PR,防无心漂移与省事造假」,不是「跑不可信代码」。残余风险:父 verify 退出之后才改磁盘仍抓不到,主防线是「核心观察全部早于执行 demo 代码」
+- `sentinel-proves-invocation-not-pixels` **哨兵证明「该导出被调用过」,不证明「屏幕上的像素来自该组件」** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:组件内部再套一层假 UI 这类情形仍需人工 review。工具不宣称自己做到了做不到的事
+- `pixel-baseline-provenance-unprovable` **门 E 基准图「是否真是产品截图」工具无法证明** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:工具能保证基准字节被 hash、比对来自可信侧、WARN 裁决绑定三图 sha256 与本次现算的 key/diffRatio/threshold;但这张 PNG 来源于产品沙盒只能靠采集时的授权与人证
+- `asset-gate-override-is-policy-request` **资产体积抬闸的 overrideReason 是作者的政策请求,挡不住抬到 999MB** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:机制只保证抬闸这件事及其理由会出现在 PR 上被人看见,不构成体积上限保证。真正的闸是 reviewer 签核
+- `custom-gate-semantics-unprovable` **门 X 只能证明「精确 hash 的入口脚本被可信 runner 执行且 exit 0」,不证明脚本业务语义正确** — 出现 1 次,首见 2026-07-31,最近 2026-07-31,status: tracked
+  - 现象:一个永远 exit 0 的自定义门会一路绿。工具只承诺执行链完整(入口脚本字节被锁、由可信副本执行、退出码进链),语义正确性属于 reviewer 读脚本的范围。注意边界:scriptSha256 只绑入口那一个文件、不绑它整棵执行依赖树(兄弟模块的字节一致性由「exec 树 ≡ 冻结 manifest」另行保证)
 - `cross-engine-pixel-compare-infeasible` **web 基准图与原生端截图直接像素比对不可行,基准必须分端存** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: tracked
   - 现象:2026-07-30 调研确认:无任何活跃开源项目做跨渲染引擎直比;Playwright 官方文档明示连同引擎跨 OS 都要分快照;根因=字体渲染/Yoga 取整/阴影实现三套/OS chrome。正确姿势:truth 跨端共享,基准 baselines/{web,electron-mac,electron-win,ios,android} 分端,跨端一致性断言放几何/属性层
 - `html-to-native-no-mechanical-path` **结构级 HTML→四端机械转换原理性不存在,agent 双改即业界最优** — 出现 1 次,首见 2026-07-30,最近 2026-07-30,status: tracked

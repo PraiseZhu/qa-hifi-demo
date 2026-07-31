@@ -6,9 +6,13 @@
   },
   "dependencies": {
     "css-to-react-native": "^3.2.0",
+    "odiff-bin": "^4.5.0",
     "pixelmatch": "^7.1.0",
     "pngjs": "^7.0.0",
-    "odiff-bin": "^4.5.0",
     "postcss": "^8.4.0"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.9"
   }
 }

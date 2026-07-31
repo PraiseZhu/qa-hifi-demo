@@ -44,6 +44,179 @@ node scripts/init.mjs --dir <demo-dir> --name <slug> [--pr <n>]
 skill 安装位置）、index.html（demo-shell + 内联标准 qa-chrome 运行时）。已存在的文件拒绝覆盖。
 chrome 运行时升级：`node scripts/init.mjs --dir <demo-dir> --update-chrome`（只换标记段）。
 
+#### P0 组件模式（真组件直渲，可选路线）
+
+```bash
+node scripts/init.mjs --dir <demo-dir> --name <slug> --mode component \
+  --entry <组件入口，相对 repoRoot> [--entry-export <目标组件导出名>]
+```
+
+不带 `--mode` 就是**经典模式**（手写 HTML 复刻界面，默认路线，行为不变）。组件模式把
+demo 本体换成 **esbuild 打包的真实产品组件**：界面不再手写，因此「文案/色值手抄漂移」和
+「复刻状态机 ≠ 产品状态机」这两类盲区从根上消失。多生成的产物：
+
+| 产物 | 作用 |
+|---|---|
+| `build.mjs` + `component-build-core.mjs` + `repo-glob.mjs` | 构建器**薄壳 + 规范正本**：core 读 `spec.component` → esbuild bundle（shim/包/`@/` 三级 alias）+ 输入清单；`build.mjs` 只负责落清单 + 图片落 `assets/` + 可选 tailwind CSS（产物 `assets/component.css` 的字节由门 A 的 `--check-css` 可信侧重编复算，r6）。三份都是 skill canonical 的逐字节拷贝，改写任一份 → 门 A fail-closed「检测到自定义构建器，需人工审查」 |
+| `src/bootstrap.tsx` | 装配入口：import 真组件，`Object.assign(window.__qaDemo, { states, mount, inject, onPrefs })` |
+| `shims/`（README + `_template.ts`） | 替身层骨架与硬规 |
+| `index.html` | 组件壳：内联 adapter 标记段 + `<script src="assets/component.bundle.js">` |
+| `component.inputs.json`（build 产出） | esbuild `metafile` 规范化输入清单：`productInputs`（相对 repoRoot）/ `demoInputs`（相对 demo）/ `buildInputs.{demo,product}`（构建期文件 / tailwind config **及其 `content` 显式声明的每个文件**（r7：显式列表，非 glob） / alias 读过的 package.json）/ `entryExport` / `entrySentinel` / `skippedExternal`。清单里每个输入 + 清单自身逐文件 sha256 进防伪链；缺清单 = `NO_MANIFEST` fail-closed。**清单不是自证的**：门 A 与 `pr-block` 都跑 **skill 仓自己那份** `component-build-core.mjs --check-inputs` 用 esbuild 现算一遍再全等比对——复算路径上**不执行 demo 目录里的任何代码**，「先缩清单再重跑 verify」「把 build.mjs 换成回显旧清单的脚本」都当场被抓。该声明由两道机制共同兜住（r4）：复算子进程解析构建期依赖时**候选目录只有 `QA_HIFI_MODULE_ROOT` 与 repoRoot**（绝不含 cwd/demo 目录——否则 `<demo>/node_modules/esbuild` 的顶层代码会在 import 时执行）；且 demo 目录及任意子目录**只要存在 `node_modules` 就 fail-closed**「demo 目录不应自带 node_modules，检测到依赖目录，拒绝——demo 自身不装依赖」（demo 侧依赖既不入哈希链、也不在构建期文件对照表里，是绕过具名 hash 的侧路）|
+
+**「真组件直渲」不靠声明，靠运行期哨兵 —— 而且只认你声明的那个导出。**
+只证明 `entry` 在 `metafile` 输入里是不够的：`import '<entry>'` 这种副作用导入同样让它进图、
+hash 入链，而界面完全可以是 bootstrap 手搓的。构建期给 `entry` 的导出套调用探针，真被调用/
+实例化（React 调函数组件、`new` 类组件、`memo`/`forwardRef` 的 `render`）时置位；verify 在
+门 B 挂载完成后、第一个状态断言前查一次。
+
+**哨兵证据由可信侧观察，不靠 demo 侧提供的形状（r5）**：置位与计数留在 bundle 的模块闭包里，
+对外只暴露一个 `writable:false` / `configurable:false` 的全局 `__QA_ENTRY_SENTINEL__`。
+r3 曾把证据放在可写全局 `__QA_ENTRY_RENDERED__` / `__QA_ENTRY_TARGET_RENDERED__` 上——
+「只持引用不调用 + 把布尔量写 true + 手搓 UI」当时能拿到 `proved`；r4 改成封印形态校验
+（不可写 / 只读访问器 / 对象已冻结）后，**这套形状本身是公开可仿造的**：index.html 在 bundle
+之前抢先 `defineProperty` 一个同形封印（不可配置的 `snapshot` getter），真 bundle 的
+`defineProperty` 抛错、verify 又不听 `pageerror`，于是读到的是假证据。r5 起多层叠加、r6 再加一层，全部落在可信侧（真正的安全锚是前三条字节/异常层，
+第四条只是形态检查）：
+
+* **全部 esbuild outputs 字节全等复算（I-ESBUILD）**：门 A 跑 skill 仓自己那份 `component-build-core.mjs --check-outputs`
+  （`write:false`，不落产物、不执行 demo 目录里的任何代码）现算一遍期望产物，与磁盘上的
+  `assets/component.bundle.js` **以及每一个 file-loader 派生产物**（图片 / 字体，`[name]-[hash]`）做「路径 → 字节」逐项全等比对。伪造方要过这关就得提供一份**字节全等的真
+  bundle**，而真 bundle 里的哨兵是真的；顺带堵死一切手改 bundle（塞手写 UI / 摘哨兵）与**派生资产同名换字节**（r7 条目 3：`[hash]` 是 esbuild 的内容指纹**不是密码学校验**，只复算 JS 时它字节全等）。
+* **`pageerror` fail-closed**：verify 监听页面未捕获异常，哨兵断言处非空即硬失败——预占封印
+  导致真 bundle 初始化抛错的场景在这里直接暴露（bundle 初始化**故意不 try/catch**）。
+* **CSS 字节全等复算（r6 条目 1）**：同型的一条 —— 门 A 跑 `component-build-core.mjs
+  --check-css`，用**产品仓的 tailwind config** 把 CSS 重编到临时目录，与磁盘上的
+  `assets/component.css` 做 sha256 全等比对（未配 tailwind 时期望值是共享常量
+  `CSS_PLACEHOLDER` 的字节）。r5 之前 CSS 产物**全仓没有任何字节复算**：`buildComponentHashes`
+  / `buildAssetsManifest` 只把它的字节记进清单做「report 是否过期」检测，于是合法构建后
+  手改 `component.css`（改样式 / 删规则 / 插任意 CSS），只要不动入链的输入文件，
+  verify / pr-block 全流程零检测通过。同输入编译两遍字节不等 → 直接 fail（不静默容忍
+  不确定性）；产品仓没有 tailwindcss CLI → fail-closed 拒绝放行，不是静默跳过。
+* **`prove(nonce)` challenge —— 形态检查，不是安全锚（r6 校准）**：封印上有不可写/不可配置的
+  `prove(nonce)`，verify 每次运行生成随机 nonce 并要求回应原样带回。**它只是一次 nonce
+  回显**：nonce 由 verify 通过页面求值传进去，页面里的任何函数都能收到并原样返回，
+  所以它**不构成 secret**，也不构成「哨兵是真的」的证明 —— 审核人与 r5 修复者独立得出同一结论。
+  它的实际作用只是把「静态预置一份冻结对象」抬高成「必须写一个真函数」，而真函数躲不过
+  上面的字节复算与 `pageerror`。**真正的锚是「全部 esbuild outputs 字节复算 + CSS 字节复算 + `pageerror`
+  fail-closed」这三条。**
+
+封印形态校验与 `prove` 回应仍在（不可写 / 只读访问器 / `prove` 形态 / 对象已冻结），
+但它们只是形态检查，**不是安全锚，也不是结论强度的来源**。
+
+判定分三种（`manifest.entrySentinel`）：
+
+| 形态 | 触发条件 | 结论 |
+|---|---|---|
+| `targeted` | 声明了 `component.export` 且探针就位 | 目标导出被调用 → `entryRenderProof='proved'`，PR 块写「真组件直渲」；目标可探测却一次没被调用 → **门 B 硬失败**并点名（报文区分「只调了其它导出」与「纯 side-effect import」） |
+| `active` | 未声明 `component.export` | 只保留「一个导出都没被调用 → 门 B 失败」这条硬失败；最高只到 `nontarget`，**PR 块一律降级** |
+| `unavailable` | 探针完全套不上（`entry` 不是 JS/TS、无任何导出、或声明的目标导出是常量/纯数据） | 不判造假（避免误伤），PR 块降级 |
+
+声明了 `entry` 里**不存在**的导出 → `build` 直接 exit 2 并列出真实导出名（错误声明不许静默
+降级）。另有 tree-shake 护栏：`entry` 在图里但 `bytesInOutput` 为 0（只被 `import type`、
+或导出全未被引用且无副作用）→ build exit 2。
+
+诚实边界（不隐瞒）：
+* 不声明 `component.export` 就**永远拿不到**「真组件直渲」这句话，PR 块只会写「产品模块已打包
+  （N 个源文件 hash 入链）｜⚠️ 运行期哨兵未证明「声明的目标组件导出被渲染」…是否为 UI 组件需
+  人工审查」。这是 r3 收紧的点：r2 只要 `entry` 的**任一**导出被调用就宣称直渲，于是
+  「entry 同时导出组件与工具函数、bootstrap 只调工具函数 + 手搓 UI」能骗到 ✅。
+* 探针只能套函数/类/`memo`·`forwardRef`；`export *` 转出的名字拿不到，不套探针。
+* 工具**不**证明「渲染出来的像素来自该组件」——它证明的是「该导出被调用过」。组件里再套一层
+  假 UI 这类情形仍需人工 review；工具不宣称自己做到了做不到的事。
+
+`spec.json` 多一个 `component` 段：`mode:"component"` / `entry`（必须是 bootstrap 真正
+import 渲染的组件——build.mjs 用 esbuild `metafile` 核对，不在 bundle 真实输入里就 exit 2）/
+`export?`（目标组件导出名，默认导出写 `"default"`；**拿到「真组件直渲」结论的唯一途径**，
+不填只会降级、填错直接 exit 2）/
+`sources[]`（可选的人读声明；代码层防伪链的真相源是 build 生成的 `component.inputs.json`）/ `bundle` / `bootstrap` / `assetsDir` / `rendererRoot` / `packageRoots` /
+`shims[{spec,file,why}]` / `css`（配了 `css` 就**必须**显式声明 `css.content` 非空数组——r4 起
+省略/空数组一律 schema + build 双重 fail-closed，因为不显式声明时 Tailwind 会按
+`tailwind.config.js` 里的 `content` **隐式扫描**，那些样式源文件不进防伪链，改了 hash 不变、
+旧 CSS + 旧 report 照过；build 始终用显式 `--content` 覆盖 config。
+
+> **⚠️ 破坏性变更（r7 条目 2）：`css.content` 只接受「显式的仓内相对普通文件路径」列表，
+> 不再支持 glob 与目录。** 旧 spec（如 `["src/**/*.tsx"]`）会在 schema / build / verify 入口
+> 直接被拒并附迁移指引。迁移方式：
+> `node scripts/lib/component-build-core.mjs --suggest-content "src/**/*.tsx" --demo <dir>`
+> 把旧 glob 展成建议清单，**抄进 spec.json**（生成器只是便利工具，运行期一律不做展开）。
+> 逐项校验分两层（r7 条目 5 修正）：**① 路径安全** —— 非空、无 NUL、非绝对路径、无 `..`、无空段、默认拒 `node_modules/` 与 `.git/` 下的路径；**② glob/transport 形态** —— 只拒
+> 「Tailwind 自己会当 glob 解释的形态」：`*`、成对 `[...]`、成对 `{...}`、extglob 前缀
+> `+( @( !( ?( *(`、反斜杠；外加 `,`（`--content` 是逗号分隔多值串，承载不了）与 `?`
+> （**意图信号**，实测它在文件名里是字面的）。再加 fs 层的「存在 + 必须是
+> regular file + realpath 落在 repoRoot 内」（挡 symlink 越狱）。声明不存在的文件 = exit 2
+> （等价于旧「glob 零命中」：CSS 会按更小的集合编译却不被发现）。
+> **为什么收紧到这个程度**：自研 glob 展开已被证伪四次（字符类 `[ab]` → `content.relative`
+> 基准错位 → `node_modules` 非对称扫描 → `***`/`a**` 语法差异），r6 改成复用 fast-glob 后仍留
+> 三条残余；而 Tailwind v3 **没有公开稳定的 API/CLI 能导出真实 file set**
+> （`parseCandidateFiles` 是包内私有 API，不是升级稳定契约）。所以把语义解释权收回来。
+> **不变式 `S ⊆ E = L`**（实扫集 ⊆ 期望集 = 入链集）由**参数结构**保证：content 转成绝对
+> 文件路径传 `--content`，Tailwind 对绝对文件路径给出 `glob === null`，扫描集就是那些文件
+> 本身；CLI override 之后 `config.content` 与 `config.content.relative` 都不再决定集合。
+> 参数构造两侧共用构建核心的 `contentCliArg`（薄壳 build 与可信侧复算必须逐字节一致，
+> 否则 CSS 字节复算会误杀合法产物）。受限 glob 白名单仍在，但只服务 `component.sources`
+> 等其它 glob 用途，不再管 content。
+
+不需要 tailwind 就把 `component.css` 设为 `null`） / `themeVars.truthPath` /
+`fixtures[{id,why,shape?}]` / `target?`。**没有 `component.driver`**——状态怎么被驱动只写 `states[].driver`
+（`"inject"` / `"via"`，单一真相源）。adapter 升级：
+`node scripts/init.mjs --dir <demo-dir> --update-adapter`（与 `--update-chrome` 同机制）。
+
+**`__qaDemo` 组件模式合约**（adapter 校验，不符当场抛错，不给静默空白页）：
+
+| 字段 | 谁提供 | 语义 |
+|---|---|---|
+| `mode: 'component'` | index.html 基础段 | 组件模式标记 |
+| `name/pr/summary/matrix/defaultPrefs/initialState/tabStates/adaptive/scale` | index.html 基础段 | 与复刻模式逐字一致 |
+| `states` | bootstrap | 键 ≡ `spec.states[].id`，每项 `{ driver: 'inject' \| 'via' }`；`via` 型不许进 `tabStates` |
+| `mount(ctx)` | bootstrap | **只调一次**，把真组件挂到 `ctx.root`（adapter 在 `.frame` 内建的 `.qa-component-root`） |
+| `inject(id)` | bootstrap | `driver:'inject'` 状态必填；幂等（挂在 `onEnter`，首帧 `initialState` 也会走一遍） |
+| `onPrefs(prefs)` | bootstrap（可选） | 非主题偏好（lang/region/os/plat）；**主题由 adapter 接管** |
+| `renderApp` | adapter 合成 | bootstrap 自带 `renderApp` = 直接抛错 |
+
+内联顺序硬性：`#qa-truth` → 基础配置段 → `assets/component.bundle.js` → adapter → qa-chrome。
+adapter 必须在 bundle **之后**（它读装配好的 `mount`/`states`）、qa-chrome **之前**
+（它要先把 `__qaDemo` 补成 chrome 能吃的形状）。
+
+**什么时候用组件模式**——只用于「干净边界的组件面」，选之前先做 **coupling 侦察**：
+
+1. 组件 render 期是否碰 IPC / 网络 / 原生能力？碰得越少越适合（登录页这类是理想对象）。
+2. 需要 shim 的依赖清单有多长？每条 shim 都要写得出 `why`；清单发散说明边界不干净，退回经典模式。
+3. 状态是否可从外部驱动？组件局部 `useState` 的子视图只能经真实交互到达——在
+   `spec.states[]` 里标 `driver:"via"` 并写全 via 链路（schema 硬要求），
+   `__qaDemo.states` 同键同标；adapter 对它的 `goto` 显式 throw，门 B 走 via 重放取证，
+   不许假装可直达。
+4. 界面数据是否都在源码里？只在服务端响应里存在的数据（登录方式配置、成员列表等）
+   **没有源码 provenance**，写进 `component.fixtures[]` 如实声明，不许塞进 `truth.json`。
+
+**适用范围限定（spike 结论，别越界）**：
+
+- **移动端 / RN 组件不在范围**：需要 react-native-web，维持经典模式；`--mode component`
+  生成的 matrix 因此只留 `desktop`。
+- 保真度让步要如实记进 PR：`null` / 稳态 shim 造成的缺席（如窗口按钮）需要 pixel 基准 mask。
+- 主题走**主题桥**：色值由 `extract.mjs` 用 `extractThemeVars()` 提到 `truth.themeVars`
+  （逐 token 带 provenance），运行时由 **adapter** 复刻产品 `applyTheme` 语义
+  （重写 `style#theme-vars` + 切 `html.dark` + `colorScheme`）。bootstrap 不碰主题，
+  更不许手写色值。`themeVars` 两种合法形状：token 优先
+  `{ '<token>': { light, dark } }`（`extractThemeVars` 的输出，推荐）或 mode 优先
+  `{ light: { '<token>': v }, dark: {...} }`；缺失/空则主题桥如实关闭（不假装应用了主题）。
+- 资产不内联：图片走 file loader 落 `assets/`（全内联实测让单文件涨到 10MB 级，仓里不可接受；
+  xd-pages 本来就部署整个目录）。产品原始美术资产可能单张就几 MB（登录 hero@2x 实测 3.8MB），
+  `assets-manifest.mjs` 默认 8MB 闸门会拦——**要么压图/换 webp，要么显式
+  `--max-total <MB> --override-reason "<理由>"` 抬闸**；理由是必填参数（缺了直接拒），
+  会自动印上 PR 附贴块，闷着抬这条路已经堵死。
+- **「整窗级组件」的帧语义**（2026-07-30 集成实测）：组件若用 `window.innerWidth/innerHeight`
+  自量尺寸、或用 `position: fixed` 铺全屏 overlay（登录屏就是），它的几何公式以 **viewport**
+  为基准，而 chrome 工具区占了上方空间、`.frame` 比 viewport 小——两者不一致会让门 C 报
+  「溢出 viewport」。两条路都可以，但要选一条并写清：
+  ① **让组件铺满 viewport**（推荐）：不给组件根建包含块，产品公式在真实 viewport 里运行
+  （几何与真实 App 同源），demo 侧把 chrome 抬到 overlay 之上（`.qa-chrome{position:relative;
+  z-index:100000}`）；代价是 `.frame` 对这类组件只是名义边框，像素基准要按 viewport 取。
+  ② **把帧当窗口**：给组件根 `transform: translateZ(0)` 建包含块把 fixed 收进帧内；
+  但组件读 `window.innerHeight` 时仍是整窗值，须自行对齐，且门 C 的 viewport 判定会与
+  帧偏移打架——只适合不读 window 尺寸的组件。
+- 门语义变化：组件内部的门 D 绑定失去意义（值没有手写环节），门 D 收缩为只验 chrome 工具区；
+  门 A 需把组件源文件 hash 计入防伪链。
+
 ### P1 真值提取（杜绝手抄）
 
 1. 和用户确认 demo 覆盖范围：哪个功能、哪些端/区域/语言/主题（写进 `spec.json` 的 `matrix`）。
@@ -61,6 +234,45 @@ chrome 运行时升级：`node scripts/init.mjs --dir <demo-dir> --update-chrome
    （demo 从 `_tmp/` 迁 `docs/design-previews/` 后 repoRoot/provenance 前缀全断）。
 3. 跑 `node scripts/truth.mjs --demo <dir>` 生成规范化 `truth.json`。
    **禁止**：demo 里出现任何不在 truth.json 里的界面文案/几何/颜色值。
+
+#### 服务端驱动数据（fixture 叶子）
+
+有些值**源码里根本没有字面量**——模型供应商配置、账号 membership、后端下发的开关等，
+只存在于服务端响应里。这类值用 `makeFixtureLeaf()`：把真沙盒响应存成 demo 内
+`fixtures/<name>.json`，叶子记 `provenance.sourceKind: 'fixture'` + 结构化 `capturedFrom`。
+
+```js
+import { makeFixtureLeaf } from './extract-helpers.mjs';
+const fx = readJson('fixtures/providers.json');
+providers: fx.data.map((p, i) => makeFixtureLeaf(p.displayName, 'fixtures/providers.json', {
+  locator: `data.${i}.displayName`,                 // 受限 JSON 路径,会被真解析
+  capturedFrom: {
+    environment: '公司沙盒',                          // 必填
+    capturedAt: '2026-07-30',                        // 必填,ISO 日期开头
+    endpoint: 'GET /api/providers',                  // 可选
+  },
+}))
+```
+
+规则：
+
+- fixture 文件必须落在 demo 内 `fixtures/` 下并随 PR 入库——reviewer 打不开的 fixture 等于没有溯源；
+  存在性 + hash 校验与 `code` 叶子完全一致（fixture 是**声明性降级**，不是防伪豁免）。
+- **`locator` 必须是可机械解析的 JSON 路径**，三种写法：`data.0.displayName`、
+  `data[0].displayName`、JSON Pointer `/data/0/displayName`。自由文本（`'第 0 个 provider 的名字'`）
+  一律 FAIL——不可解析的锚等于没有锚。
+- **值绑定（硬校验）**：工厂函数与门 A 都会解析 fixture 文件、按 locator 取值，与叶子 `value`
+  做 canonical 比对，不符即 FAIL。整文件 hash 只能证明"fixture 没被改过"，证明不了
+  "叶子里的值真出自这份 fixture"——少了值绑定，fixture 就是手抄数据的免检通道。
+- `capturedFrom` 必须是结构化对象 `{ environment, capturedAt[, endpoint, note] }`；
+  `capturedAt` 必须是真日期（ISO 开头）。旧的一句话自由文本已不接受——它没有任何可机械
+  检查的成分，"沙盒响应"四个字就能过，三个月后没人判断得出这份 fixture 还代表不代表真实服务端。
+- **禁止用 fixture 冒充可源码提取的值**：布局常量、i18n 文案、颜色 token 一律 `makeLeaf()` 走源码。
+  ⚠️ **这一条工具证明不了**——机械校验只能确认"值确实来自这份 fixture"，无法判断"这个值本来
+  可以从源码提取却偷懒录了 fixture"。它属**人工审查边界**：reviewer 看到 fixture 声明行时，
+  要自己核一遍这些值是不是真的只存在于服务端响应里。
+- 门 A 语义不变：fixture 文件是 extract 的输入，`extract.mjs` 现跑仍须≡`truth.json`。
+- PR 附贴块会自动加一行 `⚠️ N 个叶子来自录制 fixture（非源码溯源）`——不阻断，但对外诚实。
 
 ### P2 生成 demo（LLM 自由区，但守合约）
 
@@ -85,17 +297,349 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
 （历史事故:全量 verify 超时把整轮验收堵死,obs 16320）。任一过滤参数出现 →
 `report.partial=true`，**pr-block 一律拒收 partial 报告**——增量只用于调试，定稿必须全量重跑。
 
+**pr-block 定稿前会在可信侧亲自重跑（r5 立规、r6 补上门 E）**：`report.json` 整份都住在 demo 目录里、
+是被审方可写的，而 `inputHashes` 是用**可导出的** `buildInputHashes()` 对被审方自己控制的文件
+现算的——天然自洽，锁不住任何东西。所以「正常 build + 只持引用不调用 + 手搓 UI + **完全不跑
+verify** + 手写一份全 pass 的 `report.json`」曾能让 pr-block exit 0 并打出「真组件直渲」。
+r5 起 pr-block 用 **skill 仓自己那份 `verify.mjs`** 重跑 A/B/C/D/F/X（`--report-out` 写到 demo
+之外，不覆盖作者的 `report.json`），**以自己重跑的结果为唯一放行依据**；demo 的 `report.json`
+降级为仅供对账的自报材料——两者在 `ok`/`partial`/`entryRenderProof`/A·B·C·D·F·X 六门 pass/`gateB`·`gateD`
+计数/coverage case 集上不一致即阻断。代价是定稿时会多跑一次浏览器验收（已有其它 problems 时
+跳过重跑）。
+
+**门 E 不在 `verify.mjs` 里**（`GATE_LETTERS = A/B/C/D/F/X`），r5 的可信重跑因此**漏掉了它**
+（r6 条目 2 CRITICAL）：门 E 当时的唯一校验是 `validatePixelForPr`，它全是
+`report-pixel.json` 自身字段的算术自洽（`diffRatio === bad/total`、`threshold === spec` 声明值、
+`bad <= total`、`engine` 枚举、WARN 需 adjudication + 存在的 artifact 图），**从不重新调用
+odiff/pixelmatch 对真实图片比对**。于是手写一份满足全部自洽约束的 `report-pixel.json`
+（`inputHashes` 用可导出的 `buildInputHashes()` 现算）就能让门 E 判通过 —— 基准图甚至可以
+不是 PNG，视觉回归被伪造成 PASS。r6 起：`spec.baselines` 非空时 pr-block **亲自 spawn skill
+自己那份 `pixel-compare.mjs`**（`--report-out` 写到 demo 之外），以可信结果为放行依据；
+可信结果同样过一遍完整校验（阈值 / 计数 / engine / WARN 裁决与 artifact 全绑在这份上，
+artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自报做结论对账
+（`ok`/`skipped`/`declared`/`threshold` + 每个基准的 `status`；`bad`/`total` 因重新渲染有
+像素级抖动，不做全等以免假阴性）。
+
+### 三层不变式（r7 收口，写死）
+
+组件模式的验收结论只建立在这三条上。**三者同时成立**才可以表述：所有影响组件渲染的构建产物，
+要么是可信工具当前输入的确定性输出、要么验收失败；demo 自报与磁盘最终 hash 不再充当
+"发生过可信构建 / 观察"的证明。
+
+| 不变式 | 内容 | 落地位置 |
+|---|---|---|
+| **I-ESBUILD** | 磁盘上 bundle + **所有 file-loader outputs** 的「路径 → 字节」映射，必须等于 canonical `write:false` 现算映射 | `component-build-core --check-outputs` + `recheckComponentOutputs`（门 A） |
+| **I-CSS** | 磁盘 `component.css` 字节必须等于 canonical 临时重编字节（同一 Tailwind 实现 / config / cwd / input / content / 受控 env） | `--check-css` + `recheckComponentCss`（门 A） |
+| **I-OBSERVE** | **观察对象必须等于交付对象**：所有核心观察(门 B/C/D/F 的浏览器实测 **与门 E 的像素比对**)都从**同一份整树不可变 snapshot** 取文件，且这份 snapshot 与交付树逐条**同类型同字节** —— 因此 demo 输入树里**不许有任何 symlink**（前置门 `checkDemoNoSymlinks`，r9 P0）；三项字节复算与这些观察**绑定同一份快照字节** —— 快照先建，复算随后，紧邻一次**双向 manifest** 证明 snapshot ≡ 磁盘；全部发生在 demo `node_modules` fail-fast 之后、**任何 demo 可执行脚本之前**；出块前再做一次双向 manifest | `lib/observe.mjs`（verify 与 pixel-compare 共用一份实现）+ `fs-utils.checkDemoNoSymlinks`（verify / pr-block / pixel-compare 三处同一道前置门）+ verify 的执行时序；次序与实现由 `comp-fix-r8` / `comp-fix-r9` 源码契约锁死 |
+
+**I-ESBUILD 为什么必须覆盖派生资产（r7 条目 3，实测 P0）**：r5 只复算 JS 字节。组件真实
+`import hero.png` 时 esbuild 的 file loader 会落出 `assets/hero-XMUUP4P7.png`；审核人实测把它
+**原地覆盖成另一张图但保留原文件名** → JS 里引用的还是同一个名字（bundle 字节仍全等）、
+`inputHashes.assets` 是对攻击后字节现算的（天然自洽）、文件名里的 `[hash]` 只是 esbuild 的
+**内容指纹不是密码学校验** ⇒ `verify=0`、`pr-block=0`，仍贴「真组件直渲」。我在 256dff4 上
+复现了这一结果，修后同一攻击 `verify=2` / `pr-block=2` 并点名具体产物。
+缺失 / 字节不等 / 换名一律门红；**不在 expected 集合里的额外 assets 不阻断**（作者可能手工放图），
+但会列进 `gateA.outputsRecheck.extraAssets` 供人核对 —— 拦它会误杀合法用法，不列出来则无从发现。
+
+### 执行时序原则（r7 条目 1 CRITICAL，写死）
+
+**「可信侧重跑」成立的前提是：canonical runner 自己不能在核心观察之前执行被审方的代码。**
+r5/r6 一直漏了这一条 —— r6 的 verify 次序是「跑 demo `extract.mjs` → 三项字节复算 → 启浏览器
+跑门 B/C/D/F」，于是 demo 代码拿到了**整个观察窗口**：`extract.mjs` 同步返回**正确** truth
+（门 A extractor drift 绿），同时派一个 `detached`+`unref` 的 worker，在父 verify 存活期间把
+永久错误的 `index.html` 临时改成与 truth 一致（门 D 实测**绿**），父进程退出瞬间恢复原错误
+文件。最终磁盘字节与 `inputHashes` 完全自洽 —— verify exit 0、门 D 判过。
+
+r7 起的次序（**禁止调换，由 `comp-fix-r7` 源码契约测试锁死**）：
+
+0. demo `node_modules` fail-fast（无条件，排在任何 demo 输入解析 / 动态 import / 子进程 / 浏览器之前）；
+1. 观察前算一次 `inputHashes`；门 A 的纯静态段（内嵌 `qa-truth` ≡ `truth.json`、页面不得引用快照之外的路径）；
+2. 建立**整树**不可变快照（demo 之外的临时目录，`lib/observe.mjs`）。**所有**核心观察的唯一来源：
+   门 B/C/D/F 的浏览器实测**与门 E 的像素比对**都从它取文件（门 E 连 baseline PNG 也从快照读）；
+3. 三项可信侧字节复算（`--check-inputs` / `--check-bundle` / `--check-css`），跑 skill canonical、不执行
+   demo 代码；
+4. **双向 manifest 绑定检查点**（`gateA.observeBinding`）：证明第 3 步读到的磁盘字节 ≡ 第 2 步的快照字节。
+   这就是「复算与 B/C/D/F/E 绑定同一份字节」的落地方式，同时堵掉「建快照与复算之间有并发写入者」这个窗口。
+   为什么复算读磁盘而不是直接读快照：`component-build-core --check-inputs` 必须以 **demoDir 为 cwd** 跑
+   esbuild（metafile 的 key 相对 cwd，换 cwd 会改整份清单的规范化结果），且产品组件源码靠 demo 所在的
+   **git 仓根**解析 —— 快照住在 tmpdir、不在产品仓内，拿它当 cwd 会直接 `repoRoot=UNRESOLVED` 硬失败。
+   所以保留「磁盘产物 == canonical 现算」这个强命题，另加一层当场证明的 snapshot ≡ 磁盘；
+5. 浏览器门 B/C/D/F（全部核心测量），全部从快照加载；
+6. **之后**才执行 demo 侧代码：门 A 的 extractor drift 段 + 门 X 自定义门。门 A 的结论**延后合并**
+   （`gateAHardFail` 一票否决），extractor drift 这项检查不丢不降级；
+7. 再算一次 `inputHashes` 与第 1 步比对，不等即门 A 红；并做**收口双向 manifest**
+   （`gateA.snapshotDrift` / `gateA.snapshotManifest`）—— 此时测量结果本身仍可信（观察对象是快照），
+   但磁盘上的 demo 已不是被观察的那一份，PR 会带走另一个版本，必须报出来。
+
+**快照为什么必须是整树（r8 条目 A，P0，审核人可执行 PoC）**：r7 的快照带一张排除表（整个
+`verify-artifacts/`、`pixel-artifacts/`、三个 `report*.json`），而**没有任何东西禁止页面引用被排除的
+路径**。PoC：`index.html` 加 `<script src="pixel-artifacts/late.js">`，该脚本把门 D 绑定的 `.box` 宽度
+从正确的 `16px` 改成 `99px` → 快照里那个文件 404（门 D 在快照上量到 16px，**绿**）、交付原地却真的加载它
+（computed width = **99px**）；`snapshotDrift()` 当时只从快照一侧单向遍历，看不见被排除目录、也看不见
+运行期新增文件，于是报 `"none"`；`buildInputHashes` 同样不覆盖这两个目录。结果 **verify exit 0 /
+gateD.pass=true / pr-block exit 0 可出块**，而被验页面 ≠ 交付页面。同一根因还有两处组成性不一致：
+门 E 完全不走快照（直接 serve/read `demoDir` 与 baseline），三项复算针对原目录、快照后建。
+r8 的修法不是再加一条检查去挡引用，而是把盲区本身消掉：
+
+| 修法 | 内容 |
+|---|---|
+| 快照 = **整树** | 唯一跳过 `node_modules`（前置门已无条件拒，存在即 fail-fast）与 `.git`（不属交付产物，部署侧同样排除）——二者都**不是页面可达的交付字节**，因此不构成盲区。曾被排除的 `pixel-artifacts/` / `verify-artifacts/` / `report*.json` 现在全部进快照 |
+| 工具输出改到 **output root** | 失败截图与门 X/extractor 的可信脚本副本一律写到 demo 之外的 output root（`report.artifactRoot` 给出绝对路径，`failure.screenshot` 是相对它的路径）。demo 树里因此**没有本轮运行期写入**，双向 manifest 不需要任何按名豁免 |
+| **双向 manifest** | `snapshot→磁盘`（删除 / 字节改写）+ `磁盘→snapshot`（**新增**）都遍历。单向 walk 对「验收期间新增一个页面可达文件」这一整类零感知，而 PoC 用的就是「加一个 late.js」 |
+| 门 E 同源 | `pixel-compare` 建立同一种快照、服务快照、**baseline PNG 也从快照读**，比对期间 demo 树零写入，artifact 三图在自己的双向 manifest 通过之后才落盘（WARN 人工裁决按 demo 相对路径看图，这条路径契约不变） |
+
+页面**仍不得引用快照之外的路径**（只剩 `node_modules/` 与 `.git/` 两类，`gateA.refsOutsideSnapshot`）——
+这份检查从快照跳过项推导，不会漂移。
+
+**为什么 demo 输入树里一律不许有 symlink（r9 条目 P0，审核人可执行 PoC）**：整树快照用
+`cpSync(..., dereference: true)` 建立，这改变了 symlink 的**可达语义** —— 同一条链接在三处不一样：
+
+| 位置 | 对「指向 demo 之外的 symlink」的行为 |
+|---|---|
+| 快照侧（可信观察） | `dereference` 把链接目标的字节复制成快照内的**普通文件** → snapshot safe-server **200** |
+| 交付 / 原地侧 | safe-server 对 target 做 `realpath` 后要求落在 demo 根内 → **403**，交付页面上这个资源加载不到 |
+| 部署侧 | 行为不确定（可能 dereference、可能直接失效） |
+
+PoC：demo 原始 `.box{width:99px}`、truth/binding 期望 `16px`，`linked.js` 是**指向 demo 之外**的
+symlink，其目标 JS 把 `.box` 改成 `16px`，`index.html` 引用它。实测
+`verify exit = 0 / gateD.pass = true / gateA.observeBinding = "bound" / gateA.snapshotDrift = "none" / pr-block exit = 0`，
+而原地 safe-server 上 `linked.js` = **HTTP 403**、最终 computed width = **99px** ——
+**可信侧量到 16px 判绿放行，实际交付页面是 99px**。注意方向与 r8 的 `late.js` PoC 相反：那次是
+「交付比观察多」，这次是「观察比交付多」。
+
+修法三条：
+
+| 修法 | 内容 |
+|---|---|
+| **symlink 一律 fail-closed**（主修） | `fs-utils.checkDemoNoSymlinks` 属**前置门**阶段，与 `checkDemoNoNodeModules` 相邻、**排在建立快照之前**（快照一建起来就已经 dereference 过了，等快照建完再查就晚了）。verify / pr-block / pixel-compare 三处同一道门；门 E 的这道门还排在「`spec.baselines` 为空 → exit 0」早退分支之前。报错点名**具体路径 + 链接目标 + 403 vs 200 的语义差 + 修法**。`makeObservationSnapshot` 自身再拦一次，使「任何调用方都拿不到 dereference 过的快照」成为该函数的不变式 |
+| **含指向 demo 内部的 symlink 也拒** | 内部链接在 dereference 后同样变成普通文件、manifest 同样判不出差异，且部署侧对 symlink 行为不确定 —— 原地 / 快照 / 部署三处语义仍不一致。这是 fail-closed，不按目标位置分情况放行。`node_modules`（含 symlink 形态）归 `checkDemoNoNodeModules` 无条件拒，本门不重复点名；`.git` 跳过（不属交付产物） |
+| **manifest 记录 `lstat` 类型 + `readlink` target**（纵深） | r8 的 manifest 只比「跟随 symlink 之后的文件 hash」，于是「快照里的普通文件」与「磁盘上指向仓外的 symlink」被判**全等**（PoC 里 `snapshotDrift` 因此报 `"none"`）。现在 `entryKind()` 用 `lstat` 给出 `{type, linkTarget}`，`snapshotManifestDiff` 多报一类 `retyped`（条目类型不一致）；`listFilesRel` 也改用 `lstat`，不再跟随「指向目录的 symlink」走进去。即使将来某条路径绕过前置门，manifest 也不再瞎 |
+
+**双 server 一致性通用回归**（`comp-fix-r9`）：对每个页面可达资源，断言「原地 safe-server」（交付对象）
+与「snapshot safe-server」（观察对象）的 **status + bytes 都一致**。这是「观察 == 交付」的直接验证，
+**不限 symlink** —— 未来任何让两侧行为分叉的机制都会在这里翻车。回归里同时放了一条「对 PoC 形状真的会
+翻车」的对照，防止它退化成空转。
+
+> 实现坑（Node v24.13，已写进 `observe.mjs` 注释）：`cpSync` 只在**同时传了 `filter`** 时才真按
+> `dereference: true` 跟随 symlink；不传 filter 时链接会被原样保留。`makeObservationSnapshot` 正好传了
+> filter，所以这里的 dereference 是真生效的、P0 成立；任何要复现该形态的测试必须照样带 filter。
+
+> **⚠️ 破坏性接口约定（r9）**：现存 demo 里只要含 symlink（含指向 demo 内部的），升级后一律被前置门
+> 拒收，`verify` / `pr-block` / `pixel-compare` 全部 exit 2。修法：把这些 symlink 复制成真实文件
+> （`cp -L`，或直接把内容写进 demo），让 demo 树里只有普通文件。
+
+**门 X / extractor 执行可信副本（r8 条目 C）**：此前 `hashFile(scriptAbs)` 之后仍按**同一路径**
+`spawnSync`，不是原子执行已哈希的字节 —— hash 与 spawn 之间的写入者可以换掉文件，「精确 hash 的脚本
+字节被执行」这句话就不成立。r8 起把已 hash 的字节复制到 output root 再执行副本，并复算副本 hash 与源
+hash 比对，不等即拒绝执行。**接口约定（破坏性）**：被执行的是副本，所以 `extract.mjs` 与自定义门脚本
+必须用 `--demo <dir>` argv（两者都会收到）或 cwd（仍是 demoDir）定位 demo，**不能**靠
+`import.meta.url` 推断自己在 demo 里。
+
+> **r10 修正（整树副本）**：r8 复制的是**单文件**（`trusted-scripts/<hash12>-<name>`），而 ESM 的相对
+> `import` 按脚本自身位置解析 —— init 生成的官方 `extract.mjs` 模板第一行就是
+> `import { ... } from './extract-helpers.mjs'`，单文件搬走之后兄弟模块不在旁边，
+> `ERR_MODULE_NOT_FOUND`：**官方脚手架的推荐写法在可信路径下跑不通**（正式 e2e 抓到，十轮终审全漏）。
+> r10 起复制的是**整棵树**到 `trusted-trees-<hash12>-<rand>/`，脚本在树内的原相对位置执行，相对
+> `import`（含子目录）天然可用。树的字节取自**观察快照**，所以 (d) 不但保住还更强：mismatch 现在同时
+> 覆盖「磁盘字节 ≠ 快照字节」。每次调用开一棵新树、且不是快照本身 —— demo 脚本写自己所在的树时动不到
+> 已用于观察的那份快照字节（(a) 不回退）。
+> 作者侧接口不变：仍用 `--demo` / cwd 定位 demo，不要靠 `import.meta.url`（它现在指向 exec 树）。
+
+> **r11 修正（收口 oracle 换成分界线前冻结的内存 manifest）**：r10 的整树 exec 副本带来一个新攻击面 ——
+> 观察快照在 `<tmp>/qa-hifi-snapshot-*`、exec 树在 `<tmp>/qa-hifi-out-*` 下，**两者同处一个用户可枚举、
+> 可写的 `os.tmpdir()` 命名空间**。自定义门是任意 Node 代码，`os.tmpdir()` + `readdirSync` 即可枚举
+> `qa-hifi-snapshot-*`、按 `spec.json` 的 `meta.name` 认出本次快照，然后把 **快照与磁盘同步改成相同
+> 字节**：旧口径的 `snapshot ⟷ disk` 比对于是报全等，而交付页面已经是错的（审核人 PoC 实测
+> `verify exit 0` / `snapshotDrift "none"`，交付页 `.box` 却是 99px）。审核人的定性：**「manifest 证明
+> 的只是『两个当前可变对象现在相等』，不再证明『最终交付等于当时被观察的字节』」**。随机后缀只防猜、不防
+> 同权限枚举，所以 r11 **不去阻止枚举**（挡不住），而是让枚举变得无用：进入 untrusted-script 分界线
+> **之前**，父 verify 进程把快照整树的 `{path, type, linkTarget, sha256}` 全量捕获进 `Object.freeze`
+> 的**内存** manifest（**不落盘** —— 落盘就又变成同权限可写文件对象）；收口时**最终磁盘只与这份内存
+> manifest 比较**，不再与快照文件树比较。子进程改不到父进程内存，「同步改快照 + 磁盘」由此失效。
+> 冻结范围是快照**整树**，所以也覆盖 `buildInputHashes` 窄范围之外的文件（PoC 的 `late.js` 正是这一类，
+> 窄口径 `postRunHashRecheck` 必然报 ok）。exec 树仍从快照复制（r10 修法保留），但它只是让相对
+> `import` 能解析的执行载体，**不再是收口 oracle**。
+
+**门 X 无 OS 沙箱的降级为什么可以接受**：需要同时成立四条 —— (a) 所有可信观察固定在**完整**快照；
+(b) 后置脚本只能污染不被信任的原目录（观察已完成，收口 oracle 是分界线前冻结在父进程内存里的
+manifest，它碰不到）；(c) 出块前做双向比对（基准 = 那份冻结内存 manifest，不是仍可被改写的快照树）；
+(d) 精确 hash 字节被执行 = 执行已哈希的可信副本。r8 之前 (a)(c)(d) 均不满足，r8 补齐，r10/r11 收紧。
+
+> **(d) 的边界（不许扩大）**：`scriptSha256` 绑的是**入口脚本字节**——`extract.mjs` 或
+> `spec.customGates[].script` 那一个文件——并**不**绑它整棵执行依赖树。exec 树里的兄弟模块字节来自
+> 观察快照（因此与观察态一致，且它们若是 demo 内文件也在冻结 manifest 的范围里），但 report 里
+> `scriptSha256` 这个字段只对入口脚本成立。任何文案都不得把这个绑定说成覆盖整棵依赖树。
+
+> **r12(路径为 key 的映射不许用普通对象)**：`captureFrozenManifest` 原来用 `const entries = {}`，
+> 于是文件名为 `__proto__` 时 `entries['__proto__'] = record` 不建 own property（触发
+> `Object.prototype.__proto__` setter），两头都瞎——冻结基准侧 `Object.keys` 遍历不到，disk 侧
+> `rel in entries` 又因原型链恒为 true。`safe-server` 能服务 `/__proto__`，配 `asset-sha` binding
+> 就是一条可用的绕过（审核人 PoC 实测 `verify exit 0` / `snapshotDrift "none"`，而交付资源字节已变）。
+> 修法：`Object.create(null)` + `Object.hasOwn`（**禁止 `in` 做 membership**）；`Object.freeze` 对无
+> 原型对象照样生效。全仓同形状的路径/名字映射一并改（`canonicalize`、`inputHashes.customGates`、
+> `buildComponentHashes` 的 sources/demoInputs/bundle、`unwrapTruth`/`truthAt`、`canonicalJson`、
+> `extractThemeVars`、`packageExports`、门 F 的 `probes`、`html-lite` 的 `attrs`、`dom-ops` 的
+> attr/style diff、`style-convert` 的 `mechanical`），由 comp-fix-r12 的「全表」契约测试钉住。
+
+**门 E（pixel-compare）为什么可以继续用「快照文件树 ⟷ 磁盘」收口**：它的生命周期内**不执行任何
+demo 侧脚本**（全文无 `spawnSync`/`execFileSync`，只跑浏览器与 PNG 比对），因此没有「同步改快照 +
+磁盘」的执行载体。**这是一条有前提的豁免**：一旦 pixel-compare 将来引入任何 demo 脚本执行（自定义
+像素门、作者裁决脚本、后处理钩子等），必须同步改用 `observe.captureFrozenManifest` /
+`diffAgainstFrozen` 的冻结 oracle，否则门 E 会重新落进同一个陷阱。告示同时写在
+`scripts/pixel-compare.mjs` 建快照那段的注释里。
+
+**pr-block 侧同理**：门 E 的可信重跑必须排在可信 verify **之前** —— verify 末段会执行 demo
+代码，排在其后的那次真实渲染观察正好落在攻击窗口里。
+
+**第 5 步是纵深，不是主防线**：攻击可以在父进程退出后才恢复原文件，让前后两次 hash 都自洽；
+真正挡住它的是「核心观察全部早于执行 demo 代码」。
+
+**残余风险（如实标注）**：demo 侧代码在第 4 步之后仍能改磁盘（只是核心观察已完成，且偏离会被
+第 5 步报出来）。**没有**把
+extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本都不合适，且 Node `vm` 不是安全
+边界，不拿它假装隔离。因此：**任何在第 4 步之后新增的观察性检查都会重新打开这个窗口**，
+新增检查必须放在分界线之前（源码契约测试会拦）。
+
+### 门级全表（结论进 PR 附贴块 ⇒ 必须有可信侧来源）
+
+**原则（写死）：任何结论会进 PR 附贴块的门，都必须有可信侧来源。** 没有可信来源的门不许出块。
+
+| 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
+|---|---|---|---|
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`。顺序写死：demo `node_modules` fail-fast → **demo 输入树 symlink fail-fast（r9 P0：一律拒，含指向 demo 内部的）** → 建立**整树** immutable snapshot → `--check-inputs`（esbuild 输入图）+ `--check-outputs`（**bundle 与全部 file-loader 产物**的路径→字节，I-ESBUILD）+ `--check-css`（I-CSS；三项针对磁盘字节，随后由**双向 manifest 绑定检查点**证明 ≡ 快照字节）→ 浏览器门从 snapshot 观察 → **之后**才处理 demo extractor | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并（`gateAHardFail` 一票否决）；执行完 demo 代码再比 `inputHashes` 与 snapshot 偏离 |
+| B 状态覆盖 | ✅ 进（`passed/total`） | canonical 浏览器重跑，**在任何 demo Node 脚本之前**、从同一 immutable snapshot 加载 | 哨兵结论同门 |
+| C 交互鲁棒 | ✅ 进（checks 列表） | 同 B（canonical 浏览器 + snapshot + 先于 demo 脚本） | |
+| D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | 同 B | |
+| E 像素基准 | ✅ 进（`compared/declared` + 最大 diff + WARN 的裁决人与理由） | **pr-block 亲自 spawn canonical `pixel-compare --report-out <demo 外>`**，真实解码/截图/odiff；trusted report 出块、自报只对账；**门 E 也从同一种整树 snapshot 观察（含 baseline PNG，r8 条目 A）**并做自己的双向 manifest；artifact 三图被 trusted 运行覆盖（manifest 通过后落盘），WARN 裁决必须绑定这三图的 sha256 + 本次现算的 `key`/`diffRatio`/`threshold`（r8） | 排在可信 verify **之前**（verify 末段会执行 demo 代码）；未声明 baseline 时出块写"未运行 pixel-compare"，不宣称已验 |
+| F 适配还原 | ✅ 进（点数；未配置则降级声明） | 同 B | |
+| X 自定义门 | ✅ 进（gate id 列表，**降准表述**） | canonical verify 亲自执行注册脚本、记真实 exit code；执行前就地算脚本 sha256 并与观察前入链的那份比对 | **只能声称「精确 hash 的注册脚本被可信 runner 执行且 exit 0」这个执行事件** —— 脚本本身是 demo 代码，不证明它实现了正确的业务 oracle（r7 条目 10）。排在 A-D/F/E 核心观察之后；执行完整组回收子进程；隔离程度见下方残余风险 |
+| 资产体积闸门（非字母门） | ⚠️ 仅抬闸时进（抬闸理由 + 可信侧现算体积） | pr-block **自己**枚举 `assets/` 现算体积并与阀值比对；`report-assets.json` 自报数字仅对账 | 抬闸阀与理由是**作者的政策输入**、不是测量证据（见「资产抬闸的定性」） |
+| 部署一致性（`--require-deployed`） | ❌ 不进附贴块（只作为出块前置条件） | pr-block 自己 fetch 线上字节与本地逐文件 sha256 全等比对（可信侧直接观察） | |
+| 入库检查（`--require-committed`） | ❌ 不进附贴块 | pr-block 自己跑 `git ls-files` / `git status`（可信侧直接观察） | |
+
+**原则（写死）：所有进入 PR 附贴块的字母门都必须来自 canonical 运行或等价可信复算，没有一门可以只靠 demo JSON。**
+
+门字母 ⟷ runner 的映射是**唯一机读真相源**（`scripts/lib/gates.mjs` 的 `TRUSTED_GATES`）：
+verify 的门过滤、pr-block 的投影门集合、PR 门表渲染都只遍历它，**不许再手写第二份门列表** ——
+门 E 那个 CRITICAL 的根因就是两份手写清单各自漏了它（r7 条目 7a）。渲染器另加 taint 保护：
+只接受 `markTrustedRun` 打过标记的结果，拿到未标记对象直接 throw（r7 条目 7b）。
+
+### 报告型 JSON 的定位表（谁能当证据、谁只是声明）
+
+**审核人确认：没有第四个"报告型"放行 JSON。** `package.json` 只用于模块解析根，不参与验收判定。
+
+| JSON | 定位 | 凭什么 |
+|---|---|---|
+| `spec.json` | **验收声明 / 输入**，不是证据 | 它是被验对象本身：schema 校验 + 进 `inputHashes`，且 canonical 重跑读的是同一份 |
+| `report.json` | **不能作放行依据**，仅对账 | 放行取 canonical verify 重跑结果；自报与可信结论投影不一致即阻断 |
+| `report-pixel.json` | **不能作放行依据**，仅对账 | 放行取 canonical `pixel-compare` 重跑结果（写到 demo 之外） |
+| `report-assets.json` | 测量数字**不能**作依据；抬闸理由可作**作者声明** | 体积/阀值由 pr-block 自己现算；`overrideReason` 原样印进 PR 供 reviewer 判断 |
+| `component.inputs.json` | **不能单独信** | 必须 `--check-inputs` 与 esbuild 现算结果全等 + 清单内每项逐文件 hash + 产物字节复算（I-ESBUILD / I-CSS） |
+| `truth.json` | **待证明的声明** | 每个叶子带 provenance + canonical verify 现跑 `extract.mjs` 比对（extractor drift） |
+| `adjudications/*.json`（WARN 人工裁决） | **人工裁决声明，不是机械测量** | 必须同时声明并全等四项：`key`（含 platform 的复合 key `<platform>/<key>`）/ `diffRatio` / `threshold` / 三图 sha256（r8）；裁决人与理由印进 PR |
+| `index.html` | **init 生成后可编辑的运行输入**，不是可信产物 | 不声称 adapter/chrome 段是 canonical（没有逐段字节全等校验）：只保证「相对上次 build 未被改动」（进 `inputHashes`）+ 内嵌 `qa-truth` ≡ `truth.json` + **渲染结论由 canonical 浏览器从 immutable snapshot 实测**（门 B/C/D）（r7 条目 12） |
+
+### 资产抬闸的定性（r7 条目 11，别把它写成机械保证）
+
+`effectiveLimitMb` / `overrideReason` 是**作者请求的显式抬闸政策输入，不是测量证据**。
+pr-block 会自己现算体积并把抬闸阀与理由原样印进 PR 附贴块，但**机械重跑无法阻止作者把阀抬到
+999MB** —— 若产品不希望如此，需要**外部 reviewer approval / sign-off 这一人工环节**来兜。
+工具这一侧只承诺三件事：体积数字是可信侧现算的、抬闸必须署名理由、理由会出现在 PR 上。
+
+### 门 X 的隔离与残余风险（r7 条目 10，如实标注）
+
+已做：① 表述降准到「精确 hash 的注册脚本被可信 runner 执行且 exit 0」；② 排在 A-D/F/E
+核心观察之后（与执行时序原则一致）；③ 用 `detached` 起**新进程组**跑脚本，返回后整组
+`SIGKILL` 回收；④ 执行前就地算脚本 sha256，与观察前 `inputHashes.customGates` 里的那份比对
+（"注册 A 脚本、跑 B 脚本"在这里落地）；⑤ 脚本字节进防伪链。
+
+**未做（残余风险）**：没有把门 X 放进 OS 级只写隔离的沙箱。原因如实说明 —— 门 X 是 demo 自带
+脚本，需要读 demo 目录与产品仓（`--demo <dir>` 就是为此传的），一刀切的 FS 隔离会让正常的
+自定义门直接跑不起来；Node `vm` 不是安全边界，不拿它假装隔离。因此：脚本仍可写磁盘，但
+① 它跑在所有核心观察之后，② 浏览器观察用的是 immutable snapshot，③ 它对 demo 输入的任何
+改写都会被事后 `inputHashes` 复算与 snapshot 偏离比对抓出来并判门 A 红。同组子进程会被回收，
+但脚本若刻意用 `detached` 再起孙进程，孙进程会拿到自己的新进程组、这一招杀不到它 ——
+那条路由「核心观察全部早于执行 demo 代码」兜住。
+
+### 产物全表（组件模式下"由外部工具生成"的产物）
+
+判据三档：**需可信侧复算** / **hash 输入已足够**（内容被上游锚住，改它必然让某条 hash 不符）/
+**不影响验收结论**。
+
+| 产物 | 生成者 | 判定 | 依据 |
+|---|---|---|---|
+| `assets/component.bundle.js` | esbuild（build.mjs） | **需可信侧复算** ✅ 已做（r5） | `--check-outputs` 字节全等（r7 起与派生资产同一张映射） |
+| `assets/component.css` | tailwindcss CLI（build.mjs） | **需可信侧复算** ✅ r6 补上 | `--check-css` 字节全等；未配 tailwind 时对 `CSS_PLACEHOLDER` 字节复算 |
+| `assets/` 下 esbuild 派生资产（图片/字体 `[name]-[hash]`） | esbuild file loader | **需可信侧复算** ✅ r7 条目 3 补上（此前判「间接达成」是**错的**） | `--check-outputs` 逐产物路径+字节全等。r6 之前的理由「文件名含内容 hash 且被 bundle 引用」不成立：`[hash]` 是 esbuild 的内容指纹不是校验和，**同名换字节** JS 侧毫无变化，`inputHashes.assets` 又是对攻击后字节现算的 → 全链绿（审核人实测，我已复现） |
+| `component.inputs.json` | build.mjs（esbuild metafile） | **需可信侧复算** ✅ 已做（r3） | `--check-inputs` 全等比对；清单自身也进 hash |
+| `truth.json` | demo `extract.mjs` | **需可信侧复算** ✅ 已做 | 门 A 现跑 `extract.mjs`，结果必须 ≡ `truth.json`（extractor drift）；且每个叶子带 provenance |
+| `index.html`（init 生成的组件壳 / adapter / chrome 模板产物） | `init.mjs` 模板 | **hash 输入已足够**（**不声称 canonical**） | 它是 init 生成后**可编辑的运行输入**:`--update-adapter` / `--update-chrome` 只替换标记段，仓里那份随后可被作者改动，而我们**没有做逐段字节全等校验** —— 所以只声称「进 `inputHashes['index.html']`，相对上次 build 未被改动」+ 内嵌 `qa-truth` ≡ `truth.json`（门 A）+ **渲染结论由 canonical 浏览器从 immutable snapshot 实测**（门 B/C/D），不靠模板可信（r7 条目 12） |
+| `build.mjs` / `component-build-core.mjs` / `extract-helpers.mjs` / `repo-glob.mjs`（demo 侧拷贝） | init 拷贝 | **需可信侧复算**（更强：钉死） | `checkDemoBuilderIntegrity` 要求与 skill canonical 逐字节全等；且复算一律跑 skill 那份，不执行 demo 拷贝 |
+| `baselines/**.png`（像素基准图） | `capture-baseline.mjs` / 人工采集 | **hash 输入已足够 + 门 E 可信重跑** | 基准图进 `inputHashes.baselines`（换图 → report 失效）；比对本身由 pr-block 重跑 pixel-compare 亲自做。**基准图的"来源真实性"（是否真是产品沙盒截图）工具无法机械证明——这一条如实降级为需人工审查** |
+| `pixel-artifacts/*.png`（baseline/demo/diff 三图） | pixel-compare | **需可信侧复算** ✅ r6 起 | 被可信重跑覆盖成我们生成的那份，WARN 人工裁决判的是这份 |
+| `adjudications/*.json`（WARN 人工裁决） | 人工 | **人工裁决声明，不是机械测量** | 必须同时声明并**全等**四项 `{ key, diffRatio, threshold, artifactHashes }`，缺一项即拒并点名缺哪个，任一项不等即拒并打印「裁决声明值 vs 本次现算值」。① `artifactHashes`：trusted E 产出的 baseline/demo/diff 三图 sha256（r7 条目 8 起就不再是「路径存在」算数:路径可以指向后来被换掉的图）——三层都要对上:report 记了三图 hash、磁盘现算等于它、裁决声明等于它。② `diffRatio` / `threshold`：必须等于**本次 trusted pixel 现算**的值(r8)。只绑三图挡得住「换图」，挡不住「换差异」——同一 key 上一次小幅 WARN 的裁决，在差异变大、三图跟着重跑更新之后就会被复用;**人工裁决的是当时那个具体差异，差异变大就必须重新裁决**。③ `key`：含 platform 的复合形式 `<platform>/<key>`（无 platform 的旧式条目用裸 key）——基准按 `baselines/<platform>/` 分端存放、永不互比，mac 端的裁决不得被 windows 端的 WARN 复用。校验点在 trusted `pixel-compare` 采纳处与 `report.mjs` 的 `validatePixelReport` **两侧都有**。`reviewer` / `reason` 必填并印进 PR。工具只保证「它判的是可信侧生成的那三张图、那个具体差异」，保证不了「判断本身对」 |
+| `report.json` | verify | **不作为放行依据** | pr-block 重跑 canonical verify，自报仅对账（r5） |
+| `report-pixel.json` | pixel-compare | **不作为放行依据** | pr-block 重跑 canonical pixel-compare，自报仅对账（r6） |
+| `report-assets.json` | assets-manifest | **不作为放行依据** | 体积/阀值由 pr-block 自己重算，自报仅对账（r5 #5c） |
+| `verify-artifacts/*.png`（失败截图） | verify | **不影响验收结论** | 只为人读复现，不进任何判定 |
+
+**pr-block 直接读 demo 目录文件的位置（逐个核过，无第四第五处放行依据）**：
+
+> r7 条目 9 起 pr-block **在出块阶段不再读取任何 demo 侧可变文件** —— 渲染所需的一切都来自
+> 打过 taint 标记的 canonical 产出（见上表「报告型 JSON 的定位表」与 `scripts/lib/pr-render.mjs`）。
+
+| 位置 | 读什么 | 是放行依据还是仅对账 |
+|---|---|---|
+| `pr-block.mjs` 读 `spec.json` | 声明输入 | **放行依据**（但它是被验对象本身：schema 校验 + 进 `inputHashes`，且可信重跑读的是同一份） |
+| 读 `report.json` | 作者自报的 A-F/X 结论 | **仅对账**（结论取可信重跑） |
+| 经 `validatePixelForPr` 读 `report-pixel.json` | 作者自报的门 E 结论 | **仅对账**（结论取可信重跑） |
+| 读 `report-assets.json` | 作者自报的体积数字 | **仅对账**（阀值与体积由 pr-block 自己从 `assets/` 重算） |
+| 读 `index.html` + `assets/**` 字节 | `--require-deployed` 的本地侧 | 比对对象本身（拿它与线上字节比） |
+| ~~读 `truth.json`（`countFixtureLeaves`）~~ | —— | **r7 条目 9 起 pr-block 不再读它**:在流程末尾重读可变文件属 TOCTOU 变体(demo 代码可能已在中途改过它)。fixture 叶子计数改由 canonical verify 在**观察前**统计进 `report.truthStats`，渲染器取可信 payload |
+| `component.inputs.json` | —— | pr-block **不直接读**；由 verify / `report.mjs` 经复算与逐文件 hash 处理 |
+
+> **Tailwind content 入链集（r7 条目 2：从 glob 降级为显式文件列表）**：`component.css.content`
+> 只接受**显式的仓内相对普通文件路径**，构建与可信侧复算都把它转成**绝对路径**传给
+> Tailwind `--content`。此时不变式 **`S ⊆ E = L`**（实扫集 ⊆ 期望集 = 入链集）由**参数结构**
+> 保证，不再依赖任何展开语义的猜测：绝对文件路径在 Tailwind 的 `parseCandidateFiles` 里
+> `glob === null`，扫描集就是那些文件本身；`config.content` 与 `config.content.relative` 在
+> CLI override 之后都不再决定集合。r6 遗留的三条局限**因此消失**：① `content.relative` 不必
+> 再靠静态文本扫描推断；② 不再需要与 Tailwind 内部 fast-glob 同源（我们压根不展开）；
+> ③ `node_modules` 非对称扫描没有了发生条件（显式路径默认拒依赖目录，且不递归任何目录）。
+> **仍在的一条**：tailwind config `require` 的 presets/plugins 不做递归入链追踪 —— 它由
+> `--check-css` 的 CSS 字节复算兜住（改 plugin → 重编字节不等于磁盘字节 → 门 A 红），
+> 已有实跑回归。CSS 字节复算仍是**最终锚**。
+> 版本联动：`tailwindcss` / `fast-glob` / `micromatch` 的版本钉在
+> `scripts/__tests__/fixtures/r7-content-engine-versions.json`，变了就让集成测试红，
+> 强制重跑「实扫集 === resolved list」的交叉验证（私有 API 不可加载即 fail-closed，
+> **不许 fallback 回自研 glob**）。
+
 **失败取证**：任一动态门失败自动截图到 `verify-artifacts/`，failure 条目带 `screenshot`
 字段——不用再开 `--headed` 人肉复现失败现场。`verify-artifacts/` 是生成产物，不入库。
 
-> **playwright 依赖解析**:verify/pixel 需要 playwright。脚本按 `cwd` → `INIT_CWD` → skill 目录向上 →
-> 宿主 `projects/*` package root 依次解析宿主 `node_modules`(playwright 或 playwright-core),
-> Chromium 用本机缓存/系统 Chrome。宿主仓没装时打印一串 attempts + 安装提示;可用
-> `QA_HIFI_MODULE_ROOT=<装了 playwright 的目录>` 显式指定。无 playwright 时门 B/C/D/F 跑不了,门 A 仍可跑。
+> **playwright 依赖解析(r5 收紧)**:verify/pixel 需要 playwright。解析候选**只含不受 demo 目录
+> 内容左右的根**:`QA_HIFI_MODULE_ROOT` → `PLAYWRIGHT_MODULE_ROOT` → demo 所在产品仓根
+> (`git rev-parse --show-toplevel`,且必须是 demo 目录的严格祖先) → skill 自身位置,
+> 外加这些根的 package root 与宿主 `projects/*` package root;Chromium 用本机缓存/系统 Chrome。
+> **不再有 `cwd` / `INIT_CWD` / demo 目录**——它们曾让 `<demo>/node_modules/playwright/index.js`
+> 的顶层代码在 `import` 时于 verify 进程内执行(RCE),而且 demo 目录还排在候选第一位、优先于
+> 机器上真实的 Playwright。另有两道兜底:解析结果落在 demo 子树里一律拒收;且**任何 demo
+> (不限组件模式)只要目录及任意子目录存在 `node_modules`,verify / pr-block 在解析依赖、
+> 启动浏览器、执行任何 demo 侧代码之前就无条件 fail-fast 退出**(不是标红后继续)。
+> 宿主仓没装时打印一串 attempts + 安装提示;可用 `QA_HIFI_MODULE_ROOT=<装了 playwright 的目录>`
+> 显式指定。无 playwright 时门 B/C/D/F 跑不了,门 A 仍可跑。
 >
 > **大矩阵必须配 `verify.cases` 收敛**:门 B/C 对每个 `case × state` 都 freshLoad(两次页面加载),
 > 全 matrix 笛卡尔积(如 3×2×2×4=48 组 × N 状态)会慢到不可用。真实 demo 用 `spec.verify.cases`
 > 声明一组有代表性组合(pairwise / 关键端×暗色×长文案),不要默认全展开。
+>
+> **`verify.cases[].via` 不许写空数组**(schema 直接拒)。三种语义各有写法,别混：
+> · 省略 `via` → applyCase 走**默认偏好点击**(按 `data-qa-pref` 之类入口逐个点到位),
+>   demo 有偏好控件时用这个；
+> · `via: [{ expect: '<初始状态 id>' }]` → 声明「demo 初始就在该 case 的偏好上,无需导航」,
+>   并顺手断言确实如此；
+> · `via: [ …真实交互步骤… ]` → 自定义到达链路。
+> 空数组同时可以解释成「不需要导航」和「忘填了」,两者不可分辨——用上面第二种写法把意图写明。
 
 - **门 A 真值一致 + extractor drift**：① index.html 内嵌 `<script id="qa-truth">` ≡ truth.json；
   ② 现跑 `extract.mjs` 的输出 ≡ truth.json（证明 value 真由源码提取，不是手抄 value+CSS 蒙混）；
@@ -114,16 +658,26 @@ node scripts/pixel-compare.mjs --demo <dir>   # 动态:门E 像素基准(有 bas
   但报告降级声明「还原承诺仅到数据层」；配了就必须全过。
 - **门 E 像素基准**（`scripts/pixel-compare.mjs`）：`baselines/<key>.png` = 真沙盒截图
   （桌面 dev 实例 / 手机模拟器采集），在 Node 可信侧解 PNG、比较 RGBA 并输出 baseline/demo/diff 三图。
-  mask 只可跳过小面积动态区，超面积、缺图、尺寸错、ERROR/MISSING 都阻断；WARN 必须有人工裁决 artifact 才允许 PR 附贴。
+  mask 只可跳过小面积动态区，超面积、缺图、尺寸错、ERROR/MISSING 都阻断；WARN 必须有人工裁决 artifact 才允许 PR 附贴，且该裁决必须绑定本次的 `key`/`diffRatio`/`threshold`/三图 sha256（旧裁决不得复用到变大的差异上）。
   无基准时如实标注「像素级未比对」。
   **比对内核（gate-e-v2）**：优先 **odiff**（`odiff-bin`，`antialiasing:true` 忽略抗锯齿像素、
   mask 映射 `ignoreRegions`），odiff 不可用时回退 pixelmatch（行为不变并记录 `engineNote`）；
   `QA_HIFI_COMPARE_ENGINE=odiff|pixelmatch` 可点名（A/B 对比/排障用，点名 odiff 失败直接报错不静默降级）。
   mask 面积上限 / `minUnmaskedRatio` 护栏在本仓这层，不交给引擎。
+  **mask 声明规范（组件模式）**：只有两类区域允许 mask——① **stub 区**：demo 用占位件替代的
+  非产品渲染物（如 `WindowControls` 原生红绿灯按钮，真沙盒里由 OS/Electron 画，demo 画不出来）；
+  ② **动态区**：每次渲染必然不同的内容（时钟、倒计时、随机头像）。其余任何 diff 都是真差异，
+  必须改 demo，不许用 mask 盖住。坐标系 = `[x, y, w, h]`，相对截图元素（`frameSel`，缺省 `.frame`）
+  左上角的 **CSS 像素**（DPR 由 `baselineDpr` 统一换算，写 mask 时不要自己乘 DPR）。
+  **位置必须从 truth 几何推导，不许看 diff 热图目测框选**：stub 区的槽位（标题栏高度、控件组宽度、
+  左右内缩）由 `extract.mjs` 从产品源码常量提取进 `truth.geometry.*`，mask 矩形取那些叶子的值
+  （允许 ±2px 边缘容差）；review 时按「每条 mask 能在 truth.geometry 里指到对应叶子」核对，
+  指不到 = 目测的 = 打回。面积护栏不变（`maxMaskRatio` 缺省 0.25、`minUnmaskedRatio` 缺省 0.5，
+  组件模式建议按 stub 区实际面积把 `maxMaskRatio` 收得更紧），mask 越界/零面积仍按现有规则报错。
   **分端基准（gate-e-v2）**：`baselines[].platform` 声明 `web|electron-mac|electron-win|ios|android` 后，
   基准落 `baselines/<platform>/<key>.png`（未声明保持旧平铺）；**不同 platform 的基准永不互比**，
   各自只与 demo 渲染帧比——跨渲染引擎像素直比不可行（字体/取整/阴影算法差异），跨端一致性走
-  门 D 绑定与真值断言，不走像素。分端条目的 artifact/裁决文件按 `<platform>.<key>` 命名。
+  门 D 绑定与真值断言，不走像素。分端条目的 artifact/裁决**文件名**按 `<platform>.<key>` 命名（如 `adjudications/web.one.json`），而裁决文件**内部** `key` 字段写复合 key `<platform>/<key>`（如 `web/one`，与 report 校验用的复合 key 同构）——文件名不能带 `/`，但字段必须能唯一定位「哪个 platform 的哪个 baseline」。
   **采集用 `scripts/capture-baseline.mjs`**：`--url <dev实例>` 直接截真沙盒帧元素（DPR 与
   pixel-compare 同口径），`--electron-app <main入口或app目录>` 起真实 Electron 壳截首窗口
   （桌面端真渲染，mac/win 各存各的基准），或 `--from-png <截图>` 导入真机截图（先渲染 demo 量帧尺寸，
@@ -231,16 +785,39 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
 2. `verify.mjs` 门 A-F 全绿 + （有基准时）`pixel-compare` 无未裁决 WARN；
 3. **产品仓自己的门禁**：受影响包 typecheck + 定向测试 + 仓库要求的全量门禁
    （cindy 仓 = 根目录 `pnpm test:unit`，见其 AGENTS.md）；
-4. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
+4. **资产清单 + 体积闸门（demo 有 `assets/` 时是硬门，不是可选步骤）**：
+   `node scripts/assets-manifest.mjs --demo <dir> [--max-total <MB> --override-reason "<理由>"]`——
+   图片 / 组件 bundle 一律落 demo 的 `assets/` 独立文件、HTML 用相对路径引用（不全内联：
+   实测 hero 图内联能把单文件顶到 10MB 量级，首屏卡、GitHub 预览打不开、PR diff 不可读）。
+   assets/ 总体积超生效阀 exit 2。这些文件逐个 sha 进 `inputHashes.assets` 防伪链，
+   换了图不重跑 verify → report 失效；`pr-block --require-deployed` 也会逐个比对线上资产字节。
+
+   闸门产物固定落盘 `report-assets.json`（`toolVersion` / `inputHashes.assets` /
+   `defaultLimitMb` / `effectiveLimitMb` / `overrideReason` / `ok`），**`pr-block` 强制**：
+   demo 有 `assets/` 就必须有这份报告、其 assets hash 与当前 `assets/` 一致、且 `ok: true`。
+   三者任一不满足即 exit 2——否则本闸门是一条谁都能整段跳过的"自愿门"（跑没跑过、抬没抬闸，
+   定稿时完全查不到）。
+
+   **`pr-block` 不信报告自报的数字**：`hash + ok:true` 都写在同一份可手写的 JSON 里，
+   一份 `{ ok:true, totalBytes:0, inputHashes:<真 hash> }` 就能把 9MB 资产送过闸。所以
+   `pr-block` 自己从 `assets/` 重算总体积，再逐条校验：`defaultLimitMb` ≡ 本工具写死的 8、
+   `effectiveLimitMb` 是有限正数、自报 `totalBytes` ≡ 现算值、现算值 ≤ 生效阀、
+   「生效阀 > 默认阀」⟺「`overrideReason` 非空」（双向）。任一不成立即 exit 2。
+
+   **抬闸必须留痕**：`--max-total` 高于默认 8MB 时必须同时给非空 `--override-reason "<为什么
+   这个 demo 必须更大>"`，否则参数直接被拒。理由进报告并原样印在 PR 附贴块上：
+   `⚠️ 资产 X MB 超默认闸门 8 MB（本次生效阀 Y MB），抬闸理由：…`。收紧到默认阀以下不需要理由
+   （收紧永远安全），因此也不接受"不抬闸却给理由"——免得"理由"变成随手贴的装饰；
+5. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
    `node scripts/pr-block.mjs --demo <dir> --require-committed --require-deployed --url <部署地址> [--preview ...]`
    产出附贴块——`--require-deployed` 会拉取部署地址逐字节比对本地 index.html（带 cache-bust），
    没部署 / 部署的是旧版 / 地址不可达都 exit 2。**部署不是可选步骤，是定稿门的一部分。**
 
-四步全绿 → commit 已就绪，PR 提交只差用户一句授权（push/提 PR 仍按仓库规矩经用户确认）。
+五步全绿 → commit 已就绪，PR 提交只差用户一句授权（push/提 PR 仍按仓库规矩经用户确认）。
 
 **「demo 每次都被带进 PR」的三层保证**：
 - **带入**：demo 是分支上的入库文件，git 自动把它带进 PR diff——入库即带入，零机制成本；
-- **本地硬门**：第 4 步必须用 `--require-committed`——它校验 spec/extract/truth/index 四件套
+- **本地硬门**：第 5 步必须用 `--require-committed`——它校验 spec/extract/truth/index 四件套
   已被 git 跟踪 + demo 目录无未提交改动（防「忘了入库」与「入库了但 PR 带旧版」）+ 报告 hash
   与当前文件一致（防旧验收报告冒充），任一不满足 exit 2、附贴块生成不出来；
 - **远端兜底**：上游 review-pr 格式门把 UI 证据（HTML/截图）列为硬要求，PR 里没带直接被打回——

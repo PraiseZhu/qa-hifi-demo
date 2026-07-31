@@ -1,6 +1,10 @@
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { hashFile, isPlainObject } from './fs-utils.mjs';
+// extract-helpers 是 demo 自包含拷贝件(只依赖 node 内建),这里正向 import 复用同一份
+// fixture locator / capturedFrom 判据——工厂函数与校验器双侧同代码,天然不会漂。
+import { validateCapturedFrom, validateFixtureValueBinding } from './extract-helpers.mjs';
+import { explicitContentFileProblem } from './repo-glob.mjs';
 
 // 门 E 分端基准(gate-e-v2):baselines[].platform 允许值。
 // 分端是「采集/存储」维度的命名空间,不是比对维度的白名单——不同 platform 的基准永不互比。
@@ -114,6 +118,15 @@ export function validateSpec(spec) {
     if (hasVia && st.tab) problems.push(`${where}:via 与 tab 二选一`);
     if (!hasVia && !tabOnly) problems.push(`${where}:必须有 via 数组,或 via:null + tab:"状态补齐"`);
     if (tabOnly && !(typeof st.note === 'string' && st.note.trim())) problems.push(`${where}:状态补齐必须写 note`);
+    // driver(组件模式,可选):声明该状态怎么被驱动到。'inject' = 可由 adapter 调
+    // __qaDemo.inject(id) 直达(推 reducer/setState);'via' = 局部 useState 类状态,
+    // 外部注入不到,只能经真实交互链路重放(__qa.goto 对其显式 throw)。
+    // 复刻模式(手写 HTML)不写该字段,语义不变。
+    if (st.driver !== undefined) {
+      if (st.driver !== 'inject' && st.driver !== 'via') problems.push(`${where}.driver 只允许 "inject" 或 "via"`);
+      // driver:'via' ⇒ 必须真有 via 链路,否则该状态既不能注入也没有到达路径 = 永不可达
+      else if (st.driver === 'via' && !hasVia) problems.push(`${where}.driver:"via" 必须同时声明 via 链路(否则该状态无任何到达路径)`);
+    }
     if (hasVia) {
       if (st.via.length === 0) problems.push(`${where}.via 不能为空`);
       for (const [j, step] of st.via.entries()) problems.push(...validateStep(step, `${where}.via[${j}]`, ids));
@@ -169,6 +182,11 @@ export function validateSpec(spec) {
         }
         if (c.via !== undefined) {
           if (!Array.isArray(c.via)) problems.push(`verify.cases[${i}].via 必须是 step 数组`);
+          // 空数组是语义陷阱:applyCase 见到 via 就用它取代默认偏好点击链路,via:[] 等于
+          // 「一步都不点」——非默认 case 必然 prefs mismatch,却看起来像"配置好了"。
+          // 想要默认链路就**省略** via 字段,不写空数组(审核附带收紧项)。
+          else if (c.via.length === 0)
+            problems.push(`verify.cases[${i}].via 不能是空数组——想走默认偏好点击就省略 via 字段(空数组会跳过全部点击,非默认 case 必然 prefs mismatch)`);
           else c.via.forEach((s, j) => problems.push(...validateStep(s, `verify.cases[${i}].via[${j}]`, ids)));
         }
         // per-case viewport:移动端 case 必须在移动端视口下验(否则门 C/F 结论对 mobile 不成立)
@@ -274,6 +292,101 @@ export function validateSpec(spec) {
       }
     }
   }
+  // component:真组件直渲模式声明(合约 v1)。entry/sources 相对产品仓根(repoRoot),
+  // bundle 是 demo 内的构建产物。代码层防伪链的真相源是 build.mjs 生成的
+  // component.inputs.json(esbuild metafile 规范化输入清单),不是这里的自报字段:
+  // entry 必须出现在真实输入里、sources(可选)必须 ⊆ 真实输入,均由 report 侧 fail-closed。
+  if (spec.component !== undefined) {
+    const c = spec.component;
+    if (!isPlainObject(c)) problems.push('component 必须是 object');
+    else {
+      if (c.mode !== 'component') problems.push(`component.mode 必须是 "component"(当前 ${JSON.stringify(c.mode)})`);
+      const relOk = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.includes('\\') && !v.split('/').includes('..');
+      if (!relOk(c.entry)) problems.push('component.entry 必须是相对 repoRoot 的路径 string(不含 ".."/绝对路径/反斜杠)');
+      // export:目标组件的导出名(可选,但**不声明就永远拿不到「真组件直渲」结论**)。
+      // r3 起哨兵只给这个导出算「被渲染」;不声明 / 声明的导出不存在(build 直接 exit 2)/
+      // 该导出形态套不上探针 → PR 块一律降级为「需人工审查」。值的合法性(真有这个导出)
+      // 由 build.mjs 用 esbuild metafile 校验,schema 只拦空串/非字符串。
+      if (c.export !== undefined && (typeof c.export !== 'string' || !c.export.trim()))
+        problems.push('component.export 必须是非空 string(目标组件导出名;默认导出写 "default")——不需要就整个字段删掉');
+      // sources 自 metafile 真相源上线后降级为**可选的人读声明**:代码层防伪链锁的是
+      // build.mjs 从 esbuild metafile 落下的 component.inputs.json(bundle 真实输入),
+      // 作者自报的窄集再也决定不了链的范围。声明了就必须 ⊆ 真实输入(report 侧校验)。
+      if (c.sources !== undefined && !Array.isArray(c.sources))
+        problems.push('component.sources 必须是数组(可选;人读声明,真相源是 component.inputs.json)');
+      else if (Array.isArray(c.sources)) c.sources.forEach((s, i) => {
+        if (!relOk(s)) problems.push(`component.sources[${i}] 必须是相对 repoRoot 的路径/glob string(不含 ".."/绝对路径/反斜杠)`);
+      });
+      // bundle 拼进 demo 目录做 hash 与页面加载:限 demo 内相对路径,禁越狱
+      if (!relOk(c.bundle)) problems.push('component.bundle 必须是 demo 目录内的相对路径 string(不含 ".."/绝对路径/反斜杠)');
+      // ---- 构建段(build.mjs 消费;init.mjs 生成骨架) ----
+      if (c.bootstrap !== undefined && !relOk(c.bootstrap)) problems.push('component.bootstrap 必须是 demo 目录内的相对路径 string');
+      if (c.assetsDir !== undefined && !relOk(c.assetsDir)) problems.push('component.assetsDir 必须是 demo 目录内的相对路径 string');
+      if (c.rendererRoot !== undefined && c.rendererRoot !== null && !relOk(c.rendererRoot))
+        problems.push('component.rendererRoot 必须是相对 repoRoot 的路径 string 或 null');
+      if (c.target !== undefined && typeof c.target !== 'string') problems.push('component.target 必须是 string(esbuild target)');
+      if (c.packageRoots !== undefined) {
+        if (!isPlainObject(c.packageRoots)) problems.push('component.packageRoots 必须是 object(包名 → 相对 repoRoot 的源码目录)');
+        else for (const [pkg, root] of Object.entries(c.packageRoots)) {
+          if (!relOk(root)) problems.push(`component.packageRoots["${pkg}"] 必须是相对 repoRoot 的路径 string`);
+        }
+      }
+      if (c.shims !== undefined) {
+        if (!Array.isArray(c.shims)) problems.push('component.shims 必须是数组');
+        else c.shims.forEach((s, i) => {
+          if (!isPlainObject(s)) { problems.push(`component.shims[${i}] 必须是 object`); return; }
+          if (typeof s.spec !== 'string' || !s.spec) problems.push(`component.shims[${i}].spec 必须是非空 string(被替身的 import specifier)`);
+          if (!relOk(s.file)) problems.push(`component.shims[${i}].file 必须是 demo 目录内的相对路径 string`);
+          // why 是硬要求:写不出理由的替身就不该存在(替身是保真度让步,必须留痕)
+          if (typeof s.why !== 'string' || !s.why.trim()) problems.push(`component.shims[${i}].why 必填——说明为什么必须替身(render 期碰 IPC/网络/原生能力等)`);
+        });
+      }
+      if (c.fixtures !== undefined) {
+        if (!Array.isArray(c.fixtures)) problems.push('component.fixtures 必须是数组');
+        else c.fixtures.forEach((f, i) => {
+          if (!isPlainObject(f)) { problems.push(`component.fixtures[${i}] 必须是 object`); return; }
+          if (typeof f.id !== 'string' || !f.id) problems.push(`component.fixtures[${i}].id 必须是非空 string`);
+          if (typeof f.why !== 'string' || !f.why.trim()) problems.push(`component.fixtures[${i}].why 必填——说明该数据为什么没有源码 provenance`);
+        });
+      }
+      if (c.themeVars !== undefined && c.themeVars !== null) {
+        if (!isPlainObject(c.themeVars)) problems.push('component.themeVars 必须是 object 或 null');
+        else if (typeof c.themeVars.truthPath !== 'string' || !c.themeVars.truthPath)
+          problems.push('component.themeVars.truthPath 必须是非空 string(truth 里主题变量所在路径,adapter 目前固定读 themeVars)');
+      }
+      if (c.css !== undefined && c.css !== null) {
+        if (!isPlainObject(c.css)) problems.push('component.css 必须是 object 或 null');
+        else {
+          if (!relOk(c.css.tailwindConfig)) problems.push('component.css.tailwindConfig 必须是相对 repoRoot 的路径 string');
+          if (c.css.input !== undefined && typeof c.css.input !== 'string') problems.push('component.css.input 必须是 string(tailwind 输入 CSS 内容)');
+          // content 必填非空(r4 追加 #2c-b):省略时 Tailwind 会按 config.content 隐式扫描,
+          // 被扫到的样式源文件不入 component.inputs.json 防伪链 → 改样式不换 hash,旧 CSS 照过。
+          if (!Array.isArray(c.css.content) || c.css.content.length === 0 || c.css.content.some((g) => typeof g !== 'string'))
+            problems.push(
+              'component.css.content 必须是非空 string 数组(**显式的仓内相对文件路径**,r7 起不再支持 glob)——'
+              + '配了 component.css 就必须显式声明 content;省略会让 Tailwind 按 tailwind.config.js 的 content 隐式扫描,'
+              + '那些样式源文件不进防伪链。不需要 tailwind 请把 component.css 设为 null',
+            );
+          /* r7 条目 2(破坏性变更):content 只接受显式文件路径,glob/目录一律拒。
+             理由与迁移方式见 repo-glob.explicitContentFileProblem 的报文 ——
+             自研/复用 glob 与 Tailwind 实扫集的语义差异已被证伪四次,而 v3 没有公开稳定
+             API 能导出真实 file set;只有显式列表能让 S ⊆ E = L 由参数结构保证。 */
+          else
+            for (const [i, g] of c.css.content.entries()) {
+              const gp = explicitContentFileProblem(g);
+              if (gp) problems.push(`component.css.content[${i}] ${gp}`);
+            }
+        }
+      }
+      // driver 段已下线:状态怎么被驱动统一写 states[].driver('inject'|'via'),
+      // 单一真相源——两处声明必然漂移(2026-07-30 集成调和结论)。
+      const ALLOWED = ['mode', 'entry', 'export', 'sources', 'bundle', 'bootstrap', 'assetsDir', 'rendererRoot', 'packageRoots', 'shims', 'fixtures', 'themeVars', 'css', 'target'];
+      for (const key of Object.keys(c)) {
+        if (key === 'driver') { problems.push('component.driver 已废弃——状态驱动方式写 states[].driver:"inject"|"via"(单一真相源)'); continue; }
+        if (!ALLOWED.includes(key)) problems.push(`component.${key} 不是支持的字段(${ALLOWED.join('/')})`);
+      }
+    }
+  }
   if (spec.adaptive !== undefined) {
     const ad = spec.adaptive;
     if (!isPlainObject(ad)) problems.push('adaptive 必须是 object');
@@ -318,7 +431,7 @@ export function validateTruth(truth, { demoDir = process.cwd(), requireProvenanc
     // provenance——其完整性由门 A 的 extractor-drift 检查覆盖(跑 extract.mjs 现算 ≡ truth.json)。
     if (path === 'adaptive.samples') return;
     if (isPlainObject(value) && Object.hasOwn(value, 'value')) {
-      if (requireProvenance) validateProvenance(value.provenance, path, demoDir, problems);
+      if (requireProvenance) validateProvenance(value.provenance, path, demoDir, problems, value.value);
       return;
     }
     if (Array.isArray(value)) {
@@ -335,7 +448,7 @@ export function validateTruth(truth, { demoDir = process.cwd(), requireProvenanc
   return problems;
 }
 
-function validateProvenance(prov, path, demoDir, problems) {
+function validateProvenance(prov, path, demoDir, problems, value) {
   if (!isPlainObject(prov)) { problems.push(`${path}.provenance 缺失或不是 object`); return; }
   if (typeof prov.source !== 'string' || !prov.source) problems.push(`${path}.provenance.source 必须是文件路径`);
   if (typeof prov.locator !== 'string' || !prov.locator) problems.push(`${path}.provenance.locator 必须说明定位方式`);
@@ -365,19 +478,72 @@ function validateProvenance(prov, path, demoDir, problems) {
       problems.push(`${path}.provenance.locatorKeyPath 必须是「段.段.段」非空路径(段不含空白)`);
     }
   }
+  // sourceKind 可选:省略 = 'code'(源码溯源,默认)。'fixture' = 该值来自录制的服务端响应,
+  // 源码里没有这个字面量(providers 配置 / account memberships 等服务端驱动数据)。
+  // fixture 是**声明性降级**不是防伪豁免:文件存在性 + hash 照旧校验,另外强制两条——
+  //   ① capturedFrom:一句话人读来源声明(什么时候从哪个环境的哪个接口录的),缺了直接 FAIL
+  //      ——没有它,fixture 就是"来源不明的手抄数据穿了 provenance 的马甲";
+  //   ② source 必须落在 demo 内 fixtures/ 下:fixture 得随 PR 走、可被 reviewer 打开,
+  //      指向仓外/demo 外的路径谁都验不了,等于没有溯源。
+  const sourceKind = prov.sourceKind === undefined ? 'code' : prov.sourceKind;
+  if (prov.sourceKind !== undefined && sourceKind !== 'code' && sourceKind !== 'fixture') {
+    problems.push(`${path}.provenance.sourceKind 只能是 'code' 或 'fixture'(省略即 code)`);
+  }
+  // 源文件存在性 + hash 先校验:fixture 的值绑定要读这份文件,文件不在/被改过时
+  // 绑定结论没有意义,应先报根因再跳过绑定(免得一个错误刷出两条互相掩盖的 problem)。
+  let sourceUsable = false;
   if (typeof prov.source === 'string' && prov.source) {
     const sourcePath = resolve(demoDir, prov.source);
     if (!existsSync(sourcePath)) problems.push(`${path}.provenance.source 不存在:${prov.source}`);
     else if (prov.hash && normalizeHash(prov.hash) !== hashFile(sourcePath))
       problems.push(`${path}.provenance.hash 与源文件不符:${prov.source}`);
+    else sourceUsable = true;
   }
+  if (sourceKind === 'fixture') {
+    for (const p of validateCapturedFrom(prov.capturedFrom)) problems.push(`${path}.provenance.${p}`);
+    let inFixturesDir = false;
+    if (typeof prov.source === 'string' && prov.source) {
+      const rel = relative(demoDir, resolve(demoDir, prov.source)).split('\\').join('/');
+      if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(prov.source)) {
+        problems.push(`${path}.provenance.source 指向 demo 目录外:${prov.source}——fixture 必须放 demo 内 fixtures/ 下随 PR 走`);
+      } else if (!rel.startsWith('fixtures/')) {
+        problems.push(`${path}.provenance.source 必须是 demo 内 fixtures/<name>.json(当前 ${rel})`);
+      } else inFixturesDir = true;
+    }
+    // 值绑定(审核 P1 #3):locator 必须是可解析 JSON 路径,且指向的值 ≡ 叶子 value。
+    // 少了这一条,fixture 就是"手抄数据穿 provenance 马甲"的免检通道——整文件 hash
+    // 只能证明 fixture 没被改过,证明不了叶子里的值真出自这份 fixture。
+    if (inFixturesDir && sourceUsable) {
+      for (const p of validateFixtureValueBinding(value, resolve(demoDir, prov.source), prov.locator)) {
+        problems.push(`${path}.provenance.${p}`);
+      }
+    }
+  }
+}
+
+/**
+ * 统计 truth 里 sourceKind='fixture' 的叶子数(PR 附贴块的诚实降级声明用)。
+ * 与校验解耦:只数,不判合法性——非法的在 validateTruth 阶段已被拦下。
+ */
+export function countFixtureLeaves(truth) {
+  let n = 0;
+  const visit = (value) => {
+    if (isPlainObject(value) && Object.hasOwn(value, 'value') && Object.hasOwn(value, 'provenance')) {
+      if (isPlainObject(value.provenance) && value.provenance.sourceKind === 'fixture') n += 1;
+      return;
+    }
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    if (isPlainObject(value)) { Object.values(value).forEach(visit); }
+  };
+  visit(truth);
+  return n;
 }
 
 export function unwrapTruth(value) {
   if (isPlainObject(value) && Object.hasOwn(value, 'value')) return value.value;
   if (Array.isArray(value)) return value.map(unwrapTruth);
   if (isPlainObject(value)) {
-    const out = {};
+    const out = Object.create(null);   // r12:truth 里名为 __proto__ 的叶子不许在解包时消失
     for (const [k, v] of Object.entries(value)) out[k] = unwrapTruth(v);
     return out;
   }
@@ -385,7 +551,12 @@ export function unwrapTruth(value) {
 }
 
 export function truthAt(truth, path) {
-  const raw = path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), truth);
+  /* r12:逐段必须走 own property —— 裸 `o[k]` 会让 `truth: '__proto__'` /
+     `'constructor'` 之类的 binding 取到原型链上的东西(而 truth 里根本没有这条叶子),
+     结果是「binding 指向了不存在的真值却拿到了一个对象」。hasOwn 之下这类 path 一律 undefined,
+     由既有的「binding 指向的 truth 路径不存在」那条检查报错。 */
+  const raw = path.split('.').reduce(
+    (o, k) => (o == null || !Object.hasOwn(o, k) ? undefined : o[k]), truth);
   return raw === undefined ? undefined : unwrapTruth(raw);
 }
 

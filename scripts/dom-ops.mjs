@@ -93,7 +93,7 @@ function anchorPath(node) {
 }
 
 function styleDecls(style) {
-  const out = {};
+  const out = Object.create(null);   // r12:CSS 属性名由页面控制
   for (const part of String(style ?? '').split(';')) {
     const idx = part.indexOf(':');
     if (idx <= 0) continue;
@@ -149,7 +149,7 @@ for (const [id, oldNode] of oldAnchors) {
     });
   }
 
-  const attrDiff = {};
+  const attrDiff = Object.create(null);   // r12:同上
   const keys = new Set([...Object.keys(oldNode.attrs), ...Object.keys(newNode.attrs)]);
   for (const k of keys) {
     if (k === 'data-node-id' || k === 'style') continue;
@@ -161,7 +161,7 @@ for (const [id, oldNode] of oldAnchors) {
 
   const oldStyle = styleDecls(oldNode.attrs.style);
   const newStyle = styleDecls(newNode.attrs.style);
-  const styleDiff = {};
+  const styleDiff = Object.create(null);   // r12:同上
   for (const k of new Set([...Object.keys(oldStyle), ...Object.keys(newStyle)])) {
     if (oldStyle[k] !== newStyle[k]) styleDiff[k] = { from: oldStyle[k] ?? null, to: newStyle[k] ?? null };
   }

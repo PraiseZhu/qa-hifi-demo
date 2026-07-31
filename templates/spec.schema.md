@@ -120,6 +120,12 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
 - `verify.persistence` 必须写 `expected`、`storageKey`、`reloads>=1`；不能只让 demo 的 `__qa.prefs()` 自证。
 - `verify.inputs` 必须写非空 `text`、正数 `tickMs` 与 `tickWitness`；验收会等 witness 真实变化后再断言输入框 DOM 节点未被替换。
 - `bindings.kind` 只允许 `color` / `length` / `text` / `asset-sha`；`pseudo` 只允许 `::before` / `::after` / `::placeholder`。
+- `baselines[].mask` 只允许盖两类区域：**stub 区**（demo 用占位件替代的非产品渲染物，如 `WindowControls`
+  原生红绿灯）与**动态区**（时钟/倒计时/随机头像）。坐标 `[x, y, w, h]` 是相对截图元素（`frameSel`）左上角的
+  **CSS 像素**，不要自乘 DPR。**位置从 `truth.geometry.*` 推导**（extract.mjs 从产品常量提取的标题栏高度、
+  控件组宽高、内缩），允许 ±2px 容差；靠 diff 热图目测框出来的 mask 一律打回。面积护栏不变：
+  `maxMaskRatio`（缺省 0.25，组件模式建议按 stub 区实际面积收紧）、`minUnmaskedRatio`（缺省 0.5）；
+  零面积或越界 mask 直接报错，不静默跳过。
 - `baselines` 声明的每个 key 必须有对应基准图（声明 `platform` → `baselines/<platform>/<key>.png`，未声明 → `baselines/<key>.png`）；mask 超面积、未遮罩区域过少、WARN 无人工裁决都阻断 PR 附贴。分端条目的裁决文件按 `<platform>.<key>` 命名（`adjudications/<platform>.<key>.json`）。
 - 规范化只排序 object key；语义为集合的数组必须由 `extract.mjs` 按稳定 key 排序后输出。
 
@@ -143,3 +149,109 @@ demo 目录的宪法文件。全部字段如下（`?` = 可选）：
 
 - 移动端 case 必须声明移动端视口,verify 为该 case 换用对应尺寸/DPR 的页面;
 - 不声明 = 1440×960 桌面视口(mobile 的截断/溢出/适配结论在桌面视口下不成立)。
+
+## truth.themeVars(组件模式主题桥,2026-07-30 起)
+
+组件模式(demo 直接渲染产品组件,而不是手写复刻)需要一份 CSS 自定义属性表把产品主题
+搬进 demo。这份色表必须走 truth——写死在 build 脚本里的色值不在 provenance 链上,
+产品改了色表没人报警(门 A 的 extractor-drift 只核 truth.json)。
+
+extract.mjs 侧一行拿到:
+
+```js
+import { extractThemeVars, findRepoRoot } from './extract-helpers.mjs';
+
+const repo = findRepoRoot();
+truth.themeVars = extractThemeVars(
+  `${repo}/apps/desktop/src/renderer/themes/colors.ts`,
+  { prefix: 'login-' },   // ? 只要某前缀的 token,缺省全量
+);
+```
+
+truth 结构(每个模式各一个标准叶子,直接过 `validateTruth`):
+
+```jsonc
+"themeVars": {
+  "surface": {
+    "light": { "value": "#f8f8f6", "provenance": { "source": "...colors.ts", "locator": "...defaults.light", "hash": "...", "locatorPattern": "..." } },
+    "dark":  { "value": "#1f1f1e", "provenance": { /* 同上,锚指向 defaults.dark */ } }
+  },
+  "radius": {
+    "light": { "value": "0.5rem", "provenance": { /* 带锚 */ } },
+    // dark 在源码里是 null → 按 theme-service.resolveThemeValue 回退 light;
+    // 源码里没有对应字面量,故该叶子**不带** locatorPattern(给锚只会写错位置)
+    "dark":  { "value": "0.5rem", "provenance": { "locator": "...dark 为 null/未写,回退 light" } }
+  }
+}
+```
+
+约定与边界:
+
+- 值语义与 `themes/theme-service.ts` 的 `resolveThemeValue` 对齐:`dark` 为 `null`/未写 → 回退 `light`;
+- CSS 变量名 = `--<token>`(即 truth 里的 key 加 `--` 前缀),由 adapter/runtime 侧按模式序列化成
+  `:root{--a:v;--b:v}` 注入 demo,**不在 extract 侧拼字符串**(拼出来的整串没法逐 token 核对);
+- 静态取不到真值的 token(`light`/`dark` 是函数调用、变量、带插值的模板字面量)整条跳过,
+  不猜值、不拿 light 顶替 dark;跳过清单经 `onSkip` 回调交出,不传回调则打 stderr 汇总;
+- token 顺序 = 源码注册顺序(可复现,门 A 重跑 extract 不漂移);
+- `bindings.truth` 引用写 `themeVars.<token>.light` / `themeVars.<token>.dark`(token 名含连字符不含点,
+  与点分路径不冲突)。
+
+## spec.component(组件模式声明,2026-07-30 起)
+
+只有真组件直渲 demo 才有这一段;经典(手写 HTML 复刻)demo 一律不写。
+
+```jsonc
+"component": {
+  "mode": "component",                       // 必填,固定值
+  "entry": "apps/desktop/src/renderer/components/login/LoginPage.tsx",  // 相对 repoRoot
+  "sources": [],                             // 可选人读声明(路径/glob)。防伪链**不**看这里:
+                                             // 真相源是 build.mjs 生成的 component.inputs.json
+                                             // (esbuild metafile → bundle 真实输入)。写了就必须
+                                             // ⊆ 真实输入,否则 fail-closed 拒绝出块
+  "bundle": "assets/component.bundle.js",    // demo 内构建产物(hash 入链)
+  "bootstrap": "src/bootstrap.tsx",          // demo 内装配入口(esbuild entryPoint)
+  "assetsDir": "assets",
+  "rendererRoot": "apps/desktop/src/renderer",  // '@/' 别名基准;不用别名写 null
+  "packageRoots": { "@cindy/auth-client": "packages/auth-client/src" },
+  "shims": [
+    { "spec": "@/hooks/useLogin", "file": "shims/useLogin.ts", "why": "render 期走 IPC,浏览器里无处可挂" }
+  ],
+  "fixtures": [
+    { "id": "providers", "why": "登录方式配置来自服务端,源码里没有字面量", "shape": "ProviderConfig" }
+  ],
+  "themeVars": { "truthPath": "themeVars" },
+  "css": { "tailwindConfig": "apps/desktop/tailwind.config.ts", "content": ["apps/desktop/src/renderer/components/login/**/*.tsx"] },
+  "target": "chrome120"                      // 可选,esbuild target
+}
+```
+
+约定与边界:
+
+- `entry` / `sources[]` / `rendererRoot` / `packageRoots` / `css.tailwindConfig` 相对 **repoRoot**;
+  `bundle` / `bootstrap` / `assetsDir` / `shims[].file` 相对 **demo 目录**。一律禁 `..`、绝对路径、反斜杠;
+- **代码层防伪链的真相源是 `component.inputs.json`**(build.mjs 从 esbuild `metafile` 规范化落盘,
+  含 `productInputs`(相对 repoRoot)/ `demoInputs`(相对 demo)/ `skippedExternal`;不含 node_modules)。
+  门 A 对 `productInputs` + `demoInputs` + 清单自身 + bundle 逐一 sha256;
+  缺清单或结构非法 = `NO_MANIFEST` fail-closed(先跑 `node build.mjs` 再重跑 verify);
+- `component.entry` 必须出现在 `productInputs` 里:bootstrap 没 import 它 → **build.mjs 直接 exit 2**
+  (「声明的入口未被 bundle」),report 侧同样兜底拒。声明真组件却手搓 UI 的路被机械堵死;
+- `sources` 是可选的人读声明,自报窄集再也决定不了链的范围(声明 14 个而 bundle 真读 42 个时,
+  改那 30 个未声明文件同样让 hash 变);声明了却未被 bundle 读到 = FAIL(误导性声明);
+- `shims[].why` / `fixtures[].why` 必填——写不出理由的替身不该存在(替身是保真度让步,必须留痕);
+- **没有 `component.driver`**:状态怎么被驱动只写 `states[].driver`(`"inject"` / `"via"`)。
+  两处声明必然漂移,单一真相源在 `states[]`(2026-07-30 集成调和;旧 `component.driver` 直接报错);
+- `css` 为 `null` 时 build 仍写出空 `assets/component.css`,保证 index.html 的 `<link>` 不 404。
+
+### states[].driver(组件模式)
+
+```jsonc
+"states": [
+  { "id": "entry",   "driver": "inject", "via": [{ "expect": "entry" }] },
+  { "id": "consent", "driver": "via",    "via": [ { "click": "..." }, { "expect": "consent" } ] }
+]
+```
+
+- `"inject"`:adapter 可调 `__qaDemo.inject(id)` 直达(推 reducer / 受控 store);可进「状态补齐」tab;
+- `"via"`:组件局部 `useState` 的子视图,外部注入不到——**必须同时声明 via 链路**(schema 硬校验),
+  adapter 对它的 `__qa.goto` 显式 throw,且不许出现在 `tabStates` 里;
+- 复刻模式不写该字段,语义不变。

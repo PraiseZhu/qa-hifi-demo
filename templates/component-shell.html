@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{NAME}} · qa-hifi demo(组件模式)</title>
+<!-- 组件样式:由 build.mjs 产出(spec.component.css 未配置时是占位空文件) -->
+<link rel="stylesheet" href="assets/component.css">
+<style>
+/* ===== 组件模式:界面本体样式来自产品自己的 CSS,这里不要手写界面样式 =====
+   只允许放 demo 壳自身需要的极少数修正(如组件根的尺寸容器)。
+   chrome 工具区样式由 qa-chrome 注入,不要覆盖 qa-* 类。
+   .qa-component-root 由 adapter 在 .frame 内创建(mount 的 ctx.root)。 */
+/* 组件里的 position:fixed / 全屏 overlay(登录品牌层这类)默认以 viewport 为参照,
+   会盖住 chrome 工具区、让偏好/状态入口点不动。给组件根建一个包含块(transform 非 none
+   即可),把 fixed 后代收进帧内。副作用如实记账:fixed 后代的参照系从 viewport 变成帧,
+   在「帧 = 整窗」的真实 App 里两者等价;帧被缩小时它们跟着帧走(这正是 demo 想要的)。 */
+.qa-component-root { height: 100%; transform: translateZ(0); }
+</style>
+</head>
+<body>
+<!-- 真值块:由 `node <skill>/scripts/truth.mjs --demo <dir> --embed` 写入,禁止手抄 -->
+<script id="qa-truth" type="application/json"></script>
+<script>
+// ===== demo 基础配置(组件模式;renderApp 由 adapter 提供,作者不写界面渲染) =====
+// 这里只放「与渲染无关的壳配置」;states / mount / inject / onPrefs 由 bundle
+// (src/bootstrap.tsx)Object.assign 补上——它们要 import 真组件,只能在 bundle 里。
+// 加载顺序(硬性):truth → 本段 → bundle → adapter → qa-chrome。
+window.__qaDemo = {
+  mode: 'component',
+  name: '{{NAME}}',
+  pr: {{PR}},
+  summary: {
+    what: 'TODO:做了什么(≤2 行)',
+    how: 'TODO:怎么做的(≤2 行)',
+    accept: 'TODO:怎么验收(≤2 行)',
+  },
+  matrix: {
+    plat:   { label: '端',   options: [{ v: 'desktop', label: '桌面' }] },
+    region: { label: '区域', options: [{ v: 'cn', label: '中国大陆' }, { v: 'global', label: 'Global' }] },
+    os:     { label: '系统', options: [{ v: 'mac', label: 'macOS' }, { v: 'win', label: 'Windows' }] },
+    mode:   { label: '主题', options: [{ v: 'light', label: 'Light' }, { v: 'dark', label: 'Dark' }] },
+    lang:   { label: '语言', options: [{ v: 'zh-CN', label: '简中' }, { v: 'en', label: 'EN' }] },
+  },
+  defaultPrefs: { plat: 'desktop', region: 'cn', os: 'mac', mode: 'light', lang: 'zh-CN' },
+  initialState: 'entry',
+  // states 由 bundle 提供(键 ≡ spec.states[].id,每项 { driver: 'inject' | 'via' })。
+  tabStates: [],
+  adaptive: null,
+  scale: () => 1,
+  // states / mount / inject / onPrefs 由 bundle 补;renderApp 由 adapter 合成。
+};
+</script>
+<!-- 组件 bundle:build.mjs 产出(真实产品组件 + shims 装配),
+     Object.assign(window.__qaDemo, { states, mount, inject, onPrefs }) -->
+<script src="assets/component.bundle.js"></script>
+<script>
+/* QA_COMPONENT_ADAPTER_BEGIN — 组件模式适配层,由 init.mjs 内联;勿手改。
+   必须在 bundle **之后**、qa-chrome **之前**执行(它要读已装配好的 __qaDemo)。
+   升级:node <skill>/scripts/init.mjs --dir <demo-dir> --update-adapter */
+{{QA_COMPONENT_ADAPTER}}
+/* QA_COMPONENT_ADAPTER_END */
+</script>
+<script>
+/* QA_CHROME_BEGIN — 标准 chrome 运行时,由 init.mjs 内联;勿手改。
+   升级:node <skill>/scripts/init.mjs --dir <demo-dir> --update-chrome */
+{{QA_CHROME}}
+/* QA_CHROME_END */
+</script>
+</body>
+</html>
