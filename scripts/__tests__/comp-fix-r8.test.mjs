@@ -316,14 +316,21 @@ test('条目 B 文档契约(不 skip): SKILL.md 的时序与 I-OBSERVE 表述必
 
 test('条目 C 源码契约(不 skip): 执行的是已 hash 字节的副本,副本住在 demo 之外并复算 hash', () => {
   const v = stripComments(readFileSync(VERIFY, 'utf8'));
-  assert.match(v, /const copy = trustedScriptCopy\(scriptAbs, outputRoot\)/, '必须先取可信副本');
+  /* r10 更新(不是回退):副本从「单文件」变成「整棵树」,来源树优先是观察快照 ——
+     单文件副本会让 ESM 相对 import 解析不到兄弟模块,而 init.mjs 生成的官方 extract.mjs
+     模板就 import './extract-helpers.mjs'。「执行的是已 hash 的字节」这条性质没丢,反而更强:
+     现在 mismatch 同时覆盖「磁盘 ≠ 快照」。详见 comp-fix-r10.test.mjs。 */
+  assert.match(v, /const copy = trustedScriptCopy\(scriptAbs, outputRoot, \{ demoDir, sourceTree: snapshotDir \?\? demoDir \}\)/,
+    '必须先取可信整树副本(来源树优先观察快照)');
   assert.match(v, /spawnSync\(process\.execPath, \[copy\.exec, \.\.\.extraArgs\]/, '必须执行副本而不是原路径');
   assert.ok(!/spawnSync\(process\.execPath, \[scriptAbs/.test(v), '不许再按同一路径 spawn(窄 check/use 竞态)');
   assert.match(v, /copy\.mismatch/, 'hash 与复制之间被换掉必须 fail-closed');
   const ob = stripComments(readFileSync(OBSERVE, 'utf8'));
   const fn = ob.slice(ob.indexOf('export function trustedScriptCopy'));
   assert.match(fn, /const sha = hashFile\(scriptAbs\)/);
-  assert.match(fn, /copyFileSync\(scriptAbs, exec\)/);
+  // r10:copyFileSync(单文件) → cpSync(整树);exec 是脚本在树内的原相对位置
+  assert.match(fn, /cpSync\(src, dir, \{/, '必须整树复制');
+  assert.match(fn, /const exec = join\(dir, rel\)/, '脚本必须在树内的原相对位置执行(相对 import 才解析得到)');
   assert.match(fn, /const copySha = hashFile\(exec\)/, '必须复算副本 hash 与源 hash 比对');
   assert.match(fn, /mismatch: copySha !== sha/);
 });
@@ -348,7 +355,8 @@ test('条目 C(实跑): 门 X 执行的副本在 demo 之外,且脚本字节 has
   assert.equal(rep.inputHashes.customGates['probe-gate.mjs'], scriptSha, '脚本仍在防伪链里');
   const selfPath = readFileSync(join(dir, '..', 'probe-selfpath.txt'), 'utf8');
   assert.ok(!selfPath.startsWith(resolve(dir)), `门 X 仍在 demo 内执行原文件(${selfPath})——条目 C 未修`);
-  assert.match(selfPath, /trusted-scripts/, `副本应落在 output root 的 trusted-scripts/ 下:${selfPath}`);
+  // r10:目录名从 trusted-scripts/ 改为 trusted-trees-<hash12>-<rand>/(整树副本,每次调用一棵新树)
+  assert.match(selfPath, /trusted-trees-/, `副本应落在 output root 的 trusted-trees-* 下:${selfPath}`);
   assert.equal(v.status, 0, `${v.stdout}${v.stderr}`);
 });
 

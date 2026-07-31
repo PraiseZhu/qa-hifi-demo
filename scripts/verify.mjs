@@ -826,12 +826,22 @@ try {
        后者中间有窄 check/use 竞态:hash 与 spawn 之间的写入者可以换掉文件,于是
        「精确 hash 的脚本字节被执行」这句话不成立。副本落在 demo 之外的 output root,
        被审方的后置脚本改不到它。copy 后再算一次副本 hash,不等即 fail-closed。
+       r10 P0:副本是**整棵树**(字节取自观察快照),不再是单文件 —— 单文件搬走之后 ESM 的
+       相对 import 解析不到兄弟模块,而 init.mjs 生成的官方 extract.mjs 模板就 import
+       `./extract-helpers.mjs`。整树副本让相对 import 天然可用,同时保住「执行的字节 ≡ 已 hash
+       的字节」(树内那份复算 hash 后与磁盘 hash 比对)。详见 observe.trustedScriptCopy。
        注意(接口约定):被执行的是副本,所以脚本必须用 `--demo` argv 或 cwd(仍是 demoDir)
        定位 demo,**不能**靠 `import.meta.url` 推断自己在 demo 里 —— 已写进 SKILL.md。 */
-    const copy = trustedScriptCopy(scriptAbs, outputRoot);
+    const copy = trustedScriptCopy(scriptAbs, outputRoot, { demoDir, sourceTree: snapshotDir ?? demoDir });
     const sha = copy.sha256;
     if (copy.mismatch) {
-      return { status: 1, stdout: '', stderr: `脚本字节在 hash 与复制之间被换过(${sha} → ${copy.copySha256})——拒绝执行`, scriptSha256: sha, trustedCopyMismatch: true };
+      /* r10:mismatch 现在覆盖两种形态 —— ① hash 与复制之间源文件被换过;
+         ② 磁盘字节与观察快照字节本就不一致(exec 树的字节来自快照)。两者都意味着
+         「要执行的字节 ≠ 已 hash 的字节」,一律拒执行。missingInTree = 脚本在快照里根本不存在。 */
+      const why = copy.missingInTree
+        ? `脚本在可信执行树里不存在(${copy.missingInTree})——磁盘上有、观察快照里没有`
+        : `要执行的字节与已 hash 的字节不一致(磁盘 ${sha} → 可信树 ${copy.copySha256})——拒绝执行`;
+      return { status: 1, stdout: '', stderr: why, scriptSha256: sha, trustedCopyMismatch: true };
     }
     const res = spawnSync(process.execPath, [copy.exec, ...extraArgs], {
       cwd: demoDir,
