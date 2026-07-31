@@ -17,8 +17,8 @@
 //   ③ 快照 ⟷ 磁盘用**双向 manifest** 比对:disk→snapshot(新增)与 snapshot→disk(删除/改写)
 //      都遍历。单向 walk 看不见新增文件,这正是 PoC 能全链自洽的一环。
 
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, lstatSync, readlinkSync, copyFileSync, existsSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { cpSync, mkdtempSync, readdirSync, lstatSync, readlinkSync, existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { hashFile } from './fs-utils.mjs';
 import { findDemoSymlinks } from './repo-glob.mjs';
@@ -153,16 +153,64 @@ export function snapshotManifestDiff(snapshotDir, demoDir) {
  * spawn。后者中间存在窄 check/use 竞态:hash 与 spawn 之间同步的外部写入者可以换掉文件,
  * 于是「精确 hash 的字节被执行」这句话不成立。返回 { sha256, exec } —— exec 是要执行的副本路径。
  * 副本住在 demo 之外,被审方的后置脚本改不到它。
+ *
+ * r10 P0(e2e 实测):r8 只复制**单文件**,而 ESM 的相对 import 是按脚本自身位置解析的 ——
+ * `init.mjs` 生成的官方 extract.mjs 模板第一行就是
+ * `import { ... } from './extract-helpers.mjs'`(helpers 由 init 一并拷进 demo,设计意图是
+ * demo 自包含、随 PR 进产品仓)。单文件搬到 `<outputRoot>/trusted-scripts/` 后兄弟模块不在
+ * 旁边 → `ERR_MODULE_NOT_FOUND`,**官方脚手架的推荐写法在可信路径下跑不通**。
+ *
+ * 修法:复制的不是单文件而是**整棵树**,脚本在树内的原相对位置执行 —— 相对 import 天然可解析,
+ * 且不需要静态解析 import 图(作者可以动态 import 任意 demo 内文件,闭包边界本来就定不住)、
+ * 也不需要改写作者的 specifier(改写等于「执行的不再是已 hash 的字节」)。
+ *
+ * 树的字节来源是**观察快照**(sourceTree,由 makeObservationSnapshot 产出、已被
+ * observeBinding + 双向 manifest 证明 ≡ 磁盘),而不是磁盘原地:
+ *   · 「执行已 hash 的字节」仍然成立且被机械证明 —— sha256 取自磁盘脚本,复制完再算一次
+ *     树内那份的 hash,不等即 mismatch → 调用方 fail-closed。这一条比 r8 更强:它现在同时
+ *     要求「磁盘字节 ≡ 快照字节」,快照与磁盘在这条路径上分叉也会被拦下。
+ *   · 每次调用都开一棵**新树**,而且不是观察快照本身 —— demo 脚本可写自己所在的树,但它写到的
+ *     是这份一次性副本,动不到「已用于观察的那份快照字节」(I-OBSERVE 不回退),也不影响收口
+ *     manifest(收口比的是 snapshot ⟷ disk 两棵,与 exec 树无关)。脚本之间也互不串写。
+ *
+ * @param scriptAbs  磁盘上脚本的绝对路径(hash 的对象)
+ * @param outputRoot demo 之外的工具输出根
+ * @param demoDir    脚本所属 demo 根(用来算脚本在树内的相对位置)
+ * @param sourceTree 复制字节的来源树:**优先传观察快照**;没有快照时(如只跑门 X)传 demoDir,
+ *                   此时退化为「从磁盘复制整树」——仍是隔离副本、仍复算 hash,只是少了快照绑定。
  */
-export function trustedScriptCopy(scriptAbs, outputRoot, { subdir = 'trusted-scripts' } = {}) {
+export function trustedScriptCopy(scriptAbs, outputRoot, { demoDir, sourceTree, subdir = 'trusted-trees' } = {}) {
+  if (!demoDir || !sourceTree)
+    throw new Error('trustedScriptCopy 必须显式给出 demoDir 与 sourceTree —— 缺任一就退回到「单文件副本」,'
+      + '相对 import 会断(r10 P0)');
   if (!existsSync(scriptAbs)) return { sha256: null, exec: scriptAbs };
+  const demoRoot = resolve(demoDir);
+  const rel = resolve(scriptAbs).slice(demoRoot.length + 1);
+  if (!rel || rel.startsWith('..'))
+    throw new Error(`拒绝执行 demo 之外的脚本:${scriptAbs}(demo=${demoRoot})`);
   const sha = hashFile(scriptAbs);
-  const dir = join(outputRoot, subdir);
-  mkdirSync(dir, { recursive: true });
-  const exec = join(dir, `${sha.slice(0, 12)}-${basename(scriptAbs)}`);
-  copyFileSync(scriptAbs, exec);
-  /* 复制后再算一次副本的 hash:确认「我们要执行的这份字节」确实等于「我们声称 hash 过的那份」。
-     源文件在 hash 与 copy 之间被换掉时,这里会不等 → 返回 mismatch,调用方 fail-closed。 */
+  /* 纵深(同 makeObservationSnapshot):symlink 一律在前置门被拒;这里再拦一次,免得将来某条
+     路径绕过前置检查后,exec 树的 cpSync 又把仓外目标 dereference 成普通文件。 */
+  const links = findDemoSymlinks(resolve(sourceTree), { limit: 5 });
+  if (links.length)
+    throw new Error(`来源树含 symlink,拒绝建立可信执行树:${links.map((l) => `${l.path} -> ${l.target}`).join('、')}`);
+  const dir = mkdtempSync(join(outputRoot, `${subdir}-${sha.slice(0, 12)}-`));
+  const src = resolve(sourceTree);
+  cpSync(src, dir, {
+    recursive: true,
+    dereference: true,
+    filter: (p) => {
+      const abs = resolve(p);
+      if (abs === src) return true;
+      return !isSkippedRel(abs.slice(src.length + 1));
+    },
+  });
+  const exec = join(dir, rel);
+  if (!existsSync(exec))
+    return { sha256: sha, exec, copySha256: null, mismatch: true, missingInTree: rel };
+  /* 复算树内那份的 hash:确认「我们要执行的这份字节」确实等于「我们声称 hash 过的那份」。
+     源文件在 hash 与复制之间被换掉、或磁盘与快照本就分叉时,这里会不等 → mismatch,
+     调用方 fail-closed。 */
   const copySha = hashFile(exec);
-  return { sha256: sha, exec, copySha256: copySha, mismatch: copySha !== sha };
+  return { sha256: sha, exec, copySha256: copySha, mismatch: copySha !== sha, tree: dir };
 }

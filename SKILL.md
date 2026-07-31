@@ -430,10 +430,20 @@ symlink，其目标 JS 把 `.box` 改成 `16px`，`index.html` 引用它。实�
 
 **门 X / extractor 执行可信副本（r8 条目 C）**：此前 `hashFile(scriptAbs)` 之后仍按**同一路径**
 `spawnSync`，不是原子执行已哈希的字节 —— hash 与 spawn 之间的写入者可以换掉文件，「精确 hash 的脚本
-字节被执行」这句话就不成立。r8 起把已 hash 的字节复制到 output root 的 `trusted-scripts/` 再执行副本，
-并复算副本 hash 与源 hash 比对，不等即拒绝执行。**接口约定（破坏性）**：被执行的是副本，所以
-`extract.mjs` 与自定义门脚本必须用 `--demo <dir>` argv（两者都会收到）或 cwd（仍是 demoDir）定位 demo，
-**不能**靠 `import.meta.url` 推断自己在 demo 里。
+字节被执行」这句话就不成立。r8 起把已 hash 的字节复制到 output root 再执行副本，并复算副本 hash 与源
+hash 比对，不等即拒绝执行。**接口约定（破坏性）**：被执行的是副本，所以 `extract.mjs` 与自定义门脚本
+必须用 `--demo <dir>` argv（两者都会收到）或 cwd（仍是 demoDir）定位 demo，**不能**靠
+`import.meta.url` 推断自己在 demo 里。
+
+> **r10 修正（整树副本）**：r8 复制的是**单文件**（`trusted-scripts/<hash12>-<name>`），而 ESM 的相对
+> `import` 按脚本自身位置解析 —— init 生成的官方 `extract.mjs` 模板第一行就是
+> `import { ... } from './extract-helpers.mjs'`，单文件搬走之后兄弟模块不在旁边，
+> `ERR_MODULE_NOT_FOUND`：**官方脚手架的推荐写法在可信路径下跑不通**（正式 e2e 抓到，十轮终审全漏）。
+> r10 起复制的是**整棵树**到 `trusted-trees-<hash12>-<rand>/`，脚本在树内的原相对位置执行，相对
+> `import`（含子目录）天然可用。树的字节取自**观察快照**，所以 (d) 不但保住还更强：mismatch 现在同时
+> 覆盖「磁盘字节 ≠ 快照字节」。每次调用开一棵新树、且不是快照本身 —— demo 脚本写自己所在的树时动不到
+> 已用于观察的那份快照字节（(a) 不回退），收口 manifest 比的仍是 snapshot ⟷ disk，不受影响。
+> 作者侧接口不变：仍用 `--demo` / cwd 定位 demo，不要靠 `import.meta.url`（它现在指向 exec 树）。
 
 **门 X 无 OS 沙箱的降级为什么可以接受**：需要同时成立四条 —— (a) 所有可信观察固定在**完整**快照；
 (b) 后置脚本只能污染不被信任的原目录（观察已完成，快照在 demo 之外它碰不到）；(c) 出块前做双向
