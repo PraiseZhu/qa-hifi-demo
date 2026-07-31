@@ -24,7 +24,17 @@ import { freshLoad, replay } from './lib/replay.mjs';
 import { compareImages, loadPngApi, readPng, writePng } from './lib/png-compare.mjs';
 /* r8 条目 A:门 E 此前**完全不走快照** —— 直接 serve/read demoDir 与 baseline PNG,于是
    「所有核心浏览器观察共用同一不可变快照」这句话对门 E 不成立(审核人指出的组成性不一致)。
-   现在与 verify 共用同一份实现:整树快照(含 baseline PNG)+ 双向 manifest。 */
+   现在与 verify 共用同一份实现:整树快照(含 baseline PNG)+ 双向 manifest。
+
+   ⚠️ r12 边界告示(审核人要求写死在这里)——本脚本的收口仍用 `snapshotManifestDiff`
+   (快照文件树 ⟷ 磁盘),**成立的唯一前提是本进程从建快照到收口之间不执行任何 demo 侧脚本**
+   (全文无 spawnSync / execFileSync / 动态 import demo 代码,门 E 只跑浏览器与 PNG 比对)。
+   verify.mjs 因为要跑 extract.mjs / 自定义门,已在 r11 改成「分界线前冻结进父进程内存的
+   manifest」作为收口 oracle —— 原因是快照与 exec 树同处可枚举可写的 tmpdir,后置脚本能把
+   两边同步改成相同字节让文件树比对报全等。
+   **一旦本脚本将来引入任何 demo 脚本执行(自定义像素门、作者提供的裁决脚本、后处理钩子……),
+   必须同步改用 observe.captureFrozenManifest / diffAgainstFrozen 的冻结 oracle**,
+   否则门 E 会重新落进同一个「两个当前可变对象现在相等」的陷阱。 */
 import { makeObservationSnapshot, snapshotManifestDiff } from './lib/observe.mjs';
 
 const args = process.argv.slice(2);
