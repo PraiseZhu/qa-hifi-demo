@@ -17,7 +17,9 @@ export function isPlainObject(value) {
 export function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (isPlainObject(value)) {
-    const out = {};
+    /* r12:无原型对象。普通对象下 `out['__proto__'] = v` 静默丢弃 —— 于是 manifest 里名为
+       __proto__ 的路径在 canonicalize 之后消失,sameInputHashes 对它的改动完全失明。 */
+    const out = Object.create(null);
     for (const key of Object.keys(value).sort()) out[key] = canonicalize(value[key]);
     return out;
   }
@@ -453,7 +455,14 @@ export function recheckComponentCss(demoDir, component) {
  */
 export function buildComponentHashes(demoDir, component) {
   const repoRoot = findGitRepoRoot(demoDir);
-  const out = { manifest: 'NO_MANIFEST', sources: {}, demoInputs: {}, bundle: {} };
+  /* r12:sources / demoInputs / bundle 的 key 都是**作者可控的相对路径**
+     (component.inputs.json 声明的),普通对象下名为 __proto__ 的那条会静默不入链。 */
+  const out = {
+    manifest: 'NO_MANIFEST',
+    sources: Object.create(null),
+    demoInputs: Object.create(null),
+    bundle: Object.create(null),
+  };
   const manifest = readComponentInputsManifest(demoDir);
   if (manifest) out.manifest = hashFile(join(demoDir, COMPONENT_INPUTS_FILE));
   if (!repoRoot) out.repoRoot = 'UNRESOLVED';
@@ -553,7 +562,7 @@ export function buildInputHashes(demoDir, spec = null) {
   // pr-block 拒绝出块——体外 gate 不再游离于 report 完整性校验之外
   const customGates = Array.isArray(spec?.customGates) ? spec.customGates : [];
   if (customGates.length) {
-    hashes.customGates = {};
+    hashes.customGates = Object.create(null);   // r12:路径为 key,必须无原型
     for (const g of customGates) {
       if (g && typeof g.script === 'string' && g.script) {
         const file = join(demoDir, g.script);

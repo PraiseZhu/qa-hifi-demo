@@ -111,8 +111,9 @@ if (checkMode) {
     console.log(JSON.stringify({ ok: true, drift: false }));
     process.exit(0);
   }
-  let a = {};
-  let b = {};
+  // r12:解析失败时的兜底值也用无原型对象,免得 a['__proto__'] 取到原型
+  let a = Object.create(null);
+  let b = Object.create(null);
   try { a = JSON.parse(existing); b = JSON.parse(fresh); } catch {}
   const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
   const driftedKeys = keys.filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k]));

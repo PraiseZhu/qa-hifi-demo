@@ -185,7 +185,7 @@ export function canonicalJson(value) {
     if (Array.isArray(v)) return v.map(norm);
     if (v !== null && typeof v === 'object' && Object.getPrototypeOf(v) !== null && Object.getPrototypeOf(v) !== Object.prototype) return v;
     if (v !== null && typeof v === 'object') {
-      const out = {};
+      const out = Object.create(null);   // r12:同 fs-utils.canonicalize,__proto__ 键不许被静默丢弃
       for (const k of Object.keys(v).sort()) out[k] = norm(v[k]);
       return out;
     }
@@ -586,7 +586,7 @@ export function extractThemeVars(colorsFile, { prefix, demoDir = process.cwd(), 
   if (!existsSync(abs)) throw new Error(`extractThemeVars: 源文件不存在:${abs}`);
   const src = readFileSync(abs, 'utf8');
 
-  const out = {};
+  const out = Object.create(null);   // r12:key 是产品源码里的 color id,同一形状
   const skipped = [];
   let scanned = 0;
   REGISTER_COLOR_HEAD.lastIndex = 0;

@@ -134,7 +134,8 @@ export async function applyCase(page, testCase) {
 export async function measureAdaptive(page, frameSel, probes) {
   const frame = await page.locator(frameSel).first().boundingBox();
   if (!frame) throw new Error(`门F 量不到帧元素 ${frameSel} 的 boundingBox`);
-  const out = { frame: { w: frame.width, h: frame.height }, probes: {} };
+  // r12:probes 的 key 是 spec 里作者可控的 probe id,同一形状 —— 用无原型对象
+  const out = { frame: { w: frame.width, h: frame.height }, probes: Object.create(null) };
   for (const p of probes) {
     const loc = page.locator(p.sel).first();
     if ((await loc.count()) === 0) { out.probes[p.id] = null; continue; }
