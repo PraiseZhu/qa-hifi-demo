@@ -470,6 +470,24 @@ manifest，它碰不到）；(c) 出块前做双向比对（基准 = 那份冻�
 > 观察快照（因此与观察态一致，且它们若是 demo 内文件也在冻结 manifest 的范围里），但 report 里
 > `scriptSha256` 这个字段只对入口脚本成立。任何文案都不得把这个绑定说成覆盖整棵依赖树。
 
+> **r12(路径为 key 的映射不许用普通对象)**：`captureFrozenManifest` 原来用 `const entries = {}`，
+> 于是文件名为 `__proto__` 时 `entries['__proto__'] = record` 不建 own property（触发
+> `Object.prototype.__proto__` setter），两头都瞎——冻结基准侧 `Object.keys` 遍历不到，disk 侧
+> `rel in entries` 又因原型链恒为 true。`safe-server` 能服务 `/__proto__`，配 `asset-sha` binding
+> 就是一条可用的绕过（审核人 PoC 实测 `verify exit 0` / `snapshotDrift "none"`，而交付资源字节已变）。
+> 修法：`Object.create(null)` + `Object.hasOwn`（**禁止 `in` 做 membership**）；`Object.freeze` 对无
+> 原型对象照样生效。全仓同形状的路径/名字映射一并改（`canonicalize`、`inputHashes.customGates`、
+> `buildComponentHashes` 的 sources/demoInputs/bundle、`unwrapTruth`/`truthAt`、`canonicalJson`、
+> `extractThemeVars`、`packageExports`、门 F 的 `probes`、`html-lite` 的 `attrs`、`dom-ops` 的
+> attr/style diff、`style-convert` 的 `mechanical`），由 comp-fix-r12 的「全表」契约测试钉住。
+
+**门 E（pixel-compare）为什么可以继续用「快照文件树 ⟷ 磁盘」收口**：它的生命周期内**不执行任何
+demo 侧脚本**（全文无 `spawnSync`/`execFileSync`，只跑浏览器与 PNG 比对），因此没有「同步改快照 +
+磁盘」的执行载体。**这是一条有前提的豁免**：一旦 pixel-compare 将来引入任何 demo 脚本执行（自定义
+像素门、作者裁决脚本、后处理钩子等），必须同步改用 `observe.captureFrozenManifest` /
+`diffAgainstFrozen` 的冻结 oracle，否则门 E 会重新落进同一个陷阱。告示同时写在
+`scripts/pixel-compare.mjs` 建快照那段的注释里。
+
 **pr-block 侧同理**：门 E 的可信重跑必须排在可信 verify **之前** —— verify 末段会执行 demo
 代码，排在其后的那次真实渲染观察正好落在攻击窗口里。
 

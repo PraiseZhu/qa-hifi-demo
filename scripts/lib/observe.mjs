@@ -167,7 +167,14 @@ export function snapshotManifestDiff(snapshotDir, demoDir) {
  * @returns {{root: string, capturedAt: string, entries: Readonly<Record<string, Readonly<{type: string, linkTarget: string|null, sha256: string|null}>>>}}
  */
 export function captureFrozenManifest(root, { label = 'pre-untrusted' } = {}) {
-  const entries = {};
+  /* r12 P0:**必须是无原型对象**。普通对象下 `entries['__proto__'] = record` 不会创建 own
+     property —— 它触发 Object.prototype 的 __proto__ setter,于是两头都瞎:
+     `Object.keys` 遍历不到这条路径(冻结基准里没有它),而 disk 侧 `'__proto__' in entries`
+     又因原型链返回 true(所以也不进 added)。实测:普通对象 keys=[] / hasOwn=false /
+     'in' === true;Object.create(null) 则 keys=["__proto__"] / hasOwn=true。
+     `safe-server` 能服务 `/__proto__`,配 asset-sha binding 就是一条可用的绕过。
+     `Object.freeze` 对无原型对象照样生效,三层 freeze 保留。 */
+  const entries = Object.create(null);
   for (const rel of listFilesRel(root)) {
     const k = entryKind(root, rel);
     entries[rel] = Object.freeze({ type: k.type, linkTarget: k.linkTarget, sha256: k.sha256 });
@@ -189,7 +196,7 @@ export function diffAgainstFrozen(frozen, diskDir) {
   const retyped = [];
   for (const rel of Object.keys(frozen.entries)) {
     if (!disk.has(rel)) { removed.push(rel); continue; }
-    const a = frozen.entries[rel];
+    const a = frozen.entries[rel];   // 无原型对象:这里取到的一定是 own value
     const b = entryKind(diskDir, rel);
     if (a.type !== b.type || a.linkTarget !== b.linkTarget) {
       retyped.push({ path: rel, snapshot: a.type, disk: b.type, snapshotTarget: a.linkTarget, diskTarget: b.linkTarget });
@@ -197,7 +204,9 @@ export function diffAgainstFrozen(frozen, diskDir) {
     }
     if (a.type === 'file' && a.sha256 !== b.sha256) changed.push(rel);
   }
-  const added = [...disk].filter((rel) => !(rel in frozen.entries)).sort();
+  /* r12 P0:**禁止用 `in`** —— 它会走原型链,`'__proto__' in entries` / `'toString' in entries`
+     恒为 true,于是新增的这类文件名永远进不了 added。一律 Object.hasOwn。 */
+  const added = [...disk].filter((rel) => !Object.hasOwn(frozen.entries, rel)).sort();
   const all = [
     ...added.map((r) => `${r}(验收期间新增)`),
     ...removed.map((r) => `${r}(验收期间被删除)`),

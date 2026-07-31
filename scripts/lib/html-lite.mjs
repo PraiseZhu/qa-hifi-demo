@@ -91,7 +91,7 @@ export function parseHtml(html) {
     const nameMatch = /^([a-zA-Z][^\s/>]*)/.exec(inner);
     if (!nameMatch) throw new ParseError('无法解析标签名', lt);
     const tag = nameMatch[1].toLowerCase();
-    const attrs = {};
+    const attrs = Object.create(null);   // r12:属性名由页面控制,可能是 __proto__
     ATTR_RE.lastIndex = nameMatch[0].length;
     let m;
     while ((m = ATTR_RE.exec(inner))) {

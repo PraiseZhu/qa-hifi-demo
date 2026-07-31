@@ -189,7 +189,7 @@ const camelize = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
  * @returns { mechanical: Record<string, unknown>, rejected: [{prop, value, reason}] }
  */
 export function convertDeclarations(decls) {
-  const mechanical = {};
+  const mechanical = Object.create(null);   // r12:CSS/RN 属性名为 key,同一形状
   const rejected = [];
   for (const { prop, value } of decls) {
     const p = String(prop ?? '').trim();

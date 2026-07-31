@@ -173,7 +173,9 @@ test('makeLeaf: keyPath 记进 provenance.locatorKeyPath;坏路径拒绝', () =>
 
 test('style-sync: padding shorthand 展开为四边 number', () => {
   const { mechanical, rejected } = convertDeclarations([{ prop: 'padding', value: '8px 16px' }]);
-  assert.deepEqual(mechanical, { paddingTop: 8, paddingRight: 16, paddingBottom: 8, paddingLeft: 16 });
+  // r12:mechanical 改成无原型对象(名字为 key 的映射统一收紧);期望值同构,顺带钉住原型
+  assert.deepEqual(mechanical, Object.assign(Object.create(null), { paddingTop: 8, paddingRight: 16, paddingBottom: 8, paddingLeft: 16 }));
+  assert.equal(Object.getPrototypeOf(mechanical), null, 'r12:必须无原型');
   assert.deepEqual(rejected, []);
 });
 
@@ -183,7 +185,7 @@ test('style-sync: passthrough 陷阱必须拒(1rem / calc / var)', () => {
     { prop: 'height', value: 'calc(100% - 8px)' },
     { prop: 'color', value: 'var(--fg)' },
   ]);
-  assert.deepEqual(mechanical, {});
+  assert.deepEqual(mechanical, Object.create(null));   // r12:无原型对象(见上)
   assert.equal(rejected.length, 3);
   assert.match(rejected[0].reason, /非 px 单位/);
   assert.match(rejected[1].reason, /不可静态求值/);
@@ -192,7 +194,7 @@ test('style-sync: passthrough 陷阱必须拒(1rem / calc / var)', () => {
 
 test('style-sync: shorthand 原子——padding 混 1rem 整条拒', () => {
   const { mechanical, rejected } = convertDeclarations([{ prop: 'padding', value: '8px 1rem' }]);
-  assert.deepEqual(mechanical, {});
+  assert.deepEqual(mechanical, Object.create(null));   // r12:无原型对象(见上)
   assert.equal(rejected.length, 1);
   assert.equal(rejected[0].prop, 'padding');
 });

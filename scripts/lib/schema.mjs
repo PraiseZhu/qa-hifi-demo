@@ -543,7 +543,7 @@ export function unwrapTruth(value) {
   if (isPlainObject(value) && Object.hasOwn(value, 'value')) return value.value;
   if (Array.isArray(value)) return value.map(unwrapTruth);
   if (isPlainObject(value)) {
-    const out = {};
+    const out = Object.create(null);   // r12:truth 里名为 __proto__ 的叶子不许在解包时消失
     for (const [k, v] of Object.entries(value)) out[k] = unwrapTruth(v);
     return out;
   }
@@ -551,7 +551,12 @@ export function unwrapTruth(value) {
 }
 
 export function truthAt(truth, path) {
-  const raw = path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), truth);
+  /* r12:逐段必须走 own property —— 裸 `o[k]` 会让 `truth: '__proto__'` /
+     `'constructor'` 之类的 binding 取到原型链上的东西(而 truth 里根本没有这条叶子),
+     结果是「binding 指向了不存在的真值却拿到了一个对象」。hasOwn 之下这类 path 一律 undefined,
+     由既有的「binding 指向的 truth 路径不存在」那条检查报错。 */
+  const raw = path.split('.').reduce(
+    (o, k) => (o == null || !Object.hasOwn(o, k) ? undefined : o[k]), truth);
   return raw === undefined ? undefined : unwrapTruth(raw);
 }
 

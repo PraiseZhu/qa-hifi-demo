@@ -300,13 +300,13 @@ export async function computeComponentBuild({ demoDir, checkOnly = false }) {
      (如 "./brand-identity": "./src/brandIdentity.ts")只能查 package.json 的 exports,
      路径探测猜不出来。包根 = <packageRoots 值>/..(约定值指到包内 src)。
      读过的 package.json 同样是构建输入(改 exports 会改整张图),记进 buildInputs 进链。 */
-  const packageExports = {};
+  const packageExports = Object.create(null);   // r12:包名为 key
   const readPackageJsons = [];
   for (const [pkg, root] of Object.entries(packageRoots)) {
     const pkgJson = join(root, '..', 'package.json');
     if (!existsSync(pkgJson)) continue;
     readPackageJsons.push(pkgJson);
-    const map = {};
+    const map = Object.create(null);   // r12:exports 子路径为 key
     for (const [sub, target] of Object.entries(JSON.parse(readFileSync(pkgJson, 'utf8')).exports ?? {})) {
       if (typeof target === 'string') map[sub.replace(/^\.\/?/, '')] = join(root, '..', target);
     }
