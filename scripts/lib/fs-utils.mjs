@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { DEMO_BUILD_FILES } from './component-build-core.mjs';
 import { expandRepoGlob, findDemoNodeModules, findDemoSymlinks } from './repo-glob.mjs';
 
-export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r10';
+export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r11';
 
 export function isPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
