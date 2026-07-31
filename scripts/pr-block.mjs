@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildAssetsManifest, checkDemoNoNodeModules, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
+import { buildAssetsManifest, checkDemoNoNodeModules, checkDemoNoSymlinks, failProblems, sameInputHashes, TOOL_VERSION } from './lib/fs-utils.mjs';
 import { validateSpec } from './lib/schema.mjs';
 import { validatePixelForPr, validatePixelReport, validateReportIntegrity } from './lib/report.mjs';
 /* 门字母 ⟷ runner 的唯一机读映射 + taint 标记(r7 条目 7)。
@@ -90,6 +90,9 @@ if (preview) {
 {
   const nm = checkDemoNoNodeModules(demoDir);
   if (nm.length) failProblems(nm);
+  // r9 P0:symlink 同样在读取任何 demo 输入之前无条件拒(观察对象 ≠ 交付对象)。
+  const sl = checkDemoNoSymlinks(demoDir);
+  if (sl.length) failProblems(sl);
 }
 
 const specPath = join(demoDir, 'spec.json');

@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEMO_BUILD_FILES } from './component-build-core.mjs';
-import { expandRepoGlob, findDemoNodeModules } from './repo-glob.mjs';
+import { expandRepoGlob, findDemoNodeModules, findDemoSymlinks } from './repo-glob.mjs';
 
 export const TOOL_VERSION = 'qa-hifi-demo@2026-07-30-component-mode-r9';
 
@@ -192,6 +192,29 @@ export function checkDemoNoNodeModules(demoDir) {
     + '也不在构建期文件对照表里。'
     + '\n修法:删掉 demo 里的 node_modules(以及 package.json 里多余的 dependencies),'
     + '需要宿主依赖时设 QA_HIFI_MODULE_ROOT 指向装了依赖的仓。',
+  ];
+}
+
+/* ── fail-closed:demo 输入树里不许有任何 symlink(r9 P0) ──
+   与 checkDemoNoNodeModules 同属**前置门**阶段:必须排在建立快照之前,不能等快照建完
+   才发现 —— 快照一建起来,dereference 就已经把「观察对象」造成了与交付对象不同的东西。
+   拒收理由(三处语义分叉)见 repo-glob.findDemoSymlinks 的头注。 */
+export function checkDemoNoSymlinks(demoDir) {
+  const links = findDemoSymlinks(demoDir);
+  if (!links.length) return [];
+  return [
+    'demo 输入树里检测到 symlink,拒绝——验证要求「可信侧观察到的页面」逐字节等于「实际交付的页面」,'
+    + '而 symlink 在三处的语义不一致:'
+    + `\n${links.map((l) => `  · ${l.path} -> ${l.target}`).join('\n')}`
+    + '\n  ① 不可变快照用 cpSync(dereference:true) 建立,链接目标的字节被复制成快照内的**普通文件**,'
+    + '快照 server 返回 200 —— 可信侧「看得见」这个资源;'
+    + '\n  ② 交付/原地 server 对目标做 realpath 后要求落在 demo 根内,指向 demo 之外的链接一律 **403**'
+    + ' —— 交付页面上这个资源根本加载不到;'
+    + '\n  ③ 部署侧对 symlink 的处理不确定(可能 dereference、可能直接失效)。'
+    + '\n于是「观察到的页面」比「交付的页面」多了本该被拒的资源,可信侧判绿而交付页面是错的。'
+    + '\n指向 demo 内部的 symlink 同样拒:dereference 后同样变成普通文件,原地/快照/部署三处语义仍不一致。'
+    + '\n修法:把这些 symlink 复制成真实文件(cp -L / 直接把内容写进 demo),让 demo 树里只有普通文件。'
+    + '\n(demo 自带 node_modules 是另一道门 checkDemoNoNodeModules 负责,这里不重复点名。)',
   ];
 }
 
