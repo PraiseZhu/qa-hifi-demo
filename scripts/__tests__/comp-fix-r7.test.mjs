@@ -710,7 +710,12 @@ test('条目 4 源码契约(不 skip): 快照在前置门之后、任何 demo �
   const iSnap = v.indexOf('snapshotDir = makeObservationSnapshot(demoDir)');
   const iServe = v.indexOf('createSafeStaticServer(snapshotDir)');
   const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
-  const iDrift = v.indexOf("manifestCheckpoint('post-run')");   // r8:单向 drift → 双向 manifest
+  /* r11 更新(不是回退):收口比对的调用点从 manifestCheckpoint('post-run')(snapshot 文件树 vs disk)
+     换成 diffAgainstFrozen(frozenSnapshot, demoDir) —— 基准改成分界线前冻结在父进程内存里的
+     manifest。原因:snapshot 与 exec 树同处可枚举可写的 tmpdir,后置脚本能把两边同步改成相同字节
+     让旧口径报全等(审核人 PoC,见 comp-fix-r11.test.mjs)。次序要求不变且更严:冻结必须在分界线
+     **之前**、比对必须在分界线**之后**,两条都由 comp-fix-r11 的源码契约另行钉住。 */
+  const iDrift = v.indexOf('diffAgainstFrozen(frozenSnapshot, demoDir)');   // r8:单向→双向;r11:基准换成冻结内存 manifest
   for (const [l, i] of [['node_modules 前置门', iNm], ['快照建立', iSnap], ['从快照起服务', iServe],
     ['分界线', iBoundary], ['快照偏离比对', iDrift]]) assert.ok(i > 0, `verify.mjs 里找不到 ${l}`);
   assert.ok(iNm < iSnap, '快照必须建立在 demo node_modules fail-fast 之后');

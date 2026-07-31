@@ -281,7 +281,14 @@ test('条目 B 源码契约(不 skip): 快照先建 → 三项复算 → 绑定�
   const iServe = v.indexOf('createSafeStaticServer(snapshotDir)');
   const iBrowser = v.indexOf('launchChromium(demoDir');
   const iBoundary = v.indexOf('分界线:以下开始执行 demo 侧代码');
-  const iPost = v.indexOf("manifestCheckpoint('post-run')");
+  /* r11 更新(不是回退):收口比对的调用点从 manifestCheckpoint('post-run')(snapshot 文件树 vs disk)
+     换成 diffAgainstFrozen(frozenSnapshot, demoDir) —— 基准改成分界线前冻结在父进程内存里的
+     manifest。原因:snapshot 与 exec 树同处可枚举可写的 tmpdir,后置脚本能把两边同步改成相同字节
+     让旧口径报全等(审核人 PoC,见 comp-fix-r11.test.mjs)。次序要求不变且更严:冻结必须在分界线
+     **之前**、比对必须在分界线**之后**,两条都由 comp-fix-r11 的源码契约另行钉住。 */
+  const iPost = v.indexOf('diffAgainstFrozen(frozenSnapshot, demoDir)');
+  const iFreeze = v.indexOf('frozenSnapshot = captureFrozenManifest(snapshotDir)');
+  assert.ok(iFreeze > 0, 'r11:必须有分界线前的冻结捕获');
   for (const [l, i] of [['前置门', iNm], ['快照建立', iSnap], ['复算调用', iRecheckCall], ['绑定检查点', iBind],
     ['服务快照', iServe], ['launchChromium', iBrowser], ['分界线', iBoundary], ['收口 manifest', iPost]])
     assert.ok(i > 0, `verify.mjs 里找不到 ${l}——次序契约无法判定(重排时请同步更新本测试)`);
@@ -290,7 +297,9 @@ test('条目 B 源码契约(不 skip): 快照先建 → 三项复算 → 绑定�
   assert.ok(iRecheckCall < iBind, '绑定检查点必须排在复算之后——它证明的是「复算读到的磁盘字节 ≡ 快照字节」');
   assert.ok(iBind < iServe && iServe < iBrowser, '绑定成立之后才起服务与浏览器');
   assert.ok(iBrowser < iBoundary, '浏览器观察必须早于执行 demo 代码');
-  assert.ok(iBoundary < iPost, '收口 manifest 必须排在执行 demo 代码之后');
+  assert.ok(iBrowser < iFreeze && iFreeze < iBoundary,
+    'r11:冻结必须在浏览器观察完成之后、执行 demo 代码之前——晚于分界线就等于把可能已被污染的树当基准');
+  assert.ok(iBoundary < iPost, '收口比对必须排在执行 demo 代码之后');
 });
 
 test('条目 B 文档契约(不 skip): SKILL.md 的时序与 I-OBSERVE 表述必须与实现一致', () => {
