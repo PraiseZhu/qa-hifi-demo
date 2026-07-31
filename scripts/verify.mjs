@@ -76,6 +76,8 @@ import {
   SNAPSHOT_SKIP_TOP,
   isSkippedRel,
   listFilesRel,
+  captureFrozenManifest,
+  diffAgainstFrozen,
   makeObservationSnapshot,
   makeOutputRoot,
   snapshotManifestDiff,
@@ -287,6 +289,8 @@ const needSnapshot = needBrowser || runGate('A');
    输出改写到 demo 之外的 output root,盲区本身被消掉。
    失败即 fail-closed:拿不到不可变观察对象就不许继续(不静默退回原地加载)。 */
 let snapshotDir = null;
+/* r11 P0:分界线前冻结的内存 manifest —— 收口比对的唯一 oracle(见分界线处的注释)。 */
+let frozenSnapshot = null;
 
 /* ── 工具运行期输出的独立根(r8 条目 A ②)──
    失败截图与门 X/extractor 的可信脚本副本一律写在这里,不再写进 demo 树 —— 这样 demo 树里
@@ -809,6 +813,15 @@ try {
     }
   }
 
+  /* ── r11 P0:把「当时被观察的字节」搬进父进程内存并冻结,**必须在执行任何 demo 侧代码之前** ──
+     成因:snapshot 与 exec 树同处用户可枚举、可写的 os.tmpdir();custom gate 是任意 Node 代码,
+     枚举 `qa-hifi-snapshot-*` + 按 spec.json 的 meta.name 认出本次快照,再把 snapshot 与 disk
+     **同步**改成相同字节 —— 收口的 snapshot⟷disk 比对于是报全等,而交付页面已经是错的。
+     审核人的定性:「manifest 证明的只是『两个当前可变对象现在相等』,不再证明『最终交付等于
+     当时被观察的字节』」。随机后缀只防猜、不防同权限枚举,所以不去挡枚举(挡不住),而是把
+     oracle 搬到子进程碰不到的地方 —— 父进程内存,冻结,不落盘。收口只与它比。 */
+  if (snapshotDir) frozenSnapshot = captureFrozenManifest(snapshotDir);
+
   /* ══════════ 分界线:以下开始执行 demo 侧代码(r7 条目 1) ══════════
      以上所有**核心观察**已完成:门 A 的静态段与三项可信侧字节复算、门 B/C/D/F 的全部
      浏览器实测。以下两段(门 A 的 extractor drift、门 X 的自定义门)都要跑 demo 目录里的
@@ -842,6 +855,24 @@ try {
         ? `脚本在可信执行树里不存在(${copy.missingInTree})——磁盘上有、观察快照里没有`
         : `要执行的字节与已 hash 的字节不一致(磁盘 ${sha} → 可信树 ${copy.copySha256})——拒绝执行`;
       return { status: 1, stdout: '', stderr: why, scriptSha256: sha, trustedCopyMismatch: true };
+    }
+    /* r11 纵深:exec 树逐次从快照复制,而快照住在可枚举可写的 tmpdir —— 前一个脚本改了快照,
+       后一个脚本的 exec 树就会带上被污染的**兄弟模块**(入口脚本本身有 hash 绑定,兄弟模块没有)。
+       这不构成越权(gate1 与 gate2 同属一个作者),但会让「exec 树的兄弟模块字节 ≡ 观察态字节」
+       这句话变假。这里拿分界线前冻结的内存 manifest 逐条校一遍刚复制出来的树,不符即拒绝执行 ——
+       于是那句话恒真。frozenSnapshot 为空(只跑门 X、没有快照)时跳过,并在下面如实标注。 */
+    if (frozenSnapshot && copy.tree) {
+      const treeDiff = diffAgainstFrozen(frozenSnapshot, copy.tree);
+      if (treeDiff.all.length) {
+        return {
+          status: 1,
+          stdout: '',
+          stderr: '可信执行树的字节与观察时冻结的 manifest 不一致('
+            + `${treeDiff.all.slice(0, 5).join('、')})——观察快照在本次验收过程中被改写过,拒绝执行`,
+          scriptSha256: sha,
+          trustedTreeDrift: treeDiff.all.slice(0, 10),
+        };
+      }
     }
     const res = spawnSync(process.execPath, [copy.exec, ...extraArgs], {
       cwd: demoDir,
@@ -927,7 +958,7 @@ try {
      诚实标注:攻击可以在父进程退出后才恢复原文件,从而让前后两次 hash 都自洽 ——
      所以这一条**不是**主防线,主防线是「核心观察全部排在执行 demo 代码之前」。 */
   const inputHashesPost = buildInputHashes(demoDir, spec);
-  if (!gateA.skipped && snapshotDir) {
+  if (!gateA.skipped && snapshotDir && frozenSnapshot) {
     /* I-OBSERVE 的收口比对:快照(观察对象)与磁盘逐字节比对。比单纯的 hash-vs-hash 更强 ——
        快照住在 demo 之外,demo 侧代码碰不到它,所以「改了又恢复」在这里同样无处可藏的前提是
        改动发生在快照建立之后且未复原;真正的保证仍来自「观察对象一开始就固定了」。 */
@@ -945,10 +976,15 @@ try {
         + '验证时取不到、交付原地却可能取到:被验证的页面与交付的页面不同。',
       ].filter(Boolean).join('\n');
     }
-    /* ⑥ 收口:双向 manifest(r8 条目 A)。disk→snapshot 与 snapshot→disk 都遍历 ——
-       单向 walk 看不见「验收期间新增页面可达文件」这一整类,而 PoC 用的就是「加一个 late.js」。
-       工具自己的运行期输出已经全部写在 demo 之外的 output root,所以这里不需要任何按名豁免。 */
-    const diff = manifestCheckpoint('post-run');
+    /* ⑥ 收口:双向比对(r8 条目 A)。disk→观察态 与 观察态→disk 都遍历 —— 单向 walk 看不见
+       「验收期间新增页面可达文件」这一整类,而审核人 PoC 用的就是「加一个 late.js」。
+       工具自己的运行期输出已经全部写在 demo 之外的 output root,所以这里不需要任何按名豁免。
+       r11 P0:基准**不再是 snapshot 文件树**,而是分界线前冻结的内存 manifest ——
+       snapshot 与 exec 树同处可枚举可写的 tmpdir,后置脚本能把两边同步改成相同字节让
+       snapshot⟷disk 报全等(见分界线处注释)。换成内存基准之后,「同步改 snapshot + disk」失效:
+       子进程改不到父进程内存。冻结 manifest 是 snapshot **整树**,因此也覆盖了
+       buildInputHashes 窄范围之外的文件(PoC 的 late.js 正是这一类)。 */
+    const diff = { when: 'post-run', ...diffAgainstFrozen(frozenSnapshot, demoDir) };
     gateA.snapshotDrift = diff.all.length ? diff.all.slice(0, 10) : 'none';
     gateA.snapshotManifest = { added: diff.added.length, removed: diff.removed.length, changed: diff.changed.length };
     if (diff.all.length) {
@@ -957,6 +993,7 @@ try {
         gateA.detail,
         `验收期间 demo 侧文件与观察快照发生偏离(新增 ${diff.added.length} / 删除 ${diff.removed.length} / 改写 ${diff.changed.length}):`
         + `${diff.all.slice(0, 5).join('、')}`
+        + '\n(基准是分界线前冻结在父进程内存里的观察态字节,不是 tmp 下那棵仍可被改写的快照树)'
         + '\n浏览器观察用的是验证开始时的不可变快照,所以本次测量结果本身仍然可信;'
         + '但磁盘上的 demo 已不是被观察的那一份,PR 带走的会是另一个版本。'
         + '\n修法:extract.mjs 与自定义门必须只读,不得改写或新增 demo 文件。',
