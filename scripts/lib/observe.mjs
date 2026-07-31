@@ -17,10 +17,11 @@
 //   ③ 快照 ⟷ 磁盘用**双向 manifest** 比对:disk→snapshot(新增)与 snapshot→disk(删除/改写)
 //      都遍历。单向 walk 看不见新增文件,这正是 PoC 能全链自洽的一环。
 
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, statSync, copyFileSync, existsSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, lstatSync, readlinkSync, copyFileSync, existsSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { hashFile } from './fs-utils.mjs';
+import { findDemoSymlinks } from './repo-glob.mjs';
 
 /* 快照唯一跳过的顶层目录。**不是**「豁免清单」——这两项都不是页面可达的交付字节:
    node_modules 由 checkDemoNoNodeModules 无条件拒(存在即 fail-fast,快照阶段不可能遇到),
@@ -37,6 +38,20 @@ export function isSkippedRel(rel) {
 /** demo 验证输入的**整树**不可变快照(demo 之外的临时目录)。失败即抛 —— 拿不到不可变观察对象不许继续。 */
 export function makeObservationSnapshot(demoDir, { prefix = 'qa-hifi-snapshot-' } = {}) {
   const root = resolve(demoDir);
+  /* r9 P0 纵深:symlink 由前置门(fs-utils.checkDemoNoSymlinks)在**建快照之前**拒,这里再拦一次
+     是为了让「任何调用方都不可能拿到一份 dereference 过的快照」成为本函数自身的不变式 ——
+     dereference:true 把仓外链接目标复制成快照内的普通文件(观察侧 200),交付原地 server 却
+     realpath 后判 403,观察对象由此 ≠ 交付对象。
+     实测坑(Node v24.13):`cpSync` 只在**同时传了 `filter`** 时才真的按 `dereference: true` 走
+     跟随分支;不传 filter 时 symlink 会被原样保留(即使 dereference:true)。本函数正好传了
+     filter,所以这里的 dereference 是**真生效**的 —— P0 因此成立。复现该形态的回归测试必须
+     照样带 filter,否则测不出分叉。 */
+  const links = findDemoSymlinks(root, { limit: 5 });
+  if (links.length)
+    throw new Error(
+      'demo 输入树含 symlink,拒绝建立观察快照(dereference 会把它变成快照内的普通文件,'
+      + `而交付侧 realpath 判 403 —— 观察对象 ≠ 交付对象):${links.map((l) => `${l.path} -> ${l.target}`).join('、')}`,
+    );
   const dir = mkdtempSync(join(tmpdir(), prefix));
   cpSync(root, dir, {
     recursive: true,
@@ -55,19 +70,45 @@ export function makeOutputRoot({ prefix = 'qa-hifi-out-' } = {}) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-/** 整树文件相对路径集合;跳过的顶层目录整棵不进遍历。 */
+/** 整树文件相对路径集合;跳过的顶层目录整棵不进遍历。
+    r9:改用 **lstat**(不跟随 symlink)—— statSync 会把「指向目录的 symlink」当目录走进去、
+    把「指向文件的 symlink」当普通文件收录,两种情况下条目本身的 symlink 身份都被抹掉。
+    lstat 之下 symlink 一律作为叶子条目收录,类型由 entryKind() 给出。 */
 export function listFilesRel(root) {
   const out = [];
   const walk = (rel) => {
     for (const name of readdirSync(rel ? join(root, rel) : root)) {
       const childRel = rel ? `${rel}/${name}` : name;
-      if (statSync(join(root, childRel)).isDirectory()) {
+      const st = lstatSync(join(root, childRel));
+      if (st.isDirectory()) {
         if (!isSkippedRel(`${childRel}/x`)) walk(childRel);
       } else if (!isSkippedRel(childRel)) out.push(childRel);
     }
   };
   walk('');
   return out;
+}
+
+/**
+ * 一条相对路径在某棵树里的**身份**(r9 P0 纵深)。
+ * r8 的 manifest 只比「跟随 symlink 之后的文件 hash」,于是「快照里的普通文件」与
+ * 「磁盘上指向仓外的 symlink」被判全等 —— 审核人 PoC 里 snapshotDrift 因此报 "none"。
+ * symlink 现已被前置门整类拒,这里仍记录 type + linkTarget:万一将来某条路径绕过了前置检查,
+ * manifest 不能继续瞎。
+ * @returns {{type: 'file'|'symlink'|'dir'|'other'|'missing', linkTarget: string|null, sha256: string|null}}
+ */
+export function entryKind(root, rel) {
+  const abs = join(root, rel);
+  let st;
+  try { st = lstatSync(abs); } catch { return { type: 'missing', linkTarget: null, sha256: null }; }
+  if (st.isSymbolicLink()) {
+    let target = null;
+    try { target = readlinkSync(abs); } catch { /* 悬空链接:target 记 null,type 仍是 symlink */ }
+    return { type: 'symlink', linkTarget: target, sha256: null };
+  }
+  if (st.isDirectory()) return { type: 'dir', linkTarget: null, sha256: null };
+  if (!st.isFile()) return { type: 'other', linkTarget: null, sha256: null };
+  return { type: 'file', linkTarget: null, sha256: hashFile(abs) };
 }
 
 /**
@@ -81,9 +122,19 @@ export function snapshotManifestDiff(snapshotDir, demoDir) {
   const disk = new Set(listFilesRel(demoDir));
   const removed = [];
   const changed = [];
+  /** 类型/链接目标不一致(r9):与「字节被改写」分开报,因为它说的是另一件事 ——
+      同一路径在两棵树里连**身份**都不同(一边普通文件、一边 symlink),这正是 dereference
+      造出「观察对象 ≠ 交付对象」时的形态,而按 hash 比对完全看不出来。 */
+  const retyped = [];
   for (const rel of snap) {
     if (!disk.has(rel)) { removed.push(rel); continue; }
-    if (hashFile(join(snapshotDir, rel)) !== hashFile(join(demoDir, rel))) changed.push(rel);
+    const a = entryKind(snapshotDir, rel);
+    const b = entryKind(demoDir, rel);
+    if (a.type !== b.type || a.linkTarget !== b.linkTarget) {
+      retyped.push({ path: rel, snapshot: a.type, disk: b.type, snapshotTarget: a.linkTarget, diskTarget: b.linkTarget });
+      continue;                       // 身份都不同,再比 hash 无意义(且对 symlink 会跟随)
+    }
+    if (a.type === 'file' && a.sha256 !== b.sha256) changed.push(rel);
   }
   const snapSet = new Set(snap);
   const added = [...disk].filter((rel) => !snapSet.has(rel)).sort();
@@ -91,8 +142,10 @@ export function snapshotManifestDiff(snapshotDir, demoDir) {
     ...added.map((r) => `${r}(验收期间新增)`),
     ...removed.map((r) => `${r}(验收期间被删除)`),
     ...changed.map((r) => `${r}(字节被改写)`),
+    ...retyped.map((r) => `${r.path}(条目类型不一致:快照=${r.snapshot}${r.snapshotTarget ? `->${r.snapshotTarget}` : ''}`
+      + `,磁盘=${r.disk}${r.diskTarget ? `->${r.diskTarget}` : ''})`),
   ];
-  return { added, removed, changed, all };
+  return { added, removed, changed, retyped, all };
 }
 
 /**

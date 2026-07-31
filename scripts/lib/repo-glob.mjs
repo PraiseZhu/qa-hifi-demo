@@ -6,7 +6,7 @@
 // 而该核心会随模板拷进 demo 目录、不能反向 import 整个 fs-utils(会拖进 git/hash 全套)。
 // 两处共享同一份实现,避免「两套 glob 语义」漂移。
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const GLOB_SKIP_DIRS = new Set(['.git', 'node_modules']);
@@ -33,6 +33,46 @@ export function findDemoNodeModules(demoDir, { limit = 5 } = {}) {
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.name === 'node_modules') { hits.push(childRel); continue; }
       if (e.name === '.git') continue;
+      walk(join(dir, e.name), childRel);
+    }
+  };
+  walk(demoDir, '');
+  return hits;
+}
+
+/* ── demo 输入树里的 symlink 探测(r9 P0:观察对象 ≠ 交付对象) ──
+   为什么整类拒:同一条 symlink 在三个地方语义不同。
+     · 快照侧:makeObservationSnapshot 用 cpSync(dereference:true),链接目标的字节被复制成
+       快照内的**普通文件** → snapshot safe-server 返回 200,可信侧观察得到它;
+     · 交付/原地侧:safe-server 对 target 做 realpathSync 后要求落在根内,指向仓外的链接 → **403**;
+     · manifest 侧(r9 之前):只比「跟随 symlink 后的文件 hash」,快照里的普通文件与磁盘上的
+       symlink 被判全等 → snapshotDrift = "none"。
+   三者叠起来就是审核人 PoC:linked.js 是指向仓外的 symlink,把绑定元素改成正确值 →
+   可信侧量到正确值判绿放行,而交付页面上该资源 403、渲染的是错误值。方向与 r8 的 late.js
+   PoC 相反(那次是「交付比观察多」,这次是「观察比交付多」)。
+   demo 内部指向 demo 内的 symlink 一并拒:dereference 后同样变成普通文件、manifest 同样判不出
+   差异,且部署侧对 symlink 的处理不确定(可能 dereference、可能直接失效),原地/快照/部署三处
+   语义仍不一致 —— 这是 fail-closed,不是「按目标位置分情况放行」。
+   跳过 .git(不属交付产物,部署侧同样排除);node_modules 由 findDemoNodeModules 无条件拒,
+   不在本函数重复报(命中即另一道门 fail-fast)。
+   @returns {Array<{path: string, target: string}>} path 为 demo 相对路径,target 为 readlink 原值。 */
+export function findDemoSymlinks(demoDir, { limit = 10 } = {}) {
+  const hits = [];
+  const walk = (dir, rel) => {
+    if (hits.length >= limit) return;
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (hits.length >= limit) return;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (GLOB_SKIP_DIRS.has(e.name)) continue;   // .git 不属交付;node_modules(含 symlink 形态)由另一道门拒
+      if (e.isSymbolicLink()) {
+        let target = '(readlink 失败)';
+        try { target = readlinkSync(join(dir, e.name)); } catch { /* 悬空/无权限也照样算命中 */ }
+        hits.push({ path: childRel, target });
+        continue;                    // 不跟随:跟随就等于自己做了一次 dereference
+      }
+      if (!e.isDirectory()) continue;
       walk(join(dir, e.name), childRel);
     }
   };

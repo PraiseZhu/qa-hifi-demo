@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node
 import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
+  checkDemoNoSymlinks,
   failJson,
   failProblems,
   sha256Buffer,
@@ -38,6 +39,15 @@ const demoDir = resolve(args[demoIdx + 1]);
 const reportOutIdx = args.indexOf('--report-out');
 if (reportOutIdx !== -1 && !args[reportOutIdx + 1]) failJson('--report-out 需要一个文件路径');
 const reportOut = reportOutIdx !== -1 ? resolve(args[reportOutIdx + 1]) : join(demoDir, 'report-pixel.json');
+
+/* ── 无条件 fail-fast:demo 输入树里的 symlink 一律拒(r9 P0,与 verify/pr-block 同一道门) ──
+   必须排在**读取任何 demo 输入之前**,尤其早于「spec.baselines 为空 → exit 0」这条早退分支:
+   门 E 的早退也是一次「本门放行」的结论,不该在带 symlink 的树上给出。
+   拒收理由(快照 dereference 200 vs 原地 realpath 403)见 fs-utils.checkDemoNoSymlinks。 */
+{
+  const problems = checkDemoNoSymlinks(demoDir);
+  if (problems.length) failProblems(problems);
+}
 
 let spec;
 try {

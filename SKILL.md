@@ -330,7 +330,7 @@ artifact 三图被重跑覆盖成可信侧生成的那份），再与 demo 自�
 |---|---|---|
 | **I-ESBUILD** | 磁盘上 bundle + **所有 file-loader outputs** 的「路径 → 字节」映射，必须等于 canonical `write:false` 现算映射 | `component-build-core --check-outputs` + `recheckComponentOutputs`（门 A） |
 | **I-CSS** | 磁盘 `component.css` 字节必须等于 canonical 临时重编字节（同一 Tailwind 实现 / config / cwd / input / content / 受控 env） | `--check-css` + `recheckComponentCss`（门 A） |
-| **I-OBSERVE** | 所有核心观察(门 B/C/D/F 的浏览器实测 **与门 E 的像素比对**)都从**同一份整树不可变 snapshot** 取文件；三项字节复算与这些观察**绑定同一份快照字节** —— 快照先建，复算随后，紧邻一次**双向 manifest** 证明 snapshot ≡ 磁盘；全部发生在 demo `node_modules` fail-fast 之后、**任何 demo 可执行脚本之前**；出块前再做一次双向 manifest | `lib/observe.mjs`（verify 与 pixel-compare 共用一份实现）+ verify 的执行时序；次序与实现由 `comp-fix-r8` 源码契约锁死 |
+| **I-OBSERVE** | **观察对象必须等于交付对象**：所有核心观察(门 B/C/D/F 的浏览器实测 **与门 E 的像素比对**)都从**同一份整树不可变 snapshot** 取文件，且这份 snapshot 与交付树逐条**同类型同字节** —— 因此 demo 输入树里**不许有任何 symlink**（前置门 `checkDemoNoSymlinks`，r9 P0）；三项字节复算与这些观察**绑定同一份快照字节** —— 快照先建，复算随后，紧邻一次**双向 manifest** 证明 snapshot ≡ 磁盘；全部发生在 demo `node_modules` fail-fast 之后、**任何 demo 可执行脚本之前**；出块前再做一次双向 manifest | `lib/observe.mjs`（verify 与 pixel-compare 共用一份实现）+ `fs-utils.checkDemoNoSymlinks`（verify / pr-block / pixel-compare 三处同一道前置门）+ verify 的执行时序；次序与实现由 `comp-fix-r8` / `comp-fix-r9` 源码契约锁死 |
 
 **I-ESBUILD 为什么必须覆盖派生资产（r7 条目 3，实测 P0）**：r5 只复算 JS 字节。组件真实
 `import hero.png` 时 esbuild 的 file loader 会落出 `assets/hero-XMUUP4P7.png`；审核人实测把它
@@ -391,6 +391,43 @@ r8 的修法不是再加一条检查去挡引用，而是把盲区本身消掉�
 页面**仍不得引用快照之外的路径**（只剩 `node_modules/` 与 `.git/` 两类，`gateA.refsOutsideSnapshot`）——
 这份检查从快照跳过项推导，不会漂移。
 
+**为什么 demo 输入树里一律不许有 symlink（r9 条目 P0，审核人可执行 PoC）**：整树快照用
+`cpSync(..., dereference: true)` 建立，这改变了 symlink 的**可达语义** —— 同一条链接在三处不一样：
+
+| 位置 | 对「指向 demo 之外的 symlink」的行为 |
+|---|---|
+| 快照侧（可信观察） | `dereference` 把链接目标的字节复制成快照内的**普通文件** → snapshot safe-server **200** |
+| 交付 / 原地侧 | safe-server 对 target 做 `realpath` 后要求落在 demo 根内 → **403**，交付页面上这个资源加载不到 |
+| 部署侧 | 行为不确定（可能 dereference、可能直接失效） |
+
+PoC：demo 原始 `.box{width:99px}`、truth/binding 期望 `16px`，`linked.js` 是**指向 demo 之外**的
+symlink，其目标 JS 把 `.box` 改成 `16px`，`index.html` 引用它。实测
+`verify exit = 0 / gateD.pass = true / gateA.observeBinding = "bound" / gateA.snapshotDrift = "none" / pr-block exit = 0`，
+而原地 safe-server 上 `linked.js` = **HTTP 403**、最终 computed width = **99px** ——
+**可信侧量到 16px 判绿放行，实际交付页面是 99px**。注意方向与 r8 的 `late.js` PoC 相反：那次是
+「交付比观察多」，这次是「观察比交付多」。
+
+修法三条：
+
+| 修法 | 内容 |
+|---|---|
+| **symlink 一律 fail-closed**（主修） | `fs-utils.checkDemoNoSymlinks` 属**前置门**阶段，与 `checkDemoNoNodeModules` 相邻、**排在建立快照之前**（快照一建起来就已经 dereference 过了，等快照建完再查就晚了）。verify / pr-block / pixel-compare 三处同一道门；门 E 的这道门还排在「`spec.baselines` 为空 → exit 0」早退分支之前。报错点名**具体路径 + 链接目标 + 403 vs 200 的语义差 + 修法**。`makeObservationSnapshot` 自身再拦一次，使「任何调用方都拿不到 dereference 过的快照」成为该函数的不变式 |
+| **含指向 demo 内部的 symlink 也拒** | 内部链接在 dereference 后同样变成普通文件、manifest 同样判不出差异，且部署侧对 symlink 行为不确定 —— 原地 / 快照 / 部署三处语义仍不一致。这是 fail-closed，不按目标位置分情况放行。`node_modules`（含 symlink 形态）归 `checkDemoNoNodeModules` 无条件拒，本门不重复点名；`.git` 跳过（不属交付产物） |
+| **manifest 记录 `lstat` 类型 + `readlink` target**（纵深） | r8 的 manifest 只比「跟随 symlink 之后的文件 hash」，于是「快照里的普通文件」与「磁盘上指向仓外的 symlink」被判**全等**（PoC 里 `snapshotDrift` 因此报 `"none"`）。现在 `entryKind()` 用 `lstat` 给出 `{type, linkTarget}`，`snapshotManifestDiff` 多报一类 `retyped`（条目类型不一致）；`listFilesRel` 也改用 `lstat`，不再跟随「指向目录的 symlink」走进去。即使将来某条路径绕过前置门，manifest 也不再瞎 |
+
+**双 server 一致性通用回归**（`comp-fix-r9`）：对每个页面可达资源，断言「原地 safe-server」（交付对象）
+与「snapshot safe-server」（观察对象）的 **status + bytes 都一致**。这是「观察 == 交付」的直接验证，
+**不限 symlink** —— 未来任何让两侧行为分叉的机制都会在这里翻车。回归里同时放了一条「对 PoC 形状真的会
+翻车」的对照，防止它退化成空转。
+
+> 实现坑（Node v24.13，已写进 `observe.mjs` 注释）：`cpSync` 只在**同时传了 `filter`** 时才真按
+> `dereference: true` 跟随 symlink；不传 filter 时链接会被原样保留。`makeObservationSnapshot` 正好传了
+> filter，所以这里的 dereference 是真生效的、P0 成立；任何要复现该形态的测试必须照样带 filter。
+
+> **⚠️ 破坏性接口约定（r9）**：现存 demo 里只要含 symlink（含指向 demo 内部的），升级后一律被前置门
+> 拒收，`verify` / `pr-block` / `pixel-compare` 全部 exit 2。修法：把这些 symlink 复制成真实文件
+> （`cp -L`，或直接把内容写进 demo），让 demo 树里只有普通文件。
+
 **门 X / extractor 执行可信副本（r8 条目 C）**：此前 `hashFile(scriptAbs)` 之后仍按**同一路径**
 `spawnSync`，不是原子执行已哈希的字节 —— hash 与 spawn 之间的写入者可以换掉文件，「精确 hash 的脚本
 字节被执行」这句话就不成立。r8 起把已 hash 的字节复制到 output root 的 `trusted-scripts/` 再执行副本，
@@ -420,7 +457,7 @@ extractor / 自定义门放进 OS 级 sandbox —— 跨平台可靠性与成本
 
 | 门 | 结论进 PR 附贴块 | 可信侧来源 | 说明 |
 |---|---|---|---|
-| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`。顺序写死：demo `node_modules` fail-fast → 建立**整树** immutable snapshot → `--check-inputs`（esbuild 输入图）+ `--check-outputs`（**bundle 与全部 file-loader 产物**的路径→字节，I-ESBUILD）+ `--check-css`（I-CSS；三项针对磁盘字节，随后由**双向 manifest 绑定检查点**证明 ≡ 快照字节）→ 浏览器门从 snapshot 观察 → **之后**才处理 demo extractor | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并（`gateAHardFail` 一票否决）；执行完 demo 代码再比 `inputHashes` 与 snapshot 偏离 |
+| A 真值一致 | ✅ 进（"真值一致" 行 + 组件模式 "真组件直渲/已打包" 行） | pr-block 重跑 canonical `verify.mjs`。顺序写死：demo `node_modules` fail-fast → **demo 输入树 symlink fail-fast（r9 P0：一律拒，含指向 demo 内部的）** → 建立**整树** immutable snapshot → `--check-inputs`（esbuild 输入图）+ `--check-outputs`（**bundle 与全部 file-loader 产物**的路径→字节，I-ESBUILD）+ `--check-css`（I-CSS；三项针对磁盘字节，随后由**双向 manifest 绑定检查点**证明 ≡ 快照字节）→ 浏览器门从 snapshot 观察 → **之后**才处理 demo extractor | 复算路径上不执行 demo 目录里的任何代码；门 A 结论延后合并（`gateAHardFail` 一票否决）；执行完 demo 代码再比 `inputHashes` 与 snapshot 偏离 |
 | B 状态覆盖 | ✅ 进（`passed/total`） | canonical 浏览器重跑，**在任何 demo Node 脚本之前**、从同一 immutable snapshot 加载 | 哨兵结论同门 |
 | C 交互鲁棒 | ✅ 进（checks 列表） | 同 B（canonical 浏览器 + snapshot + 先于 demo 脚本） | |
 | D 渲染绑定 | ✅ 进（computed-style 条数；未配置则降级声明） | 同 B | |

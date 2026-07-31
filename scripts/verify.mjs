@@ -52,6 +52,7 @@ import { join, resolve } from 'node:path';
 import {
   buildInputHashes,
   checkDemoNoNodeModules,
+  checkDemoNoSymlinks,
   failJson,
   failProblems,
   readComponentInputsManifest,
@@ -120,6 +121,16 @@ const runGate = (letter) => !gateFilter || gateFilter.includes(letter);
    不是「标红后继续」。 */
 {
   const problems = checkDemoNoNodeModules(demoDir);
+  if (problems.length) failProblems(problems);
+}
+
+/* ── 无条件 fail-fast:demo 输入树里的 symlink 一律拒(r9 P0) ──
+   必须与上面那道门同阶段、**排在建立快照之前**:快照 cpSync(dereference:true) 一跑,
+   仓外链接目标的字节就已被复制成快照内的普通文件(观察侧 200),而交付原地 server 对它
+   realpath 后判 403 —— 观察对象由此比交付对象「多」了本该被拒的资源(与 r8 late.js 反向)。
+   等快照建完再检查就晚了。理由全文见 fs-utils.checkDemoNoSymlinks。 */
+{
+  const problems = checkDemoNoSymlinks(demoDir);
   if (problems.length) failProblems(problems);
 }
 
