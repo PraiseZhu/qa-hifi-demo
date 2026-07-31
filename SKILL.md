@@ -823,11 +823,48 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
 - **远端兜底**：上游 review-pr 格式门把 UI 证据（HTML/截图）列为硬要求，PR 里没带直接被打回——
   即使本地两层都被绕过，上游也合不进去。
 
-### P7 自进化复盘（self-evolution，每轮 demo 会话收尾时执行）
+### P7 自进化复盘（self-evolution，两层台账 + 交付前硬门）
 
-设计对齐 review-pr skill 的同名机制。目标：**同一类工具缺口或流程坑不第二次靠人发现**。
-每轮 demo 工作（定稿、或一次返工循环结束）后，对本轮「靠人肉发现的问题」做根因复盘，
-写入 Skill 自己的进化台账。复盘只影响未来轮次，不回头改本轮已出的验收结论。
+设计对齐 review-pr skill 的同名机制。目标：**同一类工具缺口或流程坑不第二次靠人发现**，
+且**用户 case by case 指出的每个问题都留全，不被收尾复盘压缩掉**。
+
+**两层台账，各管一头**：
+
+| 层 | 记什么 | 时机 | 去重 | 公开边界 |
+|---|---|---|---|---|
+| **case 层** | 用户在对话里指出的**每个具体问题**，原样 | **用户一说就记，不许攒到收尾** | **不去重** | **本地私有**（`evolution/cases/`，.gitignore 挡住） |
+| **根因层** | 从 case 归纳的可复用根因 | 收尾归纳 | fingerprint 去重 | 入公开仓 |
+
+为什么必须分两层：收尾批量复盘会把对话中间的具体 case 压缩掉——本 skill 十三轮攻防最终只
+沉淀出 20 条根因，中间大量具体 case 已经不可回溯；而只记 case 又无法复用。case 层正文常含
+未发布产品细节（文案／间距／状态），所以**只有脱敏后的根因层入公开仓**。
+
+**case 层必填四要素**，第三项是「迭代」能否发生的关键：
+
+1. **用户原话**（不许改写成 agent 的话——改写就丢了真实使用体感）
+2. **agent 当时的做法**
+3. **为什么第一次没做对**，且必须归到一类：
+   - `info-gap` 信息不足（我没问清）→ 要改的是**提问习惯**
+   - `misjudged` 判断错误（我想错了）→ 要改的是**判断方式**（哪一步推理跳了）
+   - `spec-unread` 规范没读（有规范我没查）→ 要改的是**读规范的时机**
+   - `tool-limit` 工具限制（工具真做不到）→ 这才是工具缺口，归根因层 `auto`/`proposal`
+   四类的应对完全不同，混成自由文本就无法迭代。
+4. **修法 + 是否已验证**（未验证不许当完成）
+
+**交付前硬门（不靠自觉，靠闸门）**：出块／收尾摘要之前必须跑
+
+```bash
+node "<SKILL_ROOT>/scripts/evolution-note.mjs" gate --session <会话标识>
+```
+
+该 session 既无 case 记录、也无「本轮无 case」声明 → **exit 2，不许输出交付摘要**。
+本轮确实无人指出问题时，必须显式声明（声明本身留痕，不是沉默跳过）：
+
+```bash
+node "<SKILL_ROOT>/scripts/evolution-note.mjs" gate --session <id> --declare-none --reason "…"
+```
+
+复盘只影响未来轮次，不回头改本轮已出的验收结论。
 
 **根因三分类（tier）**：
 
@@ -840,6 +877,13 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
 **台账通道（唯一读写路径,不许手改台账文件）**：
 
 ```bash
+# case 层——用户每指出一个问题，当场记（本地私有，不入公开仓）
+node "<SKILL_ROOT>/scripts/evolution-note.mjs" case --session <id> \
+  --quote "<用户原话>" --did "<agent 当时的做法>" \
+  --why "<为什么第一次没做对>" --why-class <info-gap|misjudged|spec-unread|tool-limit> \
+  --fix "<修法>" [--verified] [--fingerprint <slug>：已能归到根因时才填]
+
+# 根因层——收尾把 case 归纳成可复用根因（入公开仓）
 node "<SKILL_ROOT>/scripts/evolution-note.mjs" add \
   --fingerprint <root-cause-slug> --tier <by-design|proposal|auto> \
   --title "<一句话根因>" [--detail "<现象与证据>"] [--proposal "<具体改法>"] [--commit <sha>]

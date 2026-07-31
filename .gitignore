@@ -3,3 +3,6 @@ node_modules/
 # "node_modules/" 只匹配目录 —— 本轮已因此误提交过一次
 node_modules
 .DS_Store
+
+# case 层台账:本地私有,正文常含未发布产品细节(文案/间距/状态),不入公开仓
+evolution/cases/
