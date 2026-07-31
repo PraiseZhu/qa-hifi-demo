@@ -149,6 +149,66 @@ export function snapshotManifestDiff(snapshotDir, demoDir) {
 }
 
 /**
+ * r11 P0:**分界线前冻结的内存 manifest** —— 收口比对的唯一 oracle。
+ *
+ * 缺陷(r10 整树 exec 副本的连带后果):snapshot 在 `<tmp>/qa-hifi-snapshot-*`、exec 树在
+ * `<tmp>/qa-hifi-out-* 下的 trusted-trees-*`,**两者同处一个用户可枚举、可写的 os.tmpdir() 命名空间**。
+ * custom gate 是任意 Node 代码,直接 `os.tmpdir()` + `readdirSync` 就能枚举 `qa-hifi-snapshot-*`、
+ * 按 `spec.json` 的 `meta.name` 认出本次快照,然后把 **snapshot 与 disk 同步改成相同字节** ——
+ * `snapshotManifestDiff(snapshot, disk)` 于是报全等。审核人的定性很准:
+ *   **「manifest 证明的只是『两个当前可变对象现在相等』,不再证明『最终交付等于当时被观察的字节』」**
+ * 随机后缀只防猜、不防同权限枚举 —— 所以不去挡枚举(挡不住),而是让枚举**变得无用**:
+ * 把「当时被观察的字节」在任何 untrusted 代码执行之前搬进**父进程内存**并冻结。
+ * 父进程内存不是同权限的可写文件对象,子进程改不到它。
+ *
+ * 范围是 snapshot **整树**(`listFilesRel`),不是 `buildInputHashes` 的窄范围 —— PoC 用的
+ * `late.js` 正好不在窄范围里,窄口径必然漏。**不落盘**:一落盘就又变成同权限可写文件对象。
+ *
+ * @returns {{root: string, capturedAt: string, entries: Readonly<Record<string, Readonly<{type: string, linkTarget: string|null, sha256: string|null}>>>}}
+ */
+export function captureFrozenManifest(root, { label = 'pre-untrusted' } = {}) {
+  const entries = {};
+  for (const rel of listFilesRel(root)) {
+    const k = entryKind(root, rel);
+    entries[rel] = Object.freeze({ type: k.type, linkTarget: k.linkTarget, sha256: k.sha256 });
+  }
+  return Object.freeze({ root: String(root), label, entries: Object.freeze(entries) });
+}
+
+/**
+ * 把**冻结的内存 manifest** 与某棵磁盘树逐条比对。返回形状与 `snapshotManifestDiff` 相同
+ * ({ added, removed, changed, retyped, all }),调用方无需分叉。
+ *
+ * 与 `snapshotManifestDiff` 的区别正是 r11 的全部要点:基准是**不可被子进程改写的内存值**,
+ * 而不是一棵仍然可写的文件树。
+ */
+export function diffAgainstFrozen(frozen, diskDir) {
+  const disk = new Set(listFilesRel(diskDir));
+  const removed = [];
+  const changed = [];
+  const retyped = [];
+  for (const rel of Object.keys(frozen.entries)) {
+    if (!disk.has(rel)) { removed.push(rel); continue; }
+    const a = frozen.entries[rel];
+    const b = entryKind(diskDir, rel);
+    if (a.type !== b.type || a.linkTarget !== b.linkTarget) {
+      retyped.push({ path: rel, snapshot: a.type, disk: b.type, snapshotTarget: a.linkTarget, diskTarget: b.linkTarget });
+      continue;
+    }
+    if (a.type === 'file' && a.sha256 !== b.sha256) changed.push(rel);
+  }
+  const added = [...disk].filter((rel) => !(rel in frozen.entries)).sort();
+  const all = [
+    ...added.map((r) => `${r}(验收期间新增)`),
+    ...removed.map((r) => `${r}(验收期间被删除)`),
+    ...changed.map((r) => `${r}(字节被改写)`),
+    ...retyped.map((r) => `${r.path}(条目类型不一致:观察时=${r.snapshot}${r.snapshotTarget ? `->${r.snapshotTarget}` : ''}`
+      + `,磁盘=${r.disk}${r.diskTarget ? `->${r.diskTarget}` : ''})`),
+  ];
+  return { added, removed, changed, retyped, all };
+}
+
+/**
  * r8 条目 C:把**已 hash 的那份字节**复制到 output root 后执行副本,而不是 hash 完再按同一路径
  * spawn。后者中间存在窄 check/use 竞态:hash 与 spawn 之间同步的外部写入者可以换掉文件,
  * 于是「精确 hash 的字节被执行」这句话不成立。返回 { sha256, exec } —— exec 是要执行的副本路径。
