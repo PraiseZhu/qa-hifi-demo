@@ -1,0 +1,105 @@
+name: Personal CI
+
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install verified actionlint
+        run: |
+          curl --fail --silent --show-error --location --retry 3 https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/actionlint-bin"
+          tar -xzf "$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP/actionlint-bin" actionlint
+          echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
+      - name: Validate workflow syntax and expressions
+        run: |
+          actionlint -color -shellcheck='' -pyflakes=''
+  credential-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+      CI_BACKUP: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check changed credential file names
+        id: paths
+        run: python3 .github/ci/check-change-paths.py
+      - name: Install verified gitleaks
+        run: |
+          curl --fail --silent --show-error --location --retry 3 https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  '"$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+      - name: Scan only the proposed change with redacted output
+        env:
+          SCAN_BASE: ${{ steps.paths.outputs.base }}
+        run: |
+          if [ -n "$SCAN_BASE" ]; then
+            gitleaks git --redact --no-banner --log-opts="$SCAN_BASE..HEAD"
+          else
+            gitleaks git --redact --no-banner --log-opts='HEAD'
+          fi
+  project-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Project check 1
+        run: |
+          npm ci --no-audit --no-fund
+      - name: Project check 2
+        run: |
+          npm test
+      - name: Publish scope boundary
+        if: always()
+        run: |
+          printf '%s\n' 'Node regression only. Product-host/browser integrations may skip; no full E2E claim.' >> "$GITHUB_STEP_SUMMARY"
+  personal-ci:
+    name: personal-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs: [workflow-validation, credential-scan, project-checks]
+    steps:
+      - name: Require every configured check to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in results.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('Checks did not succeed: ' + ', '.join(failed))
+          print('All configured checks passed. Scope limits remain documented in each project job.')
+          PY
