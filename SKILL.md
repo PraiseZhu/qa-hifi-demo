@@ -10,7 +10,7 @@ description: 高保真可交互 QA demo 工作流——从产品源码提取带 
 > 部署到内网后贴进 PR，让 reviewer 不启动沙盒就能完整走一遍功能。
 >
 > **设计原则（四要素）**：结构化数据（spec.json + truth.json）、运行脚本（scripts/）、
-> 工具链（Playwright + xd-pages）、验证机制（A-F 六道门；阻断门全过才允许部署/贴 PR）。
+> 工具链（Playwright + xd-sites）、验证机制（A-F 六道门；阻断门全过才允许部署/贴 PR）。
 >
 > **诞生背景**：2026-07-24 cindy 登录协议 demo 6 轮返工的教训固化——文案手抄漂移、
 > 产品常量变更 demo 滞后、返回按钮/输入框交互 bug 靠人撞、状态覆盖靠人脑记。
@@ -200,7 +200,7 @@ adapter 必须在 bundle **之后**（它读装配好的 `mount`/`states`）、q
   `{ '<token>': { light, dark } }`（`extractThemeVars` 的输出，推荐）或 mode 优先
   `{ light: { '<token>': v }, dark: {...} }`；缺失/空则主题桥如实关闭（不假装应用了主题）。
 - 资产不内联：图片走 file loader 落 `assets/`（全内联实测让单文件涨到 10MB 级，仓里不可接受；
-  xd-pages 本来就部署整个目录）。产品原始美术资产可能单张就几 MB（登录 hero@2x 实测 3.8MB），
+  xd-sites 本来就部署整个目录）。产品原始美术资产可能单张就几 MB（登录 hero@2x 实测 3.8MB），
   `assets-manifest.mjs` 默认 8MB 闸门会拦——**要么压图/换 webp，要么显式
   `--max-total <MB> --override-reason "<理由>"` 抬闸**；理由是必填参数（缺了直接拒），
   会自动印上 PR 附贴块，闷着抬这条路已经堵死。
@@ -709,12 +709,16 @@ PR 文案只允许承诺「数据层 truth 提取自源码（带 provenance）�
 
 ### P4 部署 + PR 附贴
 
-1. `ghost_call(ghost_id='xd-pages', tool='pages_deploy', args={name:'<name>', preset:'static'}, dir=<demo-dir 绝对路径>)`。
+1. 用 Cindy 的 **xd-sites** 插件按纯静态站发布 demo 目录（`xd-pages` 已下线，2026-10-29 改）。流程以
+   `ghost_manual({ghost_id:'xd-sites', path:'operations'})` 为准：先 `sites_detect` 识别产物，再顶层工具
+   `sites_publish_plan`（`controlPlane:'static'`，目录放 ghost_call 顶层 `dir`）。新站要用户回答可见站点、访问权限并确认发布；
+   已有站点且配置不变时是 `direct_ready`，输出摘要后直接部署。部署地址形如 `https://<slug>.workers.xd-sites.com`（XD Sites 迁移前是 `*.workers.xd.team`，旧链接仍认）。
+   多个 demo 共用一个固定站点时（如 thread-to-pr 的 `pr-demos`），每个 demo 放一个子目录，整站目录一起发布。
 2. `node scripts/pr-block.mjs --demo <dir> --preview <仓内.html链接> --url <workers.xd.team地址>` 生成 PR 附贴块。
    pr-block 会重算 spec/truth/index/baselines hash，逐门检查统计一致性；任何输入漂移、手写 `ok:true`、缺门都会拒绝输出。
 3. 贴进 PR description/评论**前必须经用户确认**（对外写操作）。
 
-**部署渠道硬规**：demo 一律用 Cindy 自带的 **xd-pages** 部署(`workers.xd.team`,仅公司内网可见)。
+**部署渠道硬规**：demo 一律用 Cindy 的 **xd-sites** 插件部署(`*.workers.xd-sites.com`,迁移前为 `*.workers.xd.team`;访问权限按站点设置)。
 **禁止**把 demo 放任何公网预览服务(htmlpreview.github.io / raw.githack / CodePen / JSFiddle /
 CodeSandbox / StackBlitz)——那会把未发布的产品界面暴露到公网,且私有仓 raw 这些服务也拿不到。
 
@@ -722,7 +726,7 @@ CodeSandbox / StackBlitz)——那会把未发布的产品界面暴露到公网,
 当作有效 UI 证据,硬判认三种形态——```` ```html ````代码块、完整 HTML 文档、`.html` 附件/预览链接。
 内网部署域名 workers.xd.team 若尚未进识别列表,证据这样给:demo 随 PR 入库到
 `docs/design-previews/<feature>/index.html`,PR 里贴该文件的 **GitHub 仓内链接**(以 `.html` 结尾,
-命中「.html 附件链接」判定,且私有仓权限天然受控),xd-pages 内网地址作为体验入口一并贴;
+命中「.html 附件链接」判定,且私有仓权限天然受控),xd-sites 内网地址作为体验入口一并贴;
 同时建议向 Lizi 提一句把 `workers.xd.team` 加进 review-pr 的预览域名识别列表,加了以后内网地址自身即证据。
 上游阶段二还会**核对 HTML 与 diff 实现的一致性**(「HTML 很漂亮但代码不是这么写的」= P1)——
 本 skill 的门 A(真值提取自产品源码)正是一致性的机械证明,pr-block 里带上验收报告即为自证。
@@ -808,7 +812,7 @@ demo 是产品代码的**镜像视图**，改动的 source of truth 永远是产
    这个 demo 必须更大>"`，否则参数直接被拒。理由进报告并原样印在 PR 附贴块上：
    `⚠️ 资产 X MB 超默认闸门 8 MB（本次生效阀 Y MB），抬闸理由：…`。收紧到默认阀以下不需要理由
    （收紧永远安全），因此也不接受"不抬闸却给理由"——免得"理由"变成随手贴的装饰；
-5. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-pages 已部署最新版**，然后
+5. demo 入库（`docs/design-previews/<feature>/`）并 commit + **xd-sites 已部署最新版**，然后
    `node scripts/pr-block.mjs --demo <dir> --require-committed --require-deployed --url <部署地址> [--preview ...]`
    产出附贴块——`--require-deployed` 会拉取部署地址逐字节比对本地 index.html（带 cache-bust），
    没部署 / 部署的是旧版 / 地址不可达都 exit 2。**部署不是可选步骤，是定稿门的一部分。**

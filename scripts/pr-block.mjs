@@ -46,7 +46,9 @@ const CANONICAL_VERIFY = join(SCRIPT_DIR, 'verify.mjs');
 const CANONICAL_PIXEL = join(SCRIPT_DIR, 'pixel-compare.mjs');
 const TRUSTED_VERIFY_TIMEOUT_MS = 900000;
 
-const PREVIEW_HOSTS = new Set(['github.com', 'gitlab.com', 'workers.xd.team']);
+// XD Sites 迁移后部署域名是 *.workers.xd-sites.com；迁移前的 *.workers.xd.team 链接仍然有效
+const DEPLOY_DOMAINS = ['workers.xd.team', 'workers.xd-sites.com'];
+const PREVIEW_HOSTS = new Set(['github.com', 'gitlab.com', ...DEPLOY_DOMAINS]);
 // 与 assets-manifest.mjs 保持一致(那边是可执行脚本不能被 import,一致性由测试锁住)
 const ASSETS_REPORT_NAME = 'report-assets.json';
 const DEFAULT_ASSETS_LIMIT_MB = 8;
@@ -71,13 +73,13 @@ const preview = prevIdx !== -1 ? args[prevIdx + 1] : null;
 const requireCommitted = args.includes('--require-committed');
 const requireDeployed = args.includes('--require-deployed');
 
-// xd-pages 真实部署地址是 <name>.workers.xd.team 子域,裸域校验会把真地址拒掉(修:允许子域)。
+// 真实部署地址是 <name>.<部署域名> 子域,裸域校验会把真地址拒掉(修:允许子域)。
 // QA_HIFI_URL_ALLOW(逗号分隔)供测试/特批扩展 host,生产不设即无影响。
 const extraHosts = (process.env.QA_HIFI_URL_ALLOW ?? '').split(',').filter(Boolean);
-const urlHostOk = (h) => h === 'workers.xd.team' || h.endsWith('.workers.xd.team') || extraHosts.includes(h);
+const urlHostOk = (h) => DEPLOY_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`)) || extraHosts.includes(h);
 if (url) {
   const u = parseUrl(url, '--url');
-  if (!urlHostOk(u.hostname)) die(`--url 只允许 workers.xd.team 内网域(含子域),当前:${u.hostname}`, 2);
+  if (!urlHostOk(u.hostname)) die(`--url 只允许 ${DEPLOY_DOMAINS.join(' / ')} 内网域(含子域),当前:${u.hostname}`, 2);
 }
 if (preview) {
   const p = parseUrl(preview, '--preview');
