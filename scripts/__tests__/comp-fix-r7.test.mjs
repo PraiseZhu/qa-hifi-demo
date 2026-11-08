@@ -931,6 +931,21 @@ test('条目 7b taint 单测(不 skip): 未标记的 report 喂给渲染器必�
   assert.throws(() => renderPrBlock({ spec, trustedVerify: markTrustedRun('verify', fakeReport), trustedPixel: { ok: true } }), /未经 canonical runner 标记/);
 });
 
+test('#2 附贴块标题下第一个非空行是「> HTML 模拟，非实机截图」', () => {
+  const spec = { meta: { name: 'x' }, component: { mode: 'component' } };
+  const report = {
+    ok: true, toolVersion: 'x', generatedAt: 'now', coverage: { cases: [] },
+    gateA: { pass: true }, gateB: { pass: true, passed: 1, total: 1, entryRenderProof: 'proved' },
+    gateC: { pass: true, checks: [{ id: 'no-clip' }] }, gateD: { pass: true, total: 1 },
+    gateF: { pass: true, total: 1 }, gateX: { pass: true, total: 0 },
+    inputHashes: { componentSources: { sources: { 'a.ts': 'h' } } },
+  };
+  const lines = renderPrBlock({ spec, trustedVerify: markTrustedRun('verify', report) }).split('\n');
+  assert.equal(lines[0], '### 可交互 QA demo（代替沙盒试用）');
+  const firstText = lines.slice(1).find((l) => l.trim() !== '');
+  assert.equal(firstText, '> HTML 模拟，非实机截图', `标题下第一行应是 HTML 模拟标注，实际：${firstText}`);
+});
+
 test('条目 7c① provenance(不 skip): 渲染器结构上读不到 demo 自报的 report', () => {
   const rn = readFileSync(join(ROOT, 'scripts/lib/pr-render.mjs'), 'utf8');
   // 渲染器不许自己读盘、不许接收 claimed/自报参数
