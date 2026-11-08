@@ -68,6 +68,9 @@ export function renderPrBlock({ spec, trustedVerify, trustedPixel = null, truste
   const lines = [];
   lines.push('### 可交互 QA demo（代替沙盒试用）');
   lines.push('');
+  // 全局规则「涉及 UI 的 PR 必须附截图或 demo」：HTML demo 必须写明不是实机截图（qa-hifi-demo#2）
+  lines.push('> HTML 模拟，非实机截图');
+  lines.push('');
   if (preview) lines.push(`**UI 证据（HTML 界面）**：[demo 页面预览](${preview})`);
   // URL 与后缀标注之间必须隔断:全角括号紧贴 URL 会被 GitHub autolink 吞进 href
   // 导致链接 404(2026-07-25 实踩)。用 <> 显式划定链接边界。
